@@ -14,3 +14,6 @@ categories = ["concurrency", "data-structures", "memory-management"]
 
 [dependencies]
 virtual-buffer = { git = "https://github.com/vulkano-rs/virtual-buffer", rev = "83c175f34e959e6535cb0339c059f1beeeb5b537" }
+
+[dev-dependencies]
+slotmap = "1.0"
