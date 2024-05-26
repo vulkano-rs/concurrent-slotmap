@@ -16,9 +16,9 @@ fn concurrent_slotmap(b: &mut Bencher) {
         thread::scope(|s| {
             for _ in 0..THREADS {
                 s.spawn(|| {
-                    for _ in 0..black_box(ITERATIONS / THREADS) {
+                    for _ in black_box(0..ITERATIONS / THREADS) {
                         let id = map.insert(black_box([0usize; 2]));
-                        map.remove(id);
+                        map.remove(black_box(id));
                     }
                 });
             }
@@ -36,9 +36,9 @@ fn rwlock_slotmap(b: &mut Bencher) {
         thread::scope(|s| {
             for _ in 0..THREADS {
                 s.spawn(|| {
-                    for _ in 0..black_box(ITERATIONS / THREADS) {
+                    for _ in black_box(0..ITERATIONS / THREADS) {
                         let id = map.write().unwrap().insert(black_box([0usize; 2]));
-                        map.write().unwrap().remove(id);
+                        map.write().unwrap().remove(black_box(id));
                     }
                 });
             }
