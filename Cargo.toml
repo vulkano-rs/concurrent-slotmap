@@ -1,0 +1,16 @@
+[package]
+name = "concurrent-slotmap"
+version = "0.1.0"
+authors = ["marc0246 <40955683+marc0246@users.noreply.github.com>"]
+edition = "2021"
+rust-version = "1.65"
+description = "A lock-free concurrent slotmap"
+documentation = "https://docs.rs/concurrent-slotmap"
+readme = "README.md"
+repository = "https://github.com/vulkano-rs/concurrent-slotmap"
+license = "MIT OR Apache-2.0"
+keywords = ["lock-free", "concurrent", "slotmap", "slot", "map", "arena", "allocator"]
+categories = ["concurrency", "data-structures", "memory-management"]
+
+[dependencies]
+virtual-buffer = { git = "https://github.com/vulkano-rs/virtual-buffer", rev = "83c175f34e959e6535cb0339c059f1beeeb5b537" }
