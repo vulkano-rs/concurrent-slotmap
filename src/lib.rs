@@ -385,6 +385,28 @@ impl<T> SlotMap<T> {
     }
 }
 
+impl<T> Drop for SlotMap<T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        for list in &mut self.free_list_queue {
+            while *list.head.get_mut() != NIL {
+                let slot = unsafe { self.slots.get_unchecked_mut(*list.head.get_mut() as usize) };
+                unsafe { slot.value.get().cast::<T>().drop_in_place() };
+                *list.head.get_mut() = *slot.next_free.head.get_mut();
+            }
+        }
+
+        for slot in &mut self.slots {
+            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                unsafe { slot.value.get_mut().assume_init_drop() };
+            }
+        }
+    }
+}
+
 const OCCUPIED_BIT: u32 = 1;
 
 struct Slot<T> {
@@ -429,16 +451,6 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
         }
 
         debug.finish()
-    }
-}
-
-impl<T> Drop for Slot<T> {
-    fn drop(&mut self) {
-        let generation = *self.generation.get_mut();
-
-        if generation & OCCUPIED_BIT != 0 {
-            unsafe { self.value.get_mut().assume_init_drop() };
-        }
     }
 }
 
