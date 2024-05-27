@@ -9,10 +9,15 @@ use core::{
 };
 use std::sync::{Mutex, TryLockError};
 
+/// The bit of `Local::epoch` which signifies that the participant is pinned.
 const PINNED_BIT: usize = 1 << 0;
 
+/// The number of pinnings between a participant tries to advance the global epoch.
 const PINNINGS_BETWEEN_ADVANCE: usize = 128;
 
+/// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross
+/// into more than one global epoch advance. It is important to pin the local epoch before doing
+/// any kind of access, such that no accesses can bleed into the previous epoch.
 #[inline]
 pub fn pin() -> Guard {
     let guard = unsafe { Guard { local: local() } };
@@ -24,6 +29,13 @@ pub fn pin() -> Guard {
         let global_epoch = global().epoch.load(Relaxed);
         let new_epoch = global_epoch | PINNED_BIT;
         local.epoch.store(new_epoch, Relaxed);
+
+        // This fence acts two-fold:
+        // * It synchronizes with the `Release` store of the global epoch in `Global::try_advance`,
+        //   which in turn ensures that the accesses all other participants did in a previous epoch
+        //   are visible to us going forward when crossing an epoch boundary.
+        // * It ensures that that no accesses we do going forward can be ordered before this point,
+        //   therefore "bleeding" into the previous epoch, when crossing an epoch boundary.
         atomic::fence(SeqCst);
 
         local.pin_count.set(local.pin_count.get().wrapping_add(1));
@@ -70,8 +82,12 @@ fn local() -> NonNull<Local> {
 
 #[repr(C)]
 struct Global {
+    /// The global list of `Local`s participating in the memory reclamation.
     local_list_head: Mutex<Option<NonNull<Local>>>,
+
     _alignment: CacheAligned,
+
+    /// The global epoch counter. This can only ever be one step ahead of any pinned local epoch.
     epoch: AtomicUsize,
 }
 
@@ -90,6 +106,9 @@ impl Global {
     #[cold]
     fn try_advance(&self) -> usize {
         let global_epoch = self.epoch.load(Relaxed);
+
+        // Ensure that none of the loads of the local epochs can be ordered before the load of the
+        // global epoch.
         atomic::fence(SeqCst);
 
         let head = match self.local_list_head.try_lock() {
@@ -114,6 +133,13 @@ impl Global {
 
         let new_epoch = global_epoch.wrapping_add(2);
 
+        // This essentially acts as a global `AcqRel` barrier. Only after ensuring that all
+        // participants are pinned in the current global epoch do we synchronize with them using
+        // the `Acquire` fence, which synchronizes with every participant's `Release` store of its
+        // local epoch in `Guard::drop`, ensuring that all accesses done by every participant until
+        // they were unpinned are visible here. The `Release` ordering on the global epoch then
+        // ensures that all participants subsequently pinned in the new epoch also see all accesses
+        // of all other participants from the previous epoch.
         atomic::fence(Acquire);
         self.epoch.store(new_epoch, Release);
 
@@ -123,11 +149,23 @@ impl Global {
 
 #[repr(C)]
 struct Local {
+    /// The next `Local` in the global list of participants.
     next: Cell<Option<NonNull<Self>>>,
+
+    /// The local epoch counter. When this epoch is pinned, it ensures that the global epoch cannot
+    /// be advanced more than one step until it is unpinned.
     epoch: AtomicUsize,
+
     _alignment: CacheAligned,
+
+    /// The number of `Guard`s that exist.
     guard_count: Cell<usize>,
+
+    /// The number of `LocalHandle`s that exist.
+    // FIXME: We don't need this.
     handle_count: Cell<usize>,
+
+    /// The number of pinnings this participant has gone through in total.
     pin_count: Cell<usize>,
 }
 
@@ -225,6 +263,9 @@ impl Drop for Guard {
         local.guard_count.set(local.guard_count.get() - 1);
 
         if local.guard_count.get() == 0 {
+            // The `Release` ordering synchronizes with the `Acquire` fence in
+            // `Global::try_advance`, which in turn ensures that all accesses done by us until this
+            // point are visible to all other participants when crossing an epoch boundary.
             local.epoch.store(0, Release);
 
             if local.handle_count.get() == 0 {
