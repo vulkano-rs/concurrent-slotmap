@@ -124,6 +124,7 @@ impl<T> SlotMap<T> {
     }
 
     pub fn remove(&self, id: SlotId) -> Option<()> {
+        let guard = epoch::pin();
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -138,7 +139,6 @@ impl<T> SlotMap<T> {
             return None;
         }
 
-        let guard = epoch::pin();
         let epoch = guard.epoch();
         let last_epoch = self.last_collect_epoch.load(Relaxed);
 
@@ -358,12 +358,11 @@ impl<T> SlotMap<T> {
     #[inline]
     #[must_use]
     pub fn get(&self, id: SlotId) -> Option<Ref<'_, T>> {
+        let guard = epoch::pin();
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
 
         if generation == id.generation() {
-            let guard = epoch::pin();
-
             // SAFETY:
             // * The `Acquire` ordering when loading the slot's generation synchronizes with the
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
