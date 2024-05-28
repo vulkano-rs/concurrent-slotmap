@@ -6,12 +6,12 @@
 
 use core::{
     cell::UnsafeCell,
-    fmt, hint,
+    fmt,
     mem::MaybeUninit,
     num::NonZeroU32,
     ops::Deref,
     sync::atomic::{
-        AtomicU32, AtomicUsize,
+        AtomicU32, AtomicU64,
         Ordering::{Acquire, Relaxed, Release},
     },
 };
@@ -22,9 +22,6 @@ mod epoch;
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
 
-/// The bit of `SlotMap::last_collect_epoch` which signifies that a garbage collection has begun.
-const COLLECTING_BIT: usize = 1 << 0;
-
 #[derive(Debug)]
 pub struct SlotMap<T> {
     slots: Vec<Slot<T>>,
@@ -32,7 +29,7 @@ pub struct SlotMap<T> {
 
     /// The free-list. This is the list of slots which have already been dropped and are ready to
     /// be claimed by insert operations.
-    free_list: List,
+    free_list: AtomicU32,
 
     /// Free-lists queued for inclusion in the `free_list`. Since the global epoch counter can only
     /// ever be one step apart from a local one, we only need two free-lists in the queue: one for
@@ -41,10 +38,13 @@ pub struct SlotMap<T> {
     /// know that the lag can be at most one step, we can be certain that the list which was
     /// lagging behind before the global epoch was advanced is now safe to drop and prepend to
     /// `free_list`.
-    free_list_queue: [List; 2],
-
-    /// The epoch for which garbage was collected the last time.
-    last_collect_epoch: AtomicUsize,
+    ///
+    /// The atomic packs the list's head in the lower 32 bits and the epoch of the last push in the
+    /// upper 32 bits. The epoch must not be updated if it would be going backwards; it's only
+    /// updated when the last epoch is at least 2 steps behind the local epoch, at which point -
+    /// after removing the list from the queue and updating the epoch - we can be certain that no
+    /// other threads are accessing any of the slots in the list.
+    free_list_queue: [AtomicU64; 2],
 }
 
 impl<T> SlotMap<T> {
@@ -53,9 +53,11 @@ impl<T> SlotMap<T> {
         SlotMap {
             slots: Vec::new(max_capacity as usize),
             len: AtomicU32::new(0),
-            free_list: List::new(),
-            free_list_queue: [List::new(), List::new()],
-            last_collect_epoch: AtomicUsize::new(0),
+            free_list: AtomicU32::new(NIL),
+            free_list_queue: [
+                AtomicU64::new(u64::from(NIL)),
+                AtomicU64::new(u64::from(NIL) | 2 << 32),
+            ],
         }
     }
 
@@ -80,7 +82,7 @@ impl<T> SlotMap<T> {
     }
 
     pub fn insert(&self, value: T) -> SlotId {
-        let mut free_list_head = self.free_list.head.load(Acquire);
+        let mut free_list_head = self.free_list.load(Acquire);
 
         loop {
             if free_list_head == NIL {
@@ -91,14 +93,12 @@ impl<T> SlotMap<T> {
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slot_unchecked(free_list_head) };
 
-            let next_free = slot.next_free.head.load(Relaxed);
+            let next_free = slot.next_free.load(Relaxed);
 
-            match self.free_list.head.compare_exchange_weak(
-                free_list_head,
-                next_free,
-                Release,
-                Acquire,
-            ) {
+            match self
+                .free_list
+                .compare_exchange_weak(free_list_head, next_free, Release, Acquire)
+            {
                 Ok(_) => {
                     // SAFETY: `SlotMap::remove` guarantees that the free-list only contains slots
                     // that are no longer read by any threads.
@@ -140,171 +140,54 @@ impl<T> SlotMap<T> {
         }
 
         let epoch = guard.epoch();
-        let last_epoch = self.last_collect_epoch.load(Relaxed);
-
-        if epoch.wrapping_sub(last_epoch) >= 3 {
-            self.collect_garbage(epoch, last_epoch);
-        }
-
-        let queued_list = &self.free_list_queue[(epoch >> 1) & 1];
-        let mut queued_head = queued_list.head.load(Acquire);
+        let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
+        let mut queued_state = queued_list.load(Acquire);
 
         loop {
-            slot.next_free.head.store(queued_head, Relaxed);
+            let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
+            let queued_epoch = (queued_state >> 32) as u32;
+            let epoch_interval = epoch.wrapping_sub(queued_epoch);
+            let local_epoch_is_behind = epoch_interval & (1 << 31) != 0;
 
-            match queued_list
-                .head
-                .compare_exchange_weak(queued_head, id.index, Release, Acquire)
-            {
-                Ok(_) => break,
-                Err(new_head) => queued_head = new_head,
+            if local_epoch_is_behind || epoch_interval == 0 {
+                slot.next_free.store(queued_head, Relaxed);
+
+                let new_state = u64::from(id.index) | u64::from(queued_epoch) << 32;
+
+                match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
+                    Ok(_) => {
+                        self.len.fetch_sub(1, Relaxed);
+                        break Some(());
+                    }
+                    Err(new_state) => queued_state = new_state,
+                }
+            } else {
+                debug_assert!(epoch_interval >= 4);
+
+                slot.next_free.store(NIL, Relaxed);
+
+                let new_state = u64::from(id.index) | u64::from(epoch) << 32;
+
+                match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
+                    Ok(_) => {
+                        self.len.fetch_sub(1, Relaxed);
+
+                        // SAFETY: Having ended up here, the global epoch must have been advanced
+                        // at least 2 steps from the last push into the queued list and we removed
+                        // the list from the queue, which means that no other threads can be
+                        // accessing any of the slots in the list.
+                        unsafe { self.collect_garbage(queued_head) };
+
+                        break Some(());
+                    }
+                    Err(new_state) => queued_state = new_state,
+                }
             }
         }
-
-        self.len.fetch_sub(1, Relaxed);
-
-        Some(())
     }
 
     #[cold]
-    fn collect_garbage(&self, epoch: usize, mut last_epoch: usize) {
-        // If a thread ended up here, it means that the global epoch was advanced far enough to
-        // allow the queued list corresponding to `epoch` to be dropped and freed. One way in which
-        // that can happen is the following.
-        //
-        // (1) The `last_epoch` is 2 steps behind `epoch`
-        //
-        //     :       :
-        //     | E - 4 | <- `last_epoch`
-        //     |-------|
-        //     | E - 2 |
-        //     |-------|
-        //     | E - 0 | <- `epoch`
-        //     :       :
-        //
-        // Since the global epoch can only ever be one step ahead of any pinned local epoch, we can
-        // be certain that once 2 steps have been made, no thread can be accessing any of the slots
-        // removed in `last_epoch`. We would like to drop and free those slots. Since we only have
-        // two lists queued for freeing, the list which contains the slots removed in `last_epoch`
-        // happens to be the same list that we would be pushing to in `epoch`:
-        // `self.free_list_queue[(epoch >> 1) & 1]`. We want to remove this list from the queue to
-        // make sure that no more slots are pushed into it by any other threads and that our thread
-        // has exclusive access to the existing slots to be able to drop them.
-        //
-        // Now comes the problem: if we naively swapped the list's head with `NIL` immediately and
-        // proceeded to drop, we could get a classic A/B/A problem:
-        // * Thread A observes `epoch - last_epoch == 4`, enters here.
-        // * Thread B observes `epoch - last_epoch == 4`, enters here.
-        // * Thread B swaps the list head and proceeds to push a slot into the same list.
-        // * Thread A swaps the list head, drops and frees the slot that was just removed by thread
-        //   B and could still be read by other threads.
-        //
-        // What we do instead, *before* touching the list, is to advance the `last_epoch` by a
-        // "half-step", reusing the same bit used for pinning to - in this case - signify that
-        // collecting is taking place.
-        //
-        // (2) The `last_epoch` is in an "in-between" state
-        //
-        //     :       :
-        //     | E - 4 |
-        //     |-------| <- `last_epoch`
-        //     | E - 2 |
-        //     |-------|
-        //     | E - 0 | <- `epoch`
-        //     :       :
-        //
-        // While the `last_epoch` is in this state, other threads **must not** touch either of the
-        // queued lists until that same thread advances the `last_epoch` again, after which point
-        // the other threads no longer have any reason to collect garbage and can continue with the
-        // remove operation. The `last_epoch` is only in this state before and after the swap on
-        // the queued list's head. After the list is successfully removed from the queue, both the
-        // collecting thread and removing threads can continue concurrently.
-        //
-        // This means that a thread can observe the `last_epoch` in this in-between state before or
-        // after entering here, and we must account for both. We ensure the former by checking that
-        // the interval between the epochs is at least 3 when getting here.
-        //
-        // Also, what if a thread reads an old version of `last_epoch` even though it was advanced?
-        // In that case, since our epochs are always increasing, the only outcome can be that the
-        // older version is lesser than the current one, which would be (1) again and still satisfy
-        // the same condition and make the thread end up here.
-        //
-        // After ending up here, one thread advancing the `last_epoch` by a half-step, that same
-        // thread advances the `last_epoch` again while the other threads wait patiently.
-        //
-        // (3) The `last_epoch` is 1 step behind `epoch`
-        //
-        //     :       :
-        //     | E - 4 |
-        //     |-------|
-        //     | E - 2 | <- `last_epoch`
-        //     |-------|
-        //     | E - 0 | <- `epoch`
-        //     :       :
-        //
-        // There are also other cases instead of (1). The `last_epoch` could have been (potentially
-        // severely) outdated. In this case, unlike when the `last_epoch` is 2 steps behind, we can
-        // have threads that are pinned in different epochs competing for garbage collection.
-        //
-        // (4) The `last_epoch` is more than 2 steps behind
-        //
-        //     :       :
-        //     | E - N | <- `last_epoch`
-        //     |-------|
-        //     :       :
-        //     |-------|
-        //     | E - 2 | <- thread B `epoch`
-        //     |-------|
-        //     | E - 0 | <- thread A `epoch`
-        //     :       :
-        //
-        // Now there are two possible interleavings: either thread A or B could win the race, but
-        // either way only one will be collecting at a time like in every other case (this is why
-        // a thread must not touch *either* of the queued lists when the `last_epoch` is in the
-        // in-between state). If thread B wins, then after it removes its list from the queue and
-        // advances the `last_epoch` again, it will be 2 steps behind thread A's epoch, which is
-        // going to loop back to (1) and thread A is going to remove its list as well. If thread A
-        // wins then thread B's list is not going to be removed.
-        //
-        // Because of this case, we always advance the epoch to one step behind `epoch` after
-        // removing a list from the queue, as opposed to advancing it by another half-step.
-
-        loop {
-            // Case (2): only one thread can be collecting queued free-lists at a time, so we spin.
-            if last_epoch & COLLECTING_BIT != 0 {
-                hint::spin_loop();
-                last_epoch = self.last_collect_epoch.load(Relaxed);
-                continue;
-            }
-
-            // Case (3): there is no more need for any garbage collection.
-            if epoch.wrapping_sub(last_epoch) == 2 {
-                return;
-            }
-
-            // Case (1) or (4): we must notify other threads that we are about to collect. This
-            // results in (2) for the losing threads.
-            match self.last_collect_epoch.compare_exchange_weak(
-                last_epoch,
-                last_epoch | COLLECTING_BIT,
-                Relaxed,
-                Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(new_epoch) => last_epoch = new_epoch,
-            }
-        }
-
-        // We can only end up here as a result of (1) or (4) and can be certain that we have
-        // exclusive access to the queue.
-        let queued_list = &self.free_list_queue[(epoch >> 1) & 1];
-        let queued_head = queued_list.head.swap(NIL, Acquire);
-
-        // Notify other threads that it is safe to proceed. This turns (2) into (3) or (1) for the
-        // other threads.
-        self.last_collect_epoch
-            .store(epoch.wrapping_sub(2), Relaxed);
-
+    unsafe fn collect_garbage(&self, queued_head: u32) {
         if queued_head == NIL {
             // There is no garbage.
             return;
@@ -319,13 +202,10 @@ impl<T> SlotMap<T> {
             // vector never shrinks, therefore the index must have stayed in bounds.
             queued_tail_slot = unsafe { self.slot_unchecked(queued_tail) };
 
-            // SAFETY: Having ended up here, the global epoch must have advanced at least 2 steps
-            // from the last collect, which means that no other threads can be reading this value.
-            // How we can be certain that this here thread is the only one that ended up here and
-            // no A/B/A occured is detailed in the wall of text above.
+            // SAFETY: The caller must ensure that we have exclusive access to this list.
             unsafe { queued_tail_slot.value.get().cast::<T>().drop_in_place() };
 
-            let next_free = queued_tail_slot.next_free.head.load(Acquire);
+            let next_free = queued_tail_slot.next_free.load(Acquire);
 
             if next_free == NIL {
                 break;
@@ -334,16 +214,13 @@ impl<T> SlotMap<T> {
             queued_tail = next_free;
         }
 
-        let mut free_list_head = self.free_list.head.load(Acquire);
+        let mut free_list_head = self.free_list.load(Acquire);
 
         // Free the queued free-list by prepending it to the free-list.
         loop {
-            queued_tail_slot
-                .next_free
-                .head
-                .store(free_list_head, Relaxed);
+            queued_tail_slot.next_free.store(free_list_head, Relaxed);
 
-            match self.free_list.head.compare_exchange_weak(
+            match self.free_list.compare_exchange_weak(
                 free_list_head,
                 queued_head,
                 Release,
@@ -368,7 +245,7 @@ impl<T> SlotMap<T> {
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
             //   is visible here.
             // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, it's generation's occupied bit must be set.
+            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
             //   Since the generation matched, the slot's occupied bit must be set, which makes
             //   reading the value safe as the only way the occupied bit can be set is in
             //   `SlotMap::insert` after initialization of the slot.
@@ -391,10 +268,12 @@ impl<T> Drop for SlotMap<T> {
         }
 
         for list in &mut self.free_list_queue {
-            while *list.head.get_mut() != NIL {
-                let slot = unsafe { self.slots.get_unchecked_mut(*list.head.get_mut() as usize) };
-                unsafe { slot.value.get().cast::<T>().drop_in_place() };
-                *list.head.get_mut() = *slot.next_free.head.get_mut();
+            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
+
+            while head != NIL {
+                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
+                unsafe { slot.value.get_mut().assume_init_drop() };
+                head = *slot.next_free.get_mut();
             }
         }
 
@@ -410,7 +289,7 @@ const OCCUPIED_BIT: u32 = 1;
 
 struct Slot<T> {
     generation: AtomicU32,
-    next_free: List,
+    next_free: AtomicU32,
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
@@ -421,7 +300,7 @@ impl<T> Slot<T> {
     fn new(value: T) -> Self {
         Slot {
             generation: AtomicU32::new(OCCUPIED_BIT),
-            next_free: List::new(),
+            next_free: AtomicU32::new(NIL),
             value: UnsafeCell::new(MaybeUninit::new(value)),
         }
     }
@@ -450,30 +329,6 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
         }
 
         debug.finish()
-    }
-}
-
-struct List {
-    head: AtomicU32,
-}
-
-impl List {
-    fn new() -> Self {
-        List {
-            head: AtomicU32::new(NIL),
-        }
-    }
-}
-
-impl fmt::Debug for List {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let head = self.head.load(Relaxed);
-
-        if head == NIL {
-            f.pad("NIL")
-        } else {
-            fmt::Debug::fmt(&head, f)
-        }
     }
 }
 

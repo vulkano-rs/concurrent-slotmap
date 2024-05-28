@@ -3,17 +3,17 @@ use core::{
     fmt,
     ptr::NonNull,
     sync::atomic::{
-        self, AtomicUsize,
+        self, AtomicU32,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
 use std::sync::{Mutex, TryLockError};
 
 /// The bit of `Local::epoch` which signifies that the participant is pinned.
-const PINNED_BIT: usize = 1 << 0;
+const PINNED_BIT: u32 = 1 << 0;
 
 /// The number of pinnings between a participant tries to advance the global epoch.
-const PINNINGS_BETWEEN_ADVANCE: usize = 128;
+const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
 
 /// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross
 /// into more than one global epoch advance. It is important to pin the local epoch before doing
@@ -88,7 +88,7 @@ struct Global {
     _alignment: CacheAligned,
 
     /// The global epoch counter. This can only ever be one step ahead of any pinned local epoch.
-    epoch: AtomicUsize,
+    epoch: AtomicU32,
 }
 
 unsafe impl Send for Global {}
@@ -99,12 +99,12 @@ impl Global {
         Global {
             local_list_head: Mutex::new(None),
             _alignment: CacheAligned,
-            epoch: AtomicUsize::new(0),
+            epoch: AtomicU32::new(0),
         }
     }
 
     #[cold]
-    fn try_advance(&self) -> usize {
+    fn try_advance(&self) {
         let global_epoch = self.epoch.load(Relaxed);
 
         // Ensure that none of the loads of the local epochs can be ordered before the load of the
@@ -115,7 +115,7 @@ impl Global {
             Ok(guard) => guard,
             // There is no way in which a panic can happen while holding the lock.
             Err(TryLockError::Poisoned(err)) => err.into_inner(),
-            Err(TryLockError::WouldBlock) => return global_epoch,
+            Err(TryLockError::WouldBlock) => return,
         };
 
         let mut head = *head;
@@ -125,7 +125,7 @@ impl Global {
             let local_epoch = local.epoch.load(Relaxed);
 
             if local_epoch & PINNED_BIT != 0 && local_epoch & !PINNED_BIT != global_epoch {
-                return global_epoch;
+                return;
             }
 
             head = local.next.get();
@@ -142,8 +142,6 @@ impl Global {
         // of all other participants from the previous epoch.
         atomic::fence(Acquire);
         self.epoch.store(new_epoch, Release);
-
-        new_epoch
     }
 }
 
@@ -154,26 +152,26 @@ struct Local {
 
     /// The local epoch counter. When this epoch is pinned, it ensures that the global epoch cannot
     /// be advanced more than one step until it is unpinned.
-    epoch: AtomicUsize,
+    epoch: AtomicU32,
 
     _alignment: CacheAligned,
 
     /// The number of `Guard`s that exist.
-    guard_count: Cell<usize>,
+    guard_count: Cell<u32>,
 
     /// The number of `LocalHandle`s that exist.
     // FIXME: We don't need this.
     handle_count: Cell<usize>,
 
     /// The number of pinnings this participant has gone through in total.
-    pin_count: Cell<usize>,
+    pin_count: Cell<u32>,
 }
 
 impl Local {
     fn register() -> LocalHandle {
         let mut local = Box::new(Local {
             next: Cell::new(None),
-            epoch: AtomicUsize::new(0),
+            epoch: AtomicU32::new(0),
             _alignment: CacheAligned,
             guard_count: Cell::new(0),
             handle_count: Cell::new(1),
@@ -246,7 +244,7 @@ pub struct Guard {
 
 impl Guard {
     #[inline]
-    pub fn epoch(&self) -> usize {
+    pub fn epoch(&self) -> u32 {
         self.local().epoch.load(Relaxed) & !PINNED_BIT
     }
 
