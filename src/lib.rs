@@ -307,6 +307,59 @@ impl<T> Drop for SlotMap<T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct List<'a, T>(&'a SlotMap<T>, u32);
+
+        impl<T> fmt::Debug for List<'_, T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut head = self.1;
+                let mut debug = f.debug_list();
+
+                while head != NIL {
+                    debug.entry(&head);
+                    let slot = unsafe { self.0.slot_unchecked(head) };
+                    head = slot.next_free.load(Acquire);
+                }
+
+                debug.finish()
+            }
+        }
+
+        struct QueuedList<'a, T>(&'a SlotMap<T>, u64);
+
+        impl<T> fmt::Debug for QueuedList<'_, T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let state = self.1;
+                let head = (state & 0xFFFF_FFFF) as u32;
+                let epoch = (state >> 32) as u32;
+                let mut debug = f.debug_struct("QueuedList");
+                debug
+                    .field("entries", &List(self.0, head))
+                    .field("epoch", &epoch);
+
+                debug.finish()
+            }
+        }
+
+        let _guard = epoch::pin();
+        let mut debug = f.debug_struct("SlotMap");
+        debug
+            .field("slots", &self.slots)
+            .field("len", &self.len)
+            .field("free_list", &List(self, self.free_list.load(Acquire)))
+            .field(
+                "free_list_queue",
+                &[
+                    QueuedList(self, self.free_list_queue[0].load(Acquire)),
+                    QueuedList(self, self.free_list_queue[1].load(Acquire)),
+                ],
+            );
+
+        debug.finish()
+    }
+}
+
 const OCCUPIED_BIT: u32 = 1;
 
 struct Slot<T> {
@@ -338,6 +391,14 @@ impl<T> Slot<T> {
 
 impl<T: fmt::Debug> fmt::Debug for Slot<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Nil;
+
+        impl fmt::Debug for Nil {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.pad("NIL")
+            }
+        }
+
         let _guard = epoch::pin();
         let generation = self.generation.load(Acquire);
 
@@ -347,7 +408,13 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
         if generation & OCCUPIED_BIT != 0 {
             debug.field("value", unsafe { self.value_unchecked() });
         } else {
-            debug.field("next_free", &self.next_free);
+            let next_free = self.next_free.load(Relaxed);
+
+            if next_free == NIL {
+                debug.field("next_free", &Nil);
+            } else {
+                debug.field("next_free", &next_free);
+            }
         }
 
         debug.finish()
