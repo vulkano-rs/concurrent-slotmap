@@ -82,6 +82,7 @@ impl<T> SlotMap<T> {
     }
 
     pub fn insert(&self, value: T) -> SlotId {
+        let _guard = epoch::pin();
         let mut free_list_head = self.free_list.load(Acquire);
 
         loop {
