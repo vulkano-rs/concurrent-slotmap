@@ -1,6 +1,6 @@
 use crate::CacheAligned;
 use core::{
-    cell::{Cell, UnsafeCell},
+    cell::Cell,
     fmt,
     ptr::NonNull,
     sync::atomic::{
@@ -8,7 +8,10 @@ use core::{
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
-use std::sync::{Mutex, TryLockError};
+use std::{
+    sync::{Mutex, TryLockError},
+    thread,
+};
 
 /// The bit of `Local::epoch` which signifies that the participant is pinned.
 const PINNED_BIT: u32 = 1 << 0;
@@ -59,22 +62,42 @@ fn global() -> &'static Global {
 #[inline]
 fn local() -> NonNull<Local> {
     thread_local! {
-        static LOCAL: UnsafeCell<Option<LocalHandle>> = const { UnsafeCell::new(None) };
+        static LOCAL: Cell<Option<NonNull<Local>>> = const { Cell::new(None) };
+
+        static THREAD_GUARD: ThreadGuard = const { ThreadGuard { local: Cell::new(None) } };
+    }
+
+    struct ThreadGuard {
+        local: Cell<Option<NonNull<Local>>>,
+    }
+
+    impl Drop for ThreadGuard {
+        fn drop(&mut self) {
+            let local = self.local.get().unwrap();
+            let guard_count = unsafe { local.as_ref() }.guard_count.get();
+
+            if guard_count == 0 {
+                let _ = LOCAL.try_with(|cell| cell.set(None));
+                unsafe { Local::unregister(local) };
+            } else if !thread::panicking() {
+                unreachable!("storing an `epoch::Guard` inside TLS is very naughty");
+            }
+        }
     }
 
     #[cold]
     fn local_slow() -> NonNull<Local> {
-        let handle = Local::register();
-        let local = handle.local;
+        let local = Local::register();
 
-        LOCAL.with(|cell| unsafe { *cell.get() = Some(handle) });
+        LOCAL.with(|cell| cell.set(Some(local)));
+        THREAD_GUARD.with(|guard| guard.local.set(Some(local)));
 
         local
     }
 
     LOCAL.with(|cell| {
-        if let Some(handle) = unsafe { &*cell.get() }.as_ref() {
-            handle.local
+        if let Some(local) = cell.get() {
+            local
         } else {
             local_slow()
         }
@@ -160,22 +183,17 @@ struct Local {
     /// The number of `Guard`s that exist.
     guard_count: Cell<u32>,
 
-    /// The number of `LocalHandle`s that exist.
-    // FIXME: We don't need this.
-    handle_count: Cell<usize>,
-
     /// The number of pinnings this participant has gone through in total.
     pin_count: Cell<u32>,
 }
 
 impl Local {
-    fn register() -> LocalHandle {
+    fn register() -> NonNull<Self> {
         let mut local = Box::new(Local {
             next: Cell::new(None),
             epoch: AtomicU32::new(0),
             _alignment: CacheAligned,
             guard_count: Cell::new(0),
-            handle_count: Cell::new(1),
             pin_count: Cell::new(0),
         });
 
@@ -189,7 +207,7 @@ impl Local {
         let local = unsafe { NonNull::new_unchecked(Box::into_raw(local)) };
         *head = Some(local);
 
-        LocalHandle { local }
+        local
     }
 
     #[cold]
@@ -223,22 +241,6 @@ impl Local {
     }
 }
 
-struct LocalHandle {
-    local: NonNull<Local>,
-}
-
-impl Drop for LocalHandle {
-    #[inline]
-    fn drop(&mut self) {
-        let local = unsafe { self.local.as_ref() };
-        local.handle_count.set(local.handle_count.get() - 1);
-
-        if local.guard_count.get() == 0 && local.handle_count.get() == 0 {
-            unsafe { Local::unregister(self.local) };
-        }
-    }
-}
-
 pub struct Guard {
     local: NonNull<Local>,
 }
@@ -266,10 +268,6 @@ impl Drop for Guard {
             // `Global::try_advance`, which in turn ensures that all accesses done by us until this
             // point are visible to all other participants when crossing an epoch boundary.
             local.epoch.store(0, Release);
-
-            if local.handle_count.get() == 0 {
-                unsafe { Local::unregister(self.local) };
-            }
         }
     }
 }
