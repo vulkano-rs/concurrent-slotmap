@@ -6,7 +6,7 @@
 
 use core::{
     cell::UnsafeCell,
-    fmt,
+    fmt, hint,
     mem::MaybeUninit,
     num::NonZeroU32,
     ops::Deref,
@@ -84,6 +84,7 @@ impl<T> SlotMap<T> {
     pub fn insert(&self, value: T) -> SlotId {
         let _guard = epoch::pin();
         let mut free_list_head = self.free_list.load(Acquire);
+        let mut backoff = Backoff::new();
 
         loop {
             if free_list_head == NIL {
@@ -111,7 +112,10 @@ impl<T> SlotMap<T> {
 
                     return SlotId::new(free_list_head, last_generation.wrapping_add(1));
                 }
-                Err(new_head) => free_list_head = new_head,
+                Err(new_head) => {
+                    free_list_head = new_head;
+                    backoff.spin();
+                }
             }
         }
 
@@ -143,6 +147,7 @@ impl<T> SlotMap<T> {
         let epoch = guard.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
+        let mut backoff = Backoff::new();
 
         loop {
             let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
@@ -160,7 +165,10 @@ impl<T> SlotMap<T> {
                         self.len.fetch_sub(1, Relaxed);
                         break Some(());
                     }
-                    Err(new_state) => queued_state = new_state,
+                    Err(new_state) => {
+                        queued_state = new_state;
+                        backoff.spin();
+                    }
                 }
             } else {
                 debug_assert!(epoch_interval >= 4);
@@ -181,7 +189,10 @@ impl<T> SlotMap<T> {
 
                         break Some(());
                     }
-                    Err(new_state) => queued_state = new_state,
+                    Err(new_state) => {
+                        queued_state = new_state;
+                        backoff.spin();
+                    }
                 }
             }
         }
@@ -216,6 +227,7 @@ impl<T> SlotMap<T> {
         }
 
         let mut free_list_head = self.free_list.load(Acquire);
+        let mut backoff = Backoff::new();
 
         // Free the queued free-list by prepending it to the free-list.
         loop {
@@ -228,7 +240,10 @@ impl<T> SlotMap<T> {
                 Acquire,
             ) {
                 Ok(_) => break,
-                Err(new_head) => free_list_head = new_head,
+                Err(new_head) => {
+                    free_list_head = new_head;
+                    backoff.spin();
+                }
             }
         }
     }
@@ -395,5 +410,27 @@ impl<T: fmt::Debug> fmt::Debug for Ref<'_, T> {
 impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
+    }
+}
+
+const SPIN_LIMIT: u32 = 6;
+
+struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Backoff { step: 0 }
+    }
+
+    fn spin(&mut self) {
+        for _ in 0..1 << self.step {
+            hint::spin_loop();
+        }
+
+        if self.step <= SPIN_LIMIT {
+            self.step += 1;
+        }
     }
 }
