@@ -1,3 +1,4 @@
+use crate::CacheAligned;
 use core::{
     cell::{Cell, UnsafeCell},
     fmt,
@@ -278,6 +279,3 @@ impl fmt::Debug for Guard {
         f.debug_struct("Guard").finish_non_exhaustive()
     }
 }
-
-#[repr(align(128))]
-struct CacheAligned;

@@ -22,14 +22,18 @@ mod epoch;
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
 
-#[derive(Debug)]
+#[cfg_attr(not(doc), repr(C))]
 pub struct SlotMap<T> {
     slots: Vec<Slot<T>>,
     len: AtomicU32,
 
+    _alignment1: CacheAligned,
+
     /// The free-list. This is the list of slots which have already been dropped and are ready to
     /// be claimed by insert operations.
     free_list: AtomicU32,
+
+    _alignment2: CacheAligned,
 
     /// Free-lists queued for inclusion in the `free_list`. Since the global epoch counter can only
     /// ever be one step apart from a local one, we only need two free-lists in the queue: one for
@@ -53,7 +57,9 @@ impl<T> SlotMap<T> {
         SlotMap {
             slots: Vec::new(max_capacity as usize),
             len: AtomicU32::new(0),
+            _alignment1: CacheAligned,
             free_list: AtomicU32::new(NIL),
+            _alignment2: CacheAligned,
             free_list_queue: [
                 AtomicU64::new(u64::from(NIL)),
                 AtomicU64::new(u64::from(NIL) | 2 << 32),
@@ -412,6 +418,9 @@ impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
         fmt::Display::fmt(&**self, f)
     }
 }
+
+#[repr(align(128))]
+struct CacheAligned;
 
 const SPIN_LIMIT: u32 = 6;
 
