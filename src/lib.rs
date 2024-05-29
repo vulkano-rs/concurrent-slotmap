@@ -2,7 +2,7 @@
 // This should be `forbid` but there's a bug in rustc:
 // https://github.com/rust-lang/rust/issues/121483
 #![deny(unsafe_op_in_unsafe_fn)]
-// #![forbid(clippy::undocumented_unsafe_blocks)]
+#![forbid(clippy::undocumented_unsafe_blocks)]
 
 use core::{
     cell::UnsafeCell,
@@ -109,7 +109,8 @@ impl<T> SlotMap<T> {
             {
                 Ok(_) => {
                     // SAFETY: `SlotMap::remove` guarantees that the free-list only contains slots
-                    // that are no longer read by any threads.
+                    // that are no longer read by any threads, and we have removed the slot from
+                    // the free-list such that no other threads can be writing the same slot.
                     unsafe { slot.value.get().cast::<T>().write(value) };
 
                     let last_generation = slot.generation.fetch_add(1, Release);
@@ -293,14 +294,25 @@ impl<T> Drop for SlotMap<T> {
             let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
 
             while head != NIL {
+                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // slots vector never shrinks, therefore the index must have staid in bounds.
                 let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
+
+                // SAFETY: We can be certain that this slot has been initialized, since the only
+                // way in which it could have been queued for freeing is in `SlotMap::remove` if
+                // the slot was inserted before.
                 unsafe { slot.value.get_mut().assume_init_drop() };
+
                 head = *slot.next_free.get_mut();
             }
         }
 
         for slot in &mut self.slots {
             if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                // SAFETY:
+                // * The mutable reference makes sure that access to the slot is synchronized.
+                // * We checked that the slot is occupied, which means the it must have been
+                //   initialized in `SlotMap::insert`.
                 unsafe { slot.value.get_mut().assume_init_drop() };
             }
         }
@@ -318,7 +330,11 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
 
                 while head != NIL {
                     debug.entry(&head);
+
+                    // SAFETY: We always push indices of existing slots into the free-lists and the
+                    // slots vector never shrinks, therefore the index must have staid in bounds.
                     let slot = unsafe { self.0.slot_unchecked(head) };
+
                     head = slot.next_free.load(Acquire);
                 }
 
@@ -368,7 +384,7 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-unsafe impl<T: Send> Send for Slot<T> {}
+// SAFETY: The user of `Slot` must ensure that access to `Slot::value` is synchronized.
 unsafe impl<T: Sync> Sync for Slot<T> {}
 
 impl<T> Slot<T> {
@@ -406,6 +422,12 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
         debug.field("generation", &generation);
 
         if generation & OCCUPIED_BIT != 0 {
+            // SAFETY:
+            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
+            //   is visible here.
+            // * We checked that the slot is occupied, which means it must have been initialized in
+            //   `SlotMap::insert`.
             debug.field("value", unsafe { self.value_unchecked() });
         } else {
             let next_free = self.next_free.load(Relaxed);

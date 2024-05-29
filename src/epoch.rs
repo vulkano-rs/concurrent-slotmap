@@ -25,8 +25,11 @@ const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
 /// as any accesses from the pinned epoch can persist.
 #[inline]
 pub fn pin() -> Guard {
-    let guard = unsafe { Guard { local: local() } };
-    let local = unsafe { guard.local.as_ref() };
+    let local_ptr = local();
+
+    // SAFETY: `local()` always returns a pointer valid for access by the current thread.
+    let local = unsafe { local_ptr.as_ref() };
+
     let guard_count = local.guard_count.get();
     local.guard_count.set(guard_count.checked_add(1).unwrap());
 
@@ -50,7 +53,12 @@ pub fn pin() -> Guard {
         }
     }
 
-    guard
+    // SAFETY:
+    // * We incremented the `guard_count` above, such that the guard's drop implementation cannot
+    //   unpin the participant while another guard still exists.
+    // * We made sure to pin the participant if it wasn't already and made sure that accesses from
+    //   this point on can't leak into the previous epoch.
+    unsafe { Guard { local: local_ptr } }
 }
 
 #[inline]
@@ -75,10 +83,18 @@ fn local() -> NonNull<Local> {
     impl Drop for ThreadGuard {
         fn drop(&mut self) {
             let local = self.local.get().unwrap();
+
+            // SAFETY: `Local::register` always returns a pointer valid for access by the current
+            // thread, and the pointer is stored in the thread's TLS. It must have staid valid
+            // until now because this place is the only one which invalidates it.
             let guard_count = unsafe { local.as_ref() }.guard_count.get();
 
             if guard_count == 0 {
                 let _ = LOCAL.try_with(|cell| cell.set(None));
+
+                // SAFETY: We checked that the `guard_count` is zero, which means that no guards
+                // exist which could attempt to access the pointer. We also ensured that any future
+                // calls to `local` can't access this pointer by unsetting `LOCAL` above.
                 unsafe { Local::unregister(local) };
             } else if !thread::panicking() {
                 unreachable!(
@@ -120,7 +136,7 @@ struct Global {
     epoch: AtomicU32,
 }
 
-unsafe impl Send for Global {}
+// SAFETY: Access to the linked list of locals is synchronized with a mutex.
 unsafe impl Sync for Global {}
 
 impl Global {
@@ -150,6 +166,7 @@ impl Global {
         let mut head = *head;
 
         while let Some(local) = head {
+            // SAFETY: The list of locals always contains valid pointers.
             let local = unsafe { local.as_ref() };
             let local_epoch = local.epoch.load(Relaxed);
 
@@ -209,7 +226,10 @@ impl Local {
         };
 
         local.next = Cell::new(*head);
+
+        // SAFETY: `Box` is guaranteed to be non-null.
         let local = unsafe { NonNull::new_unchecked(Box::into_raw(local)) };
+
         *head = Some(local);
 
         local
@@ -223,17 +243,26 @@ impl Local {
         };
 
         if *head == Some(local) {
+            // SAFETY: The list of locals always contains valid pointers.
             *head = unsafe { local.as_ref() }.next.get();
         } else {
+            // SAFETY: The caller must ensure that `local` is present in the list of locals.
             let mut curr = unsafe { head.unwrap_unchecked() };
 
             loop {
+                // SAFETY: The list of locals always contains valid pointers.
                 let next = unsafe { curr.as_ref() }.next.get();
+
+                // SAFETY: The caller must ensure that `local` is present in the list of locals.
                 let next = unsafe { next.unwrap_unchecked() };
 
                 if next == local {
+                    // SAFETY: The list of locals always contains valid pointers.
                     let next = unsafe { next.as_ref() }.next.get();
+
+                    // SAFETY: The list of locals always contains valid pointers.
                     unsafe { curr.as_ref() }.next.set(next);
+
                     break;
                 }
 
@@ -241,6 +270,7 @@ impl Local {
             }
         }
 
+        // SAFETY: The caller must ensure that `local` can't be accessed after this point.
         let _ = unsafe { Box::from_raw(local.as_ptr()) };
     }
 }
@@ -257,6 +287,8 @@ impl Guard {
 
     #[inline]
     fn local(&self) -> &Local {
+        // SAFETY: The constructor of `Guard` must ensure that the pointer stays valid for the
+        // lifetime of the guard.
         unsafe { self.local.as_ref() }
     }
 }
@@ -264,14 +296,20 @@ impl Guard {
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
-        let local = unsafe { self.local.as_ref() };
-        local.guard_count.set(local.guard_count.get() - 1);
+        let local = self.local();
+
+        // SAFETY: The constructor of `Guard` must ensure that the `guard_count` has been
+        // incremented before construction of the guard.
+        unsafe { local.guard_count.set(local.guard_count.get() - 1) };
 
         if local.guard_count.get() == 0 {
-            // The `Release` ordering synchronizes with the `Acquire` fence in
-            // `Global::try_advance`, which in turn ensures that all accesses done by us until this
-            // point are visible to all other participants when crossing an epoch boundary.
-            local.epoch.store(0, Release);
+            // SAFETY:
+            // * The `Release` ordering synchronizes with the `Acquire` fence in
+            //   `Global::try_advance`, which in turn ensures that all accesses done by us until
+            //   this point are visible to all other participants when crossing an epoch boundary.
+            // * We checked that the guard count went to zero, which means that no other guards can
+            //   exist and it is safe to unpin the participant.
+            unsafe { local.epoch.store(0, Release) };
         }
     }
 }
