@@ -5,13 +5,13 @@ extern crate test;
 use std::{sync::RwLock, thread};
 use test::{black_box, Bencher};
 
-const ITERATIONS: usize = 100_000;
-const THREADS: usize = 10;
+const ITERATIONS: u32 = 100_000;
+const THREADS: u32 = 10;
 
 #[bench]
 fn concurrent_slotmap(b: &mut Bencher) {
     b.iter(|| {
-        let map = concurrent_slotmap::SlotMap::new((ITERATIONS * 2) as u32);
+        let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
 
         thread::scope(|s| {
             for _ in 0..THREADS {
