@@ -284,41 +284,8 @@ impl<T> SlotMap<T> {
     }
 }
 
-impl<T> Drop for SlotMap<T> {
-    fn drop(&mut self) {
-        if !core::mem::needs_drop::<T>() {
-            return;
-        }
-
-        for list in &mut self.free_list_queue {
-            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
-
-            while head != NIL {
-                // SAFETY: We always push indices of existing slots into the free-lists and the
-                // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
-
-                // SAFETY: We can be certain that this slot has been initialized, since the only
-                // way in which it could have been queued for freeing is in `SlotMap::remove` if
-                // the slot was inserted before.
-                unsafe { slot.value.get_mut().assume_init_drop() };
-
-                head = *slot.next_free.get_mut();
-            }
-        }
-
-        for slot in &mut self.slots {
-            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
-                // SAFETY:
-                // * The mutable reference makes sure that access to the slot is synchronized.
-                // * We checked that the slot is occupied, which means the it must have been
-                //   initialized in `SlotMap::insert`.
-                unsafe { slot.value.get_mut().assume_init_drop() };
-            }
-        }
-    }
-}
-
+// We don't want to print the `_alignment` fields.
+#[allow(clippy::missing_fields_in_debug)]
 impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct List<'a, T>(&'a SlotMap<T>, u32);
@@ -373,6 +340,41 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             );
 
         debug.finish()
+    }
+}
+
+impl<T> Drop for SlotMap<T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        for list in &mut self.free_list_queue {
+            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
+
+            while head != NIL {
+                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // slots vector never shrinks, therefore the index must have staid in bounds.
+                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
+
+                // SAFETY: We can be certain that this slot has been initialized, since the only
+                // way in which it could have been queued for freeing is in `SlotMap::remove` if
+                // the slot was inserted before.
+                unsafe { slot.value.get_mut().assume_init_drop() };
+
+                head = *slot.next_free.get_mut();
+            }
+        }
+
+        for slot in &mut self.slots {
+            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                // SAFETY:
+                // * The mutable reference makes sure that access to the slot is synchronized.
+                // * We checked that the slot is occupied, which means the it must have been
+                //   initialized in `SlotMap::insert`.
+                unsafe { slot.value.get_mut().assume_init_drop() };
+            }
+        }
     }
 }
 
