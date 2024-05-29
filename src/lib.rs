@@ -35,13 +35,13 @@ pub struct SlotMap<T> {
 
     _alignment2: CacheAligned,
 
-    /// Free-lists queued for inclusion in the `free_list`. Since the global epoch counter can only
-    /// ever be one step apart from a local one, we only need two free-lists in the queue: one for
-    /// the current global epoch and one for the previous epoch. This way a thread can always push
-    /// a slot into list `(epoch / 2) % 2`, and whenever the global epoch is advanced, since we
-    /// know that the lag can be at most one step, we can be certain that the list which was
-    /// lagging behind before the global epoch was advanced is now safe to drop and prepend to
-    /// `free_list`.
+    /// Free-lists queued for inclusion in the `free_list`. Since the global epoch can only be
+    /// advanced if all pinned local epochs are pinned in the current global epoch, we only need
+    /// two free-lists in the queue: one for the current global epoch and one for the previous
+    /// epoch. This way a thread can always push a slot into list `(epoch / 2) % 2`, and whenever
+    /// the global epoch is advanced, since we know that the lag can be at most one step, we can be
+    /// certain that the list which was lagging behind before the global epoch was advanced is now
+    /// safe to drop and prepend to the `free_list`.
     ///
     /// The atomic packs the list's head in the lower 32 bits and the epoch of the last push in the
     /// upper 32 bits. The epoch must not be updated if it would be going backwards; it's only
@@ -217,7 +217,7 @@ impl<T> SlotMap<T> {
         // Drop the queued free-list and find the tail slot.
         loop {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
-            // vector never shrinks, therefore the index must have stayed in bounds.
+            // vector never shrinks, therefore the index must have staid in bounds.
             queued_tail_slot = unsafe { self.slot_unchecked(queued_tail) };
 
             // SAFETY: The caller must ensure that we have exclusive access to this list.

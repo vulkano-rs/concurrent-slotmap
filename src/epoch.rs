@@ -19,9 +19,10 @@ const PINNED_BIT: u32 = 1 << 0;
 /// The number of pinnings between a participant tries to advance the global epoch.
 const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
 
-/// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross
-/// into more than one global epoch advance. It is important to pin the local epoch before doing
-/// any kind of access, such that no accesses can bleed into the previous epoch.
+/// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross an
+/// epoch boundary. It is important to pin the local epoch before doing any kind of access, such
+/// that no accesses can bleed into the previous epoch. Similarly, the pin must persist for as long
+/// as any accesses from the pinned epoch can persist.
 #[inline]
 pub fn pin() -> Guard {
     let guard = unsafe { Guard { local: local() } };
@@ -80,7 +81,10 @@ fn local() -> NonNull<Local> {
                 let _ = LOCAL.try_with(|cell| cell.set(None));
                 unsafe { Local::unregister(local) };
             } else if !thread::panicking() {
-                unreachable!("storing an `epoch::Guard` inside TLS is very naughty");
+                unreachable!(
+                    "the only way to reach this is by leaking an `epoch::Guard` or by storing one \
+                    inside TLS; both are very naughty",
+                );
             }
         }
     }
@@ -111,7 +115,8 @@ struct Global {
 
     _alignment: CacheAligned,
 
-    /// The global epoch counter. This can only ever be one step ahead of any pinned local epoch.
+    /// The global epoch counter. This can only be advanced if all pinned local epochs are pinned
+    /// in the current global epoch.
     epoch: AtomicU32,
 }
 
