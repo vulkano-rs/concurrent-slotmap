@@ -210,7 +210,6 @@ impl Local {
         local
     }
 
-    #[cold]
     unsafe fn unregister(local: NonNull<Self>) {
         let mut head = match global().local_list_head.lock() {
             Ok(guard) => guard,
