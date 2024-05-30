@@ -2,6 +2,7 @@
 
 extern crate test;
 
+use concurrent_slotmap::epoch;
 use std::{sync::RwLock, thread};
 use test::{black_box, Bencher};
 
@@ -17,7 +18,7 @@ fn concurrent_slotmap(b: &mut Bencher) {
             for _ in 0..THREADS {
                 s.spawn(|| {
                     for _ in black_box(0..ITERATIONS / THREADS) {
-                        map.insert(black_box([0usize; 2]));
+                        map.insert(black_box([0usize; 2]), &epoch::pin());
                     }
                 });
             }
