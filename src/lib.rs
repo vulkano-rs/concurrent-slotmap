@@ -160,9 +160,8 @@ impl<T> SlotMap<T> {
             let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
             let queued_epoch = (queued_state >> 32) as u32;
             let epoch_interval = epoch.wrapping_sub(queued_epoch);
-            let local_epoch_is_behind = epoch_interval & (1 << 31) != 0;
 
-            if local_epoch_is_behind || epoch_interval == 0 {
+            if epoch_interval == 0 {
                 slot.next_free.store(queued_head, Relaxed);
 
                 let new_state = u64::from(id.index) | u64::from(queued_epoch) << 32;
@@ -178,6 +177,18 @@ impl<T> SlotMap<T> {
                     }
                 }
             } else {
+                let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
+
+                // TODO: What's preventing this? If we pushed into the list as above in this case,
+                // it could happen that:
+                // * Thread A loads global epoch, preempts.
+                // * Thread B advances the global epoch twice to epoch E.
+                // * Thread A pins itself in epoch E - 4.
+                // * Thread A removes slot S, sees the last push into the queued list was E - 4.
+                // * Thread B removes slot P, sees the last push into the queued list was E - 4,
+                //   drops slot S which could still be accessed by thread A.
+                assert!(!local_epoch_is_behind_queue);
+
                 debug_assert!(epoch_interval >= 4);
 
                 slot.next_free.store(NIL, Relaxed);
