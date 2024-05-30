@@ -134,7 +134,7 @@ impl<T> SlotMap<T> {
         SlotId::new(index as u32, OCCUPIED_BIT)
     }
 
-    pub fn remove(&self, id: SlotId, guard: &epoch::Guard) -> Option<()> {
+    pub fn remove<'g>(&self, id: SlotId, guard: &'g epoch::Guard) -> Option<Ref<'_, 'g, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -143,7 +143,7 @@ impl<T> SlotMap<T> {
         // the `OCCUPIED_BIT` is unset and the generation is advanced.
         if slot
             .generation
-            .compare_exchange(id.generation(), new_generation, Relaxed, Relaxed)
+            .compare_exchange(id.generation(), new_generation, Acquire, Relaxed)
             .is_err()
         {
             return None;
@@ -167,7 +167,18 @@ impl<T> SlotMap<T> {
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
                         self.len.fetch_sub(1, Relaxed);
-                        break Some(());
+
+                        // SAFETY:
+                        // * The `Acquire` ordering when loading the slot's generation synchronizes
+                        //   with the `Release` ordering in `SlotMap::insert`, making sure that the
+                        //   newly written value is visible here.
+                        // * The `compare_exchange` above succeeded, which means that the previous
+                        //   generation of the slot must have matched `id.generation`. By `SlotId`'s
+                        //   invariant, its generation's occupied bit must be set. Since the
+                        //   generation matched, the slot's occupied bit must have been set, which
+                        //   makes reading the value safe as the only way the occupied bit can be
+                        //   set is in `SlotMap::insert` after initialization of the slot.
+                        break Some(unsafe { Ref { slot, guard } });
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -203,7 +214,8 @@ impl<T> SlotMap<T> {
                         // accessing any of the slots in the list.
                         unsafe { self.collect_garbage(queued_head) };
 
-                        break Some(());
+                        // SAFETY: Same as the the `Ref` construction in the above branch.
+                        break Some(unsafe { Ref { slot, guard } });
                     }
                     Err(new_state) => {
                         queued_state = new_state;
