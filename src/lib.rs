@@ -17,7 +17,7 @@ use core::{
 };
 use virtual_buffer::vec::Vec;
 
-mod epoch;
+pub mod epoch;
 
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
@@ -87,8 +87,7 @@ impl<T> SlotMap<T> {
         self.len() == 0
     }
 
-    pub fn insert(&self, value: T) -> SlotId {
-        let _guard = epoch::pin();
+    pub fn insert(&self, value: T, _guard: &epoch::Guard) -> SlotId {
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
 
@@ -135,8 +134,7 @@ impl<T> SlotMap<T> {
         SlotId::new(index as u32, OCCUPIED_BIT)
     }
 
-    pub fn remove(&self, id: SlotId) -> Option<()> {
-        let guard = epoch::pin();
+    pub fn remove(&self, id: SlotId, guard: &epoch::Guard) -> Option<()> {
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -268,8 +266,7 @@ impl<T> SlotMap<T> {
 
     #[inline]
     #[must_use]
-    pub fn get(&self, id: SlotId) -> Option<Ref<'_, T>> {
-        let guard = epoch::pin();
+    pub fn get<'g>(&self, id: SlotId, guard: &'g epoch::Guard) -> Option<Ref<'_, 'g, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
 
@@ -491,13 +488,13 @@ impl SlotId {
     }
 }
 
-pub struct Ref<'a, T> {
-    slot: &'a Slot<T>,
+pub struct Ref<'s, 'g, T> {
+    slot: &'s Slot<T>,
     #[allow(dead_code)]
-    guard: epoch::Guard,
+    guard: &'g epoch::Guard,
 }
 
-impl<T> Deref for Ref<'_, T> {
+impl<T> Deref for Ref<'_, '_, T> {
     type Target = T;
 
     #[inline]
@@ -509,13 +506,13 @@ impl<T> Deref for Ref<'_, T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Ref<'_, T> {
+impl<T: fmt::Debug> fmt::Debug for Ref<'_, '_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
+impl<T: fmt::Display> fmt::Display for Ref<'_, '_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
