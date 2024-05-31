@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn basic_usage1() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let x = map.insert(69, guard.into());
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn basic_usage2() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let x = map.insert(1, guard.into());
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn basic_usage3() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let x = map.insert(1, guard.into());
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn iter1() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let x = map.insert(1, guard.into());
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn iter2() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let x = map.insert(1, guard.into());
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn iter3() {
-        let map = SlotMap::new(u32::MAX);
+        let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
         let _ = map.insert(1, guard.into());
