@@ -708,3 +708,216 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 }
 
 impl<T> FusedIterator for IterMut<'_, T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_usage1() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let x = map.insert(69, guard.into());
+        let y = map.insert(42, guard.into());
+
+        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&69));
+        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&42));
+
+        map.remove(x, guard.into());
+
+        let x2 = map.insert(12, guard.into());
+
+        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&12));
+        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+
+        map.remove(y, guard.into());
+        map.remove(x2, guard.into());
+
+        assert_eq!(map.get(y, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
+    }
+
+    #[test]
+    fn basic_usage2() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let x = map.insert(1, guard.into());
+        let y = map.insert(2, guard.into());
+        let z = map.insert(3, guard.into());
+
+        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&1));
+        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&2));
+        assert_eq!(map.get(z, guard.into()).as_deref(), Some(&3));
+
+        map.remove(y, guard.into());
+
+        let y2 = map.insert(20, guard.into());
+
+        assert_eq!(map.get(y2, guard.into()).as_deref(), Some(&20));
+        assert_eq!(map.get(y, guard.into()).as_deref(), None);
+
+        map.remove(x, guard.into());
+        map.remove(z, guard.into());
+
+        let x2 = map.insert(10, guard.into());
+
+        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&10));
+        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+
+        let z2 = map.insert(30, guard.into());
+
+        assert_eq!(map.get(z2, guard.into()).as_deref(), Some(&30));
+        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+
+        map.remove(x2, guard.into());
+
+        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
+
+        map.remove(y2, guard.into());
+        map.remove(z2, guard.into());
+
+        assert_eq!(map.get(y2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(z2, guard.into()).as_deref(), None);
+    }
+
+    #[test]
+    fn basic_usage3() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let x = map.insert(1, guard.into());
+        let y = map.insert(2, guard.into());
+
+        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&1));
+        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&2));
+
+        let z = map.insert(3, guard.into());
+
+        assert_eq!(map.get(z, guard.into()).as_deref(), Some(&3));
+
+        map.remove(x, guard.into());
+        map.remove(z, guard.into());
+
+        let z2 = map.insert(30, guard.into());
+        let x2 = map.insert(10, guard.into());
+
+        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&10));
+        assert_eq!(map.get(z2, guard.into()).as_deref(), Some(&30));
+        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+        assert_eq!(map.get(z, guard.into()).as_deref(), None);
+
+        map.remove(x2, guard.into());
+        map.remove(y, guard.into());
+        map.remove(z2, guard.into());
+
+        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(y, guard.into()).as_deref(), None);
+        assert_eq!(map.get(z2, guard.into()).as_deref(), None);
+    }
+
+    #[test]
+    fn iter1() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let x = map.insert(1, guard.into());
+        let _ = map.insert(2, guard.into());
+        let y = map.insert(3, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove(x, guard.into());
+        map.remove(y, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert!(iter.next().is_none());
+
+        map.insert(3, guard.into());
+        map.insert(1, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter2() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let x = map.insert(1, guard.into());
+        let y = map.insert(2, guard.into());
+        let z = map.insert(3, guard.into());
+
+        map.remove(x, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove(y, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove(z, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter3() {
+        let map = SlotMap::new(u32::MAX);
+        let guard = &epoch::pin();
+
+        let _ = map.insert(1, guard.into());
+        let x = map.insert(2, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert!(iter.next().is_none());
+
+        map.remove(x, guard.into());
+
+        let x = map.insert(2, guard.into());
+        let _ = map.insert(3, guard.into());
+        let y = map.insert(4, guard.into());
+
+        map.remove(y, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove(x, guard.into());
+
+        let mut iter = map.iter(guard.into());
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+    }
+}
