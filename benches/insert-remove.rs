@@ -18,8 +18,8 @@ fn concurrent_slotmap(b: &mut Bencher) {
             for _ in 0..THREADS {
                 s.spawn(|| {
                     for _ in black_box(0..ITERATIONS / THREADS) {
-                        let id = map.insert(black_box([0usize; 2]), &epoch::pin());
-                        map.remove(black_box(id), &epoch::pin());
+                        let id = map.insert(black_box([0usize; 2]), epoch::pin().into());
+                        map.remove(black_box(id), epoch::pin().into());
                     }
                 });
             }

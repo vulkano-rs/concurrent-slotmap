@@ -15,6 +15,7 @@ use core::{
         Ordering::{Acquire, Relaxed, Release},
     },
 };
+use std::borrow::Cow;
 use virtual_buffer::vec::Vec;
 
 pub mod epoch;
@@ -87,7 +88,7 @@ impl<T> SlotMap<T> {
         self.len() == 0
     }
 
-    pub fn insert<'a>(&'a self, value: T, _guard: &'a epoch::Guard) -> SlotId {
+    pub fn insert<'a>(&'a self, value: T, _guard: Cow<'a, epoch::Guard>) -> SlotId {
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
 
@@ -134,7 +135,7 @@ impl<T> SlotMap<T> {
         SlotId::new(index as u32, OCCUPIED_BIT)
     }
 
-    pub fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard) -> Option<Ref<'a, T>> {
+    pub fn remove<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -276,9 +277,9 @@ impl<T> SlotMap<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     #[must_use]
-    pub fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard) -> Option<Ref<'a, T>> {
+    pub fn get<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
 
@@ -503,7 +504,7 @@ impl SlotId {
 pub struct Ref<'a, T> {
     slot: &'a Slot<T>,
     #[allow(dead_code)]
-    guard: &'a epoch::Guard,
+    guard: Cow<'a, epoch::Guard>,
 }
 
 impl<T> Deref for Ref<'_, T> {

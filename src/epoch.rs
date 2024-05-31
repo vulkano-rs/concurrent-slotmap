@@ -9,6 +9,7 @@ use core::{
     },
 };
 use std::{
+    borrow::Cow,
     sync::{Mutex, TryLockError},
     thread,
 };
@@ -293,6 +294,22 @@ impl Guard {
     }
 }
 
+impl Clone for Guard {
+    #[inline]
+    fn clone(&self) -> Self {
+        let local = self.local();
+        let guard_count = local.guard_count.get();
+
+        local.guard_count.set(guard_count.checked_add(1).unwrap());
+
+        // SAFETY:
+        // * We incremented the `guard_count` above, such that the guard's drop implementation
+        //   cannot unpin the participant while another guard still exists.
+        // * The participant is already pinned, as this guard's existence is a proof of that.
+        unsafe { Guard { local: self.local } }
+    }
+}
+
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
@@ -311,6 +328,20 @@ impl Drop for Guard {
             //   exist and it is safe to unpin the participant.
             unsafe { local.epoch.store(0, Release) };
         }
+    }
+}
+
+impl<'a> From<&'a Guard> for Cow<'a, Guard> {
+    #[inline]
+    fn from(guard: &'a Guard) -> Self {
+        Cow::Borrowed(guard)
+    }
+}
+
+impl From<Guard> for Cow<'_, Guard> {
+    #[inline]
+    fn from(guard: Guard) -> Self {
+        Cow::Owned(guard)
     }
 }
 
