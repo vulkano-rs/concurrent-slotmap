@@ -90,7 +90,12 @@ impl<T> SlotMap<T> {
         self.len() == 0
     }
 
-    pub fn insert<'a>(&'a self, value: T, _guard: Cow<'a, epoch::Guard>) -> SlotId {
+    #[inline]
+    pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard>>) -> SlotId {
+        self.insert_inner(value, guard.into())
+    }
+
+    fn insert_inner<'a>(&'a self, value: T, _guard: Cow<'a, epoch::Guard>) -> SlotId {
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
 
@@ -137,7 +142,16 @@ impl<T> SlotMap<T> {
         SlotId::new(index as u32, OCCUPIED_BIT)
     }
 
-    pub fn remove<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+    #[inline]
+    pub fn remove<'a>(
+        &'a self,
+        id: SlotId,
+        guard: impl Into<Cow<'a, epoch::Guard>>,
+    ) -> Option<Ref<'a, T>> {
+        self.remove_inner(id, guard.into())
+    }
+
+    fn remove_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -281,7 +295,16 @@ impl<T> SlotMap<T> {
 
     #[inline(always)]
     #[must_use]
-    pub fn get<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+    pub fn get<'a>(
+        &'a self,
+        id: SlotId,
+        guard: impl Into<Cow<'a, epoch::Guard>>,
+    ) -> Option<Ref<'a, T>> {
+        self.get_inner(id, guard.into())
+    }
+
+    #[inline(always)]
+    fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
 
@@ -307,10 +330,10 @@ impl<T> SlotMap<T> {
     }
 
     #[inline]
-    pub fn iter<'a>(&'a self, guard: Cow<'a, epoch::Guard>) -> Iter<'a, T> {
+    pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard>>) -> Iter<'a, T> {
         Iter {
             slots: self.slots.iter().enumerate(),
-            guard,
+            guard: guard.into(),
         }
     }
 
@@ -718,24 +741,24 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let x = map.insert(69, guard.into());
-        let y = map.insert(42, guard.into());
+        let x = map.insert(69, guard);
+        let y = map.insert(42, guard);
 
-        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&69));
-        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&42));
+        assert_eq!(map.get(x, guard).as_deref(), Some(&69));
+        assert_eq!(map.get(y, guard).as_deref(), Some(&42));
 
-        map.remove(x, guard.into());
+        map.remove(x, guard);
 
-        let x2 = map.insert(12, guard.into());
+        let x2 = map.insert(12, guard);
 
-        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&12));
-        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), Some(&12));
+        assert_eq!(map.get(x, guard).as_deref(), None);
 
-        map.remove(y, guard.into());
-        map.remove(x2, guard.into());
+        map.remove(y, guard);
+        map.remove(x2, guard);
 
-        assert_eq!(map.get(y, guard.into()).as_deref(), None);
-        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(y, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), None);
     }
 
     #[test]
@@ -743,43 +766,43 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let x = map.insert(1, guard.into());
-        let y = map.insert(2, guard.into());
-        let z = map.insert(3, guard.into());
+        let x = map.insert(1, guard);
+        let y = map.insert(2, guard);
+        let z = map.insert(3, guard);
 
-        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&1));
-        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&2));
-        assert_eq!(map.get(z, guard.into()).as_deref(), Some(&3));
+        assert_eq!(map.get(x, guard).as_deref(), Some(&1));
+        assert_eq!(map.get(y, guard).as_deref(), Some(&2));
+        assert_eq!(map.get(z, guard).as_deref(), Some(&3));
 
-        map.remove(y, guard.into());
+        map.remove(y, guard);
 
-        let y2 = map.insert(20, guard.into());
+        let y2 = map.insert(20, guard);
 
-        assert_eq!(map.get(y2, guard.into()).as_deref(), Some(&20));
-        assert_eq!(map.get(y, guard.into()).as_deref(), None);
+        assert_eq!(map.get(y2, guard).as_deref(), Some(&20));
+        assert_eq!(map.get(y, guard).as_deref(), None);
 
-        map.remove(x, guard.into());
-        map.remove(z, guard.into());
+        map.remove(x, guard);
+        map.remove(z, guard);
 
-        let x2 = map.insert(10, guard.into());
+        let x2 = map.insert(10, guard);
 
-        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&10));
-        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), Some(&10));
+        assert_eq!(map.get(x, guard).as_deref(), None);
 
-        let z2 = map.insert(30, guard.into());
+        let z2 = map.insert(30, guard);
 
-        assert_eq!(map.get(z2, guard.into()).as_deref(), Some(&30));
-        assert_eq!(map.get(x, guard.into()).as_deref(), None);
+        assert_eq!(map.get(z2, guard).as_deref(), Some(&30));
+        assert_eq!(map.get(x, guard).as_deref(), None);
 
-        map.remove(x2, guard.into());
+        map.remove(x2, guard);
 
-        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), None);
 
-        map.remove(y2, guard.into());
-        map.remove(z2, guard.into());
+        map.remove(y2, guard);
+        map.remove(z2, guard);
 
-        assert_eq!(map.get(y2, guard.into()).as_deref(), None);
-        assert_eq!(map.get(z2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(y2, guard).as_deref(), None);
+        assert_eq!(map.get(z2, guard).as_deref(), None);
     }
 
     #[test]
@@ -787,34 +810,34 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let x = map.insert(1, guard.into());
-        let y = map.insert(2, guard.into());
+        let x = map.insert(1, guard);
+        let y = map.insert(2, guard);
 
-        assert_eq!(map.get(x, guard.into()).as_deref(), Some(&1));
-        assert_eq!(map.get(y, guard.into()).as_deref(), Some(&2));
+        assert_eq!(map.get(x, guard).as_deref(), Some(&1));
+        assert_eq!(map.get(y, guard).as_deref(), Some(&2));
 
-        let z = map.insert(3, guard.into());
+        let z = map.insert(3, guard);
 
-        assert_eq!(map.get(z, guard.into()).as_deref(), Some(&3));
+        assert_eq!(map.get(z, guard).as_deref(), Some(&3));
 
-        map.remove(x, guard.into());
-        map.remove(z, guard.into());
+        map.remove(x, guard);
+        map.remove(z, guard);
 
-        let z2 = map.insert(30, guard.into());
-        let x2 = map.insert(10, guard.into());
+        let z2 = map.insert(30, guard);
+        let x2 = map.insert(10, guard);
 
-        assert_eq!(map.get(x2, guard.into()).as_deref(), Some(&10));
-        assert_eq!(map.get(z2, guard.into()).as_deref(), Some(&30));
-        assert_eq!(map.get(x, guard.into()).as_deref(), None);
-        assert_eq!(map.get(z, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), Some(&10));
+        assert_eq!(map.get(z2, guard).as_deref(), Some(&30));
+        assert_eq!(map.get(x, guard).as_deref(), None);
+        assert_eq!(map.get(z, guard).as_deref(), None);
 
-        map.remove(x2, guard.into());
-        map.remove(y, guard.into());
-        map.remove(z2, guard.into());
+        map.remove(x2, guard);
+        map.remove(y, guard);
+        map.remove(z2, guard);
 
-        assert_eq!(map.get(x2, guard.into()).as_deref(), None);
-        assert_eq!(map.get(y, guard.into()).as_deref(), None);
-        assert_eq!(map.get(z2, guard.into()).as_deref(), None);
+        assert_eq!(map.get(x2, guard).as_deref(), None);
+        assert_eq!(map.get(y, guard).as_deref(), None);
+        assert_eq!(map.get(z2, guard).as_deref(), None);
     }
 
     #[test]
@@ -822,29 +845,29 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let x = map.insert(1, guard.into());
-        let _ = map.insert(2, guard.into());
-        let y = map.insert(3, guard.into());
+        let x = map.insert(1, guard);
+        let _ = map.insert(2, guard);
+        let y = map.insert(3, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 2);
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
 
-        map.remove(x, guard.into());
-        map.remove(y, guard.into());
+        map.remove(x, guard);
+        map.remove(y, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 2);
         assert!(iter.next().is_none());
 
-        map.insert(3, guard.into());
-        map.insert(1, guard.into());
+        map.insert(3, guard);
+        map.insert(1, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 2);
         assert_eq!(*iter.next().unwrap().1, 3);
@@ -857,28 +880,28 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let x = map.insert(1, guard.into());
-        let y = map.insert(2, guard.into());
-        let z = map.insert(3, guard.into());
+        let x = map.insert(1, guard);
+        let y = map.insert(2, guard);
+        let z = map.insert(3, guard);
 
-        map.remove(x, guard.into());
+        map.remove(x, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 2);
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
 
-        map.remove(y, guard.into());
+        map.remove(y, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
 
-        map.remove(z, guard.into());
+        map.remove(z, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert!(iter.next().is_none());
     }
@@ -888,33 +911,33 @@ mod tests {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
 
-        let _ = map.insert(1, guard.into());
-        let x = map.insert(2, guard.into());
+        let _ = map.insert(1, guard);
+        let x = map.insert(2, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 2);
         assert!(iter.next().is_none());
 
-        map.remove(x, guard.into());
+        map.remove(x, guard);
 
-        let x = map.insert(2, guard.into());
-        let _ = map.insert(3, guard.into());
-        let y = map.insert(4, guard.into());
+        let x = map.insert(2, guard);
+        let _ = map.insert(3, guard);
+        let y = map.insert(4, guard);
 
-        map.remove(y, guard.into());
+        map.remove(y, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 2);
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
 
-        map.remove(x, guard.into());
+        map.remove(x, guard);
 
-        let mut iter = map.iter(guard.into());
+        let mut iter = map.iter(guard);
 
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 3);

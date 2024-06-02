@@ -13,13 +13,13 @@ const THREADS: u32 = 10;
 fn concurrent_slotmap(b: &mut Bencher) {
     b.iter(|| {
         let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
-        let id = map.insert([0usize; 2], epoch::pin().into());
+        let id = map.insert([0usize; 2], epoch::pin());
 
         thread::scope(|s| {
             for _ in 0..THREADS {
                 s.spawn(|| {
                     for _ in black_box(0..ITERATIONS / THREADS) {
-                        black_box(map.get(black_box(id), epoch::pin().into()));
+                        black_box(map.get(black_box(id), epoch::pin()));
                     }
                 });
             }
