@@ -324,6 +324,35 @@ impl<T> SlotMap<T> {
         }
     }
 
+    /// # Safety
+    ///
+    /// You must ensure that the epoch is [pinned] before you call this method and that the
+    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread.
+    ///
+    /// [pinned]: epoch::pin
+    #[inline(always)]
+    pub unsafe fn get_unprotected(&self, id: SlotId) -> Option<&T> {
+        let slot = self.slots.get(id.index as usize)?;
+        let generation = slot.generation.load(Acquire);
+
+        if generation == id.generation() {
+            // SAFETY:
+            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
+            //   is visible here.
+            // * We checked that `id.generation` matches the slot's generation, which includes the
+            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
+            //   Since the generation matched, the slot's occupied bit must be set, which makes
+            //   reading the value safe as the only way the occupied bit can be set is in
+            //   `SlotMap::insert` after initialization of the slot.
+            // * The caller must ensure that the returned reference is protected by a guard before
+            //   the call, and that the returned reference doesn't outlive said guard.
+            Some(unsafe { slot.value_unchecked() })
+        } else {
+            None
+        }
+    }
+
     unsafe fn slot_unchecked(&self, index: u32) -> &Slot<T> {
         // SAFETY: The caller must ensure that the index is in bounds.
         unsafe { self.slots.get_unchecked(index as usize) }
