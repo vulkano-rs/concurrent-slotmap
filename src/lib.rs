@@ -383,7 +383,9 @@ impl<T> SlotMap<T> {
     /// # Safety
     ///
     /// You must ensure that the epoch is [pinned] before you call this method and that the
-    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread.
+    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
+    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
+    /// by being single-threaded).
     ///
     /// [pinned]: epoch::pin
     #[inline(always)]
