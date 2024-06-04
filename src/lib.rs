@@ -115,16 +115,19 @@ impl<T> SlotMap<T> {
                 .compare_exchange_weak(free_list_head, next_free, Release, Acquire)
             {
                 Ok(_) => {
-                    // SAFETY: `SlotMap::remove` guarantees that the free-list only contains slots
-                    // that are no longer read by any threads, and we have removed the slot from
-                    // the free-list such that no other threads can be writing the same slot.
+                    // SAFETY: `SlotMap::remove[_mut]` guarantees that the free-list only contains
+                    // slots that are no longer read by any threads, and we have removed the slot
+                    // from the free-list such that no other threads can be writing the same slot.
                     unsafe { slot.value.get().cast::<T>().write(value) };
 
-                    let last_generation = slot.generation.fetch_add(1, Release);
+                    let new_generation = slot.generation.fetch_add(1, Release).wrapping_add(1);
 
                     self.len.fetch_add(1, Relaxed);
 
-                    return SlotId::new(free_list_head, last_generation.wrapping_add(1));
+                    // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its
+                    // generation's `OCCUPIED_BIT` unset, and since we incremented the generation,
+                    // the bit must have been flipped again.
+                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
                 }
                 Err(new_head) => {
                     free_list_head = new_head;
@@ -139,7 +142,10 @@ impl<T> SlotMap<T> {
 
         // Our capacity can never exceed `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
-        SlotId::new(index as u32, OCCUPIED_BIT)
+        // SAFETY: The `OCCUPIED_BIT` is set.
+        unsafe {
+            SlotId::new_unchecked(index as u32, OCCUPIED_BIT)
+        }
     }
 
     pub fn insert_mut(&mut self, value: T) -> SlotId {
@@ -160,14 +166,20 @@ impl<T> SlotMap<T> {
 
             *slot.generation.get_mut() = new_generation;
 
-            return SlotId::new(free_list_head, new_generation);
+            // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
+            // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
+            // flipped again.
+            return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
         }
 
         let index = self.slots.push_mut(Slot::new(value));
 
         // Our capacity can never exceed `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
-        SlotId::new(index as u32, OCCUPIED_BIT)
+        // SAFETY: The `OCCUPIED_BIT` is set.
+        unsafe {
+            SlotId::new_unchecked(index as u32, OCCUPIED_BIT)
+        }
     }
 
     #[inline]
@@ -619,13 +631,6 @@ pub struct SlotId {
 }
 
 impl SlotId {
-    const fn new(index: u32, generation: u32) -> Self {
-        assert!(generation & OCCUPIED_BIT != 0);
-
-        // SAFETY: We checked that the `OCCUPIED_BIT` is set.
-        unsafe { SlotId::new_unchecked(index, generation) }
-    }
-
     const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
         // SAFETY: The caller must ensure that the `OCCUPIED_BIT` of `generation` is set, which
         // means it must be non-zero.
