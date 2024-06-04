@@ -206,6 +206,29 @@ impl<T> SlotMap<T> {
             return None;
         }
 
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The `compare_exchange` above succeeded, which means that the previous generation of the
+        //   slot must have matched `id.generation`. By `SlotId`'s invariant, its generation's
+        //   occupied bit must be set. Since the generation matched, the slot's occupied bit must
+        //   have been set, which makes reading the value safe as the only way the occupied bit can
+        //   be set is in `SlotMap::insert[_mut]` after initialization of the slot.
+        // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
+        //   it into the free-lists.
+        Some(unsafe { self.remove_inner_inner(id.index, guard) })
+    }
+
+    // Inner indeed.
+    unsafe fn remove_inner_inner<'a>(
+        &'a self,
+        index: u32,
+        guard: Cow<'a, epoch::Guard>,
+    ) -> Ref<'a, T> {
+        // SAFETY: The caller must ensure that `index` is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(index as usize) };
+
         let epoch = guard.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
@@ -219,23 +242,15 @@ impl<T> SlotMap<T> {
             if epoch_interval == 0 {
                 slot.next_free.store(queued_head, Relaxed);
 
-                let new_state = u64::from(id.index) | u64::from(queued_epoch) << 32;
+                let new_state = u64::from(index) | u64::from(queued_epoch) << 32;
 
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
                         self.len.fetch_sub(1, Relaxed);
 
-                        // SAFETY:
-                        // * The `Acquire` ordering when loading the slot's generation synchronizes
-                        //   with the `Release` ordering in `SlotMap::insert`, making sure that the
-                        //   newly written value is visible here.
-                        // * The `compare_exchange` above succeeded, which means that the previous
-                        //   generation of the slot must have matched `id.generation`. By `SlotId`'s
-                        //   invariant, its generation's occupied bit must be set. Since the
-                        //   generation matched, the slot's occupied bit must have been set, which
-                        //   makes reading the value safe as the only way the occupied bit can be
-                        //   set is in `SlotMap::insert[_mut]` after initialization of the slot.
-                        break Some(unsafe { Ref { slot, guard } });
+                        // SAFETY: The caller must ensure that the inner value was initialized and
+                        // that said write was synchronized with and made visible here.
+                        break unsafe { Ref { slot, guard } };
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -259,7 +274,7 @@ impl<T> SlotMap<T> {
 
                 slot.next_free.store(NIL, Relaxed);
 
-                let new_state = u64::from(id.index) | u64::from(epoch) << 32;
+                let new_state = u64::from(index) | u64::from(epoch) << 32;
 
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
@@ -271,8 +286,9 @@ impl<T> SlotMap<T> {
                         // accessing any of the slots in the list.
                         unsafe { self.collect_garbage(queued_head) };
 
-                        // SAFETY: Same as the the `Ref` construction in the above branch.
-                        break Some(unsafe { Ref { slot, guard } });
+                        // SAFETY: The caller must ensure that the inner value was initialized and
+                        // that said write was synchronized with and made visible here.
+                        break unsafe { Ref { slot, guard } };
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -361,6 +377,57 @@ impl<T> SlotMap<T> {
         }
     }
 
+    #[cfg(test)]
+    fn remove_index<'a>(
+        &'a self,
+        index: u32,
+        guard: impl Into<Cow<'a, epoch::Guard>>,
+    ) -> Option<Ref<'a, T>> {
+        self.remove_index_inner(index, guard.into())
+    }
+
+    #[cfg(test)]
+    fn remove_index_inner<'a>(
+        &'a self,
+        index: u32,
+        guard: Cow<'a, epoch::Guard>,
+    ) -> Option<Ref<'a, T>> {
+        let slot = self.slots.get(index as usize)?;
+        let mut generation = slot.generation.load(Relaxed);
+        let mut backoff = Backoff::new();
+
+        loop {
+            if generation & OCCUPIED_BIT == 0 {
+                return None;
+            }
+
+            match slot.generation.compare_exchange_weak(
+                generation,
+                generation.wrapping_add(1),
+                Acquire,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(new_generation) => {
+                    generation = new_generation;
+                    backoff.spin();
+                }
+            }
+        }
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The `compare_exchange_weak` above succeeded, which means that the previous generation
+        //   of the slot must have had its `OCCUPIED_BIT` set, which makes reading the value safe as
+        //   the only way the occupied bit can be set is in `SlotMap::insert[_mut]` after
+        //   initialization of the slot.
+        // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
+        //   it into the free-lists.
+        Some(unsafe { self.remove_inner_inner(index, guard) })
+    }
+
     #[inline(always)]
     #[must_use]
     pub fn get<'a>(
@@ -437,6 +504,33 @@ impl<T> SlotMap<T> {
             //   reading the value safe as the only way the occupied bit can be set is in
             //   `SlotMap::insert[_mut]` after initialization of the slot.
             Some(unsafe { slot.value_unchecked_mut() })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn index<'a>(
+        &'a self,
+        index: u32,
+        guard: impl Into<Cow<'a, epoch::Guard>>,
+    ) -> Option<Ref<'a, T>> {
+        self.index_inner(index, guard.into())
+    }
+
+    #[cfg(test)]
+    fn index_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+        let slot = self.slots.get(index as usize)?;
+        let generation = slot.generation.load(Acquire);
+
+        if generation & OCCUPIED_BIT != 0 {
+            // SAFETY:
+            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
+            //   is visible here.
+            // * We checked that the slot is occupied, which means that it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
+            Some(unsafe { Ref { slot, guard } })
         } else {
             None
         }
@@ -631,6 +725,14 @@ pub struct SlotId {
 }
 
 impl SlotId {
+    #[cfg(test)]
+    const fn new(index: u32, generation: u32) -> Self {
+        assert!(generation & OCCUPIED_BIT != 0);
+
+        // SAFETY: We checked that the `OCCUPIED_BIT` is set.
+        unsafe { SlotId::new_unchecked(index, generation) }
+    }
+
     const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
         // SAFETY: The caller must ensure that the `OCCUPIED_BIT` of `generation` is set, which
         // means it must be non-zero.
@@ -840,7 +942,9 @@ impl<T> FusedIterator for IterMut<'_, T> {}
 
 #[cfg(test)]
 mod tests {
+    use self::epoch::PINNINGS_BETWEEN_ADVANCE;
     use super::*;
+    use std::thread;
 
     #[test]
     fn basic_usage1() {
@@ -1340,5 +1444,119 @@ mod tests {
         map.remove_mut(x3);
         map.remove_mut(y3);
         map.remove_mut(z2);
+    }
+
+    // TODO: Testing concurrent generational collections is the most massive pain in the ass. We
+    // aren't testing the actual implementations but rather ones that don't take the generation into
+    // account because of that.
+
+    #[cfg(not(miri))]
+    const ITERATIONS: u32 = 1_000_000;
+    #[cfg(miri)]
+    const ITERATIONS: u32 = 1_000;
+
+    #[test]
+    fn multi_threaded1() {
+        const THREADS: u32 = 2;
+
+        let map = SlotMap::new(ITERATIONS);
+
+        thread::scope(|s| {
+            let inserter = || {
+                for _ in 0..ITERATIONS / THREADS {
+                    map.insert(0, epoch::pin());
+                }
+            };
+
+            for _ in 0..THREADS {
+                s.spawn(inserter);
+            }
+        });
+
+        assert_eq!(map.len(), ITERATIONS);
+
+        thread::scope(|s| {
+            let remover = || {
+                for index in 0..ITERATIONS {
+                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), epoch::pin());
+                }
+            };
+
+            for _ in 0..THREADS {
+                s.spawn(remover);
+            }
+        });
+
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn multi_threaded2() {
+        let map = SlotMap::new(PINNINGS_BETWEEN_ADVANCE * 3);
+
+        thread::scope(|s| {
+            let insert_remover = || {
+                for _ in 0..ITERATIONS {
+                    let x = map.insert(0, epoch::pin());
+                    let y = map.insert(0, epoch::pin());
+                    map.remove(y, epoch::pin());
+                    let z = map.insert(0, epoch::pin());
+                    map.remove(x, epoch::pin());
+                    map.remove(z, epoch::pin());
+                }
+            };
+            let iterator = || {
+                for _ in 0..ITERATIONS {
+                    for index in 0..12 {
+                        if let Some(value) = map.index(index, epoch::pin()) {
+                            let _ = *value;
+                        }
+                    }
+                }
+            };
+
+            s.spawn(iterator);
+            s.spawn(iterator);
+            s.spawn(iterator);
+            s.spawn(insert_remover);
+        });
+    }
+
+    #[test]
+    fn multi_threaded3() {
+        let map = SlotMap::new(ITERATIONS / 10);
+
+        thread::scope(|s| {
+            let inserter = || {
+                for i in 0..ITERATIONS {
+                    if i % 10 == 0 {
+                        map.insert(0, epoch::pin());
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            };
+            let remover = || {
+                for _ in 0..ITERATIONS {
+                    map.remove_index(0, epoch::pin());
+                }
+            };
+            let getter = || {
+                for _ in 0..ITERATIONS {
+                    if let Some(value) = map.index(0, epoch::pin()) {
+                        let _ = *value;
+                    }
+                }
+            };
+
+            s.spawn(getter);
+            s.spawn(getter);
+            s.spawn(getter);
+            s.spawn(getter);
+            s.spawn(remover);
+            s.spawn(remover);
+            s.spawn(remover);
+            s.spawn(inserter);
+        });
     }
 }

@@ -18,7 +18,10 @@ use std::{
 const PINNED_BIT: u32 = 1 << 0;
 
 /// The number of pinnings between a participant tries to advance the global epoch.
-const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
+#[cfg(not(miri))]
+pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
+#[cfg(miri)]
+pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 4;
 
 /// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross an
 /// epoch boundary. It is important to pin the local epoch before doing any kind of access, such
