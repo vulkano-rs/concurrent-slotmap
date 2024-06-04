@@ -106,7 +106,7 @@ impl<T> SlotMap<T> {
 
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
-            let slot = unsafe { self.slot_unchecked(free_list_head) };
+            let slot = unsafe { self.slots.get_unchecked(free_list_head as usize) };
 
             let next_free = slot.next_free.load(Relaxed);
 
@@ -136,6 +136,34 @@ impl<T> SlotMap<T> {
         let index = self.slots.push(Slot::new(value));
 
         self.len.fetch_add(1, Relaxed);
+
+        // Our capacity can never exceed `u32::MAX`.
+        #[allow(clippy::cast_possible_truncation)]
+        SlotId::new(index as u32, OCCUPIED_BIT)
+    }
+
+    pub fn insert_mut(&mut self, value: T) -> SlotId {
+        let free_list_head = *self.free_list.get_mut();
+
+        if free_list_head != NIL {
+            // SAFETY: We always push indices of existing slots into the free-lists and the slots
+            // vector never shrinks, therefore the index must have staid in bounds.
+            let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
+
+            let next_free = *slot.next_free.get_mut();
+
+            *self.free_list.get_mut() = next_free;
+
+            *slot.value.get_mut() = MaybeUninit::new(value);
+
+            let new_generation = slot.generation.get_mut().wrapping_add(1);
+
+            *slot.generation.get_mut() = new_generation;
+
+            return SlotId::new(free_list_head, new_generation);
+        }
+
+        let index = self.slots.push_mut(Slot::new(value));
 
         // Our capacity can never exceed `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
@@ -194,7 +222,7 @@ impl<T> SlotMap<T> {
                         //   invariant, its generation's occupied bit must be set. Since the
                         //   generation matched, the slot's occupied bit must have been set, which
                         //   makes reading the value safe as the only way the occupied bit can be
-                        //   set is in `SlotMap::insert` after initialization of the slot.
+                        //   set is in `SlotMap::insert[_mut]` after initialization of the slot.
                         break Some(unsafe { Ref { slot, guard } });
                     }
                     Err(new_state) => {
@@ -257,7 +285,7 @@ impl<T> SlotMap<T> {
         loop {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
-            queued_tail_slot = unsafe { self.slot_unchecked(queued_tail) };
+            queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail as usize) };
 
             // SAFETY: The caller must ensure that we have exclusive access to this list.
             unsafe { queued_tail_slot.value.get().cast::<T>().drop_in_place() };
@@ -293,6 +321,34 @@ impl<T> SlotMap<T> {
         }
     }
 
+    pub fn remove_mut(&mut self, id: SlotId) -> Option<T> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        let generation = *slot.generation.get_mut();
+
+        if generation == id.generation() {
+            *slot.generation.get_mut() = generation.wrapping_add(1);
+
+            let free_list_head = *self.free_list.get_mut();
+
+            *slot.next_free.get_mut() = free_list_head;
+
+            *self.free_list.get_mut() = id.index;
+
+            // SAFETY:
+            // * The mutable reference makes sure that access to the slot is synchronized.
+            // * We checked that `id.generation` matches the slot's generation, which includes the
+            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
+            //   Since the generation matched, the slot's occupied bit must be set, which makes
+            //   reading the value safe as the only way the occupied bit can be set is in
+            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            // * We incremented the slot's generation such that its `OCCUPIED_BIT` is unset and its
+            //   generation is advanced, such that future attempts to access the slot will fail.
+            Some(unsafe { slot.value.get().cast::<T>().read() })
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     #[must_use]
     pub fn get<'a>(
@@ -317,7 +373,7 @@ impl<T> SlotMap<T> {
             //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
             //   Since the generation matched, the slot's occupied bit must be set, which makes
             //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert` after initialization of the slot.
+            //   `SlotMap::insert[_mut]` after initialization of the slot.
             Some(unsafe { Ref { slot, guard } })
         } else {
             None
@@ -344,7 +400,7 @@ impl<T> SlotMap<T> {
             //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
             //   Since the generation matched, the slot's occupied bit must be set, which makes
             //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert` after initialization of the slot.
+            //   `SlotMap::insert[_mut]` after initialization of the slot.
             // * The caller must ensure that the returned reference is protected by a guard before
             //   the call, and that the returned reference doesn't outlive said guard.
             Some(unsafe { slot.value_unchecked() })
@@ -353,9 +409,23 @@ impl<T> SlotMap<T> {
         }
     }
 
-    unsafe fn slot_unchecked(&self, index: u32) -> &Slot<T> {
-        // SAFETY: The caller must ensure that the index is in bounds.
-        unsafe { self.slots.get_unchecked(index as usize) }
+    #[inline(always)]
+    pub fn get_mut(&mut self, id: SlotId) -> Option<&mut T> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        let generation = slot.generation.load(Acquire);
+
+        if generation == id.generation() {
+            // SAFETY:
+            // * The mutable reference makes sure that access to the slot is synchronized.
+            // * We checked that `id.generation` matches the slot's generation, which includes the
+            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
+            //   Since the generation matched, the slot's occupied bit must be set, which makes
+            //   reading the value safe as the only way the occupied bit can be set is in
+            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            Some(unsafe { slot.value_unchecked_mut() })
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -390,7 +460,7 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
 
                     // SAFETY: We always push indices of existing slots into the free-lists and the
                     // slots vector never shrinks, therefore the index must have staid in bounds.
-                    let slot = unsafe { self.0.slot_unchecked(head) };
+                    let slot = unsafe { self.0.slots.get_unchecked(head as usize) };
 
                     head = slot.next_free.load(Acquire);
                 }
@@ -460,8 +530,8 @@ impl<T> Drop for SlotMap<T> {
             if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
                 // SAFETY:
                 // * The mutable reference makes sure that access to the slot is synchronized.
-                // * We checked that the slot is occupied, which means the it must have been
-                //   initialized in `SlotMap::insert`.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
                 unsafe { slot.value.get_mut().assume_init_drop() };
             }
         }
@@ -523,8 +593,8 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
             // * The `Acquire` ordering when loading the slot's generation synchronizes with the
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
             //   is visible here.
-            // * We checked that the slot is occupied, which means it must have been initialized in
-            //   `SlotMap::insert`.
+            // * We checked that the slot is occupied, which means that it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
             debug.field("value", unsafe { self.value_unchecked() });
         } else {
             let next_free = self.next_free.load(Relaxed);
@@ -656,8 +726,8 @@ impl<'a, T> Iterator for Iter<'a, T> {
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
                 //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
                 //   value is visible here.
-                // * We checked that the slot is occupied, which means it must have been initialized
-                //   in `SlotMap::insert`.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { Ref { slot, guard } };
 
                 break Some((id, r));
@@ -690,8 +760,8 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
                 //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
                 //   value is visible here.
-                // * We checked that the slot is occupied, which means it must have been initialized
-                //   in `SlotMap::insert`.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { Ref { slot, guard } };
 
                 break Some((id, r));
@@ -721,8 +791,8 @@ impl<'a, T> Iterator for IterMut<'a, T> {
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
                 let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
 
-                // SAFETY: We checked that the slot is occupied, which means it must have been
-                // initialized in `SlotMap::insert`.
+                // SAFETY: We checked that the slot is occupied, which means that it must have been
+                // initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked_mut() };
 
                 break Some((id, r));
@@ -749,8 +819,8 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
                 let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
 
-                // SAFETY: We checked that the slot is occupied, which means it must have been
-                // initialized in `SlotMap::insert`.
+                // SAFETY: We checked that the slot is occupied, which means that it must have been
+                // initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked_mut() };
 
                 break Some((id, r));
@@ -870,6 +940,107 @@ mod tests {
     }
 
     #[test]
+    fn basic_usage_mut1() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(69);
+        let y = map.insert_mut(42);
+
+        assert_eq!(map.get_mut(x), Some(&mut 69));
+        assert_eq!(map.get_mut(y), Some(&mut 42));
+
+        map.remove_mut(x);
+
+        let x2 = map.insert_mut(12);
+
+        assert_eq!(map.get_mut(x2), Some(&mut 12));
+        assert_eq!(map.get_mut(x), None);
+
+        map.remove_mut(y);
+        map.remove_mut(x2);
+
+        assert_eq!(map.get_mut(y), None);
+        assert_eq!(map.get_mut(x2), None);
+    }
+
+    #[test]
+    fn basic_usage_mut2() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(1);
+        let y = map.insert_mut(2);
+        let z = map.insert_mut(3);
+
+        assert_eq!(map.get_mut(x), Some(&mut 1));
+        assert_eq!(map.get_mut(y), Some(&mut 2));
+        assert_eq!(map.get_mut(z), Some(&mut 3));
+
+        map.remove_mut(y);
+
+        let y2 = map.insert_mut(20);
+
+        assert_eq!(map.get_mut(y2), Some(&mut 20));
+        assert_eq!(map.get_mut(y), None);
+
+        map.remove_mut(x);
+        map.remove_mut(z);
+
+        let x2 = map.insert_mut(10);
+
+        assert_eq!(map.get_mut(x2), Some(&mut 10));
+        assert_eq!(map.get_mut(x), None);
+
+        let z2 = map.insert_mut(30);
+
+        assert_eq!(map.get_mut(z2), Some(&mut 30));
+        assert_eq!(map.get_mut(x), None);
+
+        map.remove_mut(x2);
+
+        assert_eq!(map.get_mut(x2), None);
+
+        map.remove_mut(y2);
+        map.remove_mut(z2);
+
+        assert_eq!(map.get_mut(y2), None);
+        assert_eq!(map.get_mut(z2), None);
+    }
+
+    #[test]
+    fn basic_usage_mut3() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(1);
+        let y = map.insert_mut(2);
+
+        assert_eq!(map.get_mut(x), Some(&mut 1));
+        assert_eq!(map.get_mut(y), Some(&mut 2));
+
+        let z = map.insert_mut(3);
+
+        assert_eq!(map.get_mut(z), Some(&mut 3));
+
+        map.remove_mut(x);
+        map.remove_mut(z);
+
+        let z2 = map.insert_mut(30);
+        let x2 = map.insert_mut(10);
+
+        assert_eq!(map.get_mut(x2), Some(&mut 10));
+        assert_eq!(map.get_mut(z2), Some(&mut 30));
+        assert_eq!(map.get_mut(x), None);
+        assert_eq!(map.get_mut(z), None);
+
+        map.remove_mut(x2);
+        map.remove_mut(y);
+        map.remove_mut(z2);
+
+        assert_eq!(map.get_mut(x2), None);
+        assert_eq!(map.get_mut(y), None);
+        assert_eq!(map.get_mut(z2), None);
+    }
+
+    #[test]
     fn iter1() {
         let map = SlotMap::new(10);
         let guard = &epoch::pin();
@@ -967,6 +1138,107 @@ mod tests {
         map.remove(x, guard);
 
         let mut iter = map.iter(guard);
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_mut1() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(1);
+        let _ = map.insert_mut(2);
+        let y = map.insert_mut(3);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove_mut(x);
+        map.remove_mut(y);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert!(iter.next().is_none());
+
+        map.insert_mut(3);
+        map.insert_mut(1);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_mut2() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(1);
+        let y = map.insert_mut(2);
+        let z = map.insert_mut(3);
+
+        map.remove_mut(x);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove_mut(y);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove_mut(z);
+
+        let mut iter = map.iter_mut();
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_mut3() {
+        let mut map = SlotMap::new(10);
+
+        let _ = map.insert_mut(1);
+        let x = map.insert_mut(2);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert!(iter.next().is_none());
+
+        map.remove_mut(x);
+
+        let x = map.insert_mut(2);
+        let _ = map.insert_mut(3);
+        let y = map.insert_mut(4);
+
+        map.remove_mut(y);
+
+        let mut iter = map.iter_mut();
+
+        assert_eq!(*iter.next().unwrap().1, 1);
+        assert_eq!(*iter.next().unwrap().1, 2);
+        assert_eq!(*iter.next().unwrap().1, 3);
+        assert!(iter.next().is_none());
+
+        map.remove_mut(x);
+
+        let mut iter = map.iter_mut();
 
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 3);
