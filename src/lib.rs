@@ -1246,4 +1246,94 @@ mod tests {
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
     }
+
+    #[test]
+    fn reusing_slots_mut1() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(0);
+        let y = map.insert_mut(0);
+
+        map.remove_mut(y);
+
+        let y2 = map.insert_mut(0);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove_mut(x);
+
+        let x2 = map.insert_mut(0);
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+
+        map.remove_mut(y2);
+        map.remove_mut(x2);
+    }
+
+    #[test]
+    fn reusing_slots_mut2() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(0);
+
+        map.remove_mut(x);
+
+        let x2 = map.insert_mut(0);
+        assert_eq!(x.index, x2.index);
+        assert_ne!(x.generation, x2.generation);
+
+        let y = map.insert_mut(0);
+        let z = map.insert_mut(0);
+
+        map.remove_mut(y);
+        map.remove_mut(x2);
+
+        let x3 = map.insert_mut(0);
+        let y2 = map.insert_mut(0);
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove_mut(x3);
+        map.remove_mut(y2);
+        map.remove_mut(z);
+    }
+
+    #[test]
+    fn reusing_slots_mut3() {
+        let mut map = SlotMap::new(10);
+
+        let x = map.insert_mut(0);
+        let y = map.insert_mut(0);
+
+        map.remove_mut(x);
+        map.remove_mut(y);
+
+        let y2 = map.insert_mut(0);
+        let x2 = map.insert_mut(0);
+        let z = map.insert_mut(0);
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove_mut(x2);
+        map.remove_mut(z);
+        map.remove_mut(y2);
+
+        let y3 = map.insert_mut(0);
+        let z2 = map.insert_mut(0);
+        let x3 = map.insert_mut(0);
+        assert_eq!(y3.index, y2.index);
+        assert_ne!(y3.generation, y2.generation);
+        assert_eq!(z2.index, z.index);
+        assert_ne!(z2.generation, z.generation);
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+
+        map.remove_mut(x3);
+        map.remove_mut(y3);
+        map.remove_mut(z2);
+    }
 }
