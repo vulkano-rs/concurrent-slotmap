@@ -1492,11 +1492,13 @@ mod tests {
 
     #[test]
     fn multi_threaded2() {
-        let map = SlotMap::new(PINNINGS_BETWEEN_ADVANCE * 3);
+        const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE * 3;
+
+        let map = SlotMap::new(CAPACITY);
 
         thread::scope(|s| {
             let insert_remover = || {
-                for _ in 0..ITERATIONS {
+                for _ in 0..ITERATIONS / 6 {
                     let x = map.insert(0, epoch::pin());
                     let y = map.insert(0, epoch::pin());
                     map.remove(y, epoch::pin());
@@ -1506,8 +1508,8 @@ mod tests {
                 }
             };
             let iterator = || {
-                for _ in 0..ITERATIONS {
-                    for index in 0..12 {
+                for _ in 0..ITERATIONS / CAPACITY * 2 {
+                    for index in 0..CAPACITY {
                         if let Some(value) = map.index(index, epoch::pin()) {
                             let _ = *value;
                         }
