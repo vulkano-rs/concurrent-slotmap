@@ -174,6 +174,8 @@ impl<T> SlotMap<T> {
 
         let index = self.slots.push_mut(Slot::new(value));
 
+        *self.len.get_mut() += 1;
+
         // Our capacity can never exceed `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
         // SAFETY: The `OCCUPIED_BIT` is set.
