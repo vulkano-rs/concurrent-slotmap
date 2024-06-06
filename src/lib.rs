@@ -494,7 +494,7 @@ impl<T> SlotMap<T> {
     #[inline(always)]
     pub fn get_mut(&mut self, id: SlotId) -> Option<&mut T> {
         let slot = self.slots.get_mut(id.index as usize)?;
-        let generation = slot.generation.load(Acquire);
+        let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
             // SAFETY:
