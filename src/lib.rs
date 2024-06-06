@@ -156,15 +156,15 @@ impl<T> SlotMap<T> {
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
 
-            let next_free = *slot.next_free.get_mut();
-
-            *self.free_list.get_mut() = next_free;
-
-            *slot.value.get_mut() = MaybeUninit::new(value);
-
             let new_generation = slot.generation.get_mut().wrapping_add(1);
 
             *slot.generation.get_mut() = new_generation;
+
+            *self.free_list.get_mut() = *slot.next_free.get_mut();
+
+            *slot.value.get_mut() = MaybeUninit::new(value);
+
+            *self.len.get_mut() += 1;
 
             // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
             // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
@@ -356,11 +356,10 @@ impl<T> SlotMap<T> {
         if generation == id.generation() {
             *slot.generation.get_mut() = generation.wrapping_add(1);
 
-            let free_list_head = *self.free_list.get_mut();
-
-            *slot.next_free.get_mut() = free_list_head;
-
+            *slot.next_free.get_mut() = *self.free_list.get_mut();
             *self.free_list.get_mut() = id.index;
+
+            *self.len.get_mut() -= 1;
 
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
