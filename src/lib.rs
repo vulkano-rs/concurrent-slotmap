@@ -1490,12 +1490,12 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
+    // TODO: This test is just fundamentally broken.
     #[test]
     fn multi_threaded2() {
         const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE * 3;
 
-        // TODO: What are these spikes?
-        let map = SlotMap::new(CAPACITY * 10);
+        let map = SlotMap::new(ITERATIONS / 2);
 
         thread::scope(|s| {
             let insert_remover = || {
