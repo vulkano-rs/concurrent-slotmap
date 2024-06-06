@@ -1,3 +1,16 @@
+// This module is heavily inspired by crossbeam-epoch v0.9, licensed under either of
+// * Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+// * MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+// at your option.
+//
+// The differences include:
+// * Being stripped down to only the global and local epochs and the guard.
+// * Allowing retrieving the epoch a guard is pinned in.
+// * The list of locals is not lock-free (as there's no useful work for threads to do concurrently
+//   anyway) but instead protected by a mutex.
+// * Implementing `Clone` for `Guard` to allow use inside `Cow`.
+// * Other small miscellaneous changes.
+
 use crate::CacheAligned;
 use core::{
     cell::Cell,
