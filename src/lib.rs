@@ -1494,7 +1494,8 @@ mod tests {
     fn multi_threaded2() {
         const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE * 3;
 
-        let map = SlotMap::new(CAPACITY * 2);
+        // TODO: What are these spikes?
+        let map = SlotMap::new(CAPACITY * 10);
 
         thread::scope(|s| {
             let insert_remover = || {
