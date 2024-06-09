@@ -647,6 +647,28 @@ impl<T> Drop for SlotMap<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a SlotMap<T> {
+    type Item = (SlotId, Ref<'a, T>);
+
+    type IntoIter = Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter(epoch::pin())
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut SlotMap<T> {
+    type Item = (SlotId, &'a mut T);
+
+    type IntoIter = IterMut<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 const OCCUPIED_BIT: u32 = 1;
 
 struct Slot<T> {
