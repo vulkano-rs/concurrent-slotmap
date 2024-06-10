@@ -598,7 +598,11 @@ impl<T> SlotMap<T> {
     }
 
     #[inline(always)]
-    fn index_unchecked_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Ref<'a, T> {
+    unsafe fn index_unchecked_inner<'a>(
+        &'a self,
+        index: u32,
+        guard: Cow<'a, epoch::Guard>,
+    ) -> Ref<'a, T> {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
 
