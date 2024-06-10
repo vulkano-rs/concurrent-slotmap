@@ -484,7 +484,8 @@ impl<T> SlotMap<T> {
             //   reading the value safe as the only way the occupied bit can be set is in
             //   `SlotMap::insert[_mut]` after initialization of the slot.
             // * The caller must ensure that the returned reference is protected by a guard before
-            //   the call, and that the returned reference doesn't outlive said guard.
+            //   the call and that the returned reference doesn't outlive said guard, or that
+            //   synchronization is ensured externally.
             Some(unsafe { slot.value_unchecked() })
         } else {
             None
@@ -510,8 +511,8 @@ impl<T> SlotMap<T> {
         }
     }
 
-    #[cfg(test)]
-    fn index<'a>(
+    #[inline(always)]
+    pub fn index<'a>(
         &'a self,
         index: u32,
         guard: impl Into<Cow<'a, epoch::Guard>>,
@@ -519,7 +520,7 @@ impl<T> SlotMap<T> {
         self.index_inner(index, guard.into())
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     fn index_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
         let slot = self.slots.get(index as usize)?;
         let generation = slot.generation.load(Acquire);
@@ -532,6 +533,51 @@ impl<T> SlotMap<T> {
             // * We checked that the slot is occupied, which means that it must have been
             //   initialized in `SlotMap::insert[_mut]`.
             Some(unsafe { Ref { slot, guard } })
+        } else {
+            None
+        }
+    }
+
+    /// # Safety
+    ///
+    /// You must ensure that the epoch is [pinned] before you call this method and that the
+    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
+    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
+    /// by being single-threaded).
+    ///
+    /// [pinned]: epoch::pin
+    #[inline(always)]
+    pub unsafe fn index_unprotected(&self, index: u32) -> Option<&T> {
+        let slot = self.slots.get(index as usize)?;
+        let generation = slot.generation.load(Acquire);
+
+        if generation & OCCUPIED_BIT != 0 {
+            // SAFETY:
+            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
+            //   is visible here.
+            // * We checked that the slot is occupied, which means that it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
+            // * The caller must ensure that the returned reference is protected by a guard before
+            //   the call and that the returned reference doesn't outlive said guard, or that
+            //   synchronization is ensured externally.
+            Some(unsafe { slot.value_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn index_mut(&mut self, index: u32) -> Option<&mut T> {
+        let slot = self.slots.get_mut(index as usize)?;
+        let generation = *slot.generation.get_mut();
+
+        if generation & OCCUPIED_BIT != 0 {
+            // SAFETY:
+            // * The mutable reference makes sure that access to the slot is synchronized.
+            // * We checked that the slot is occupied, which means that it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
+            Some(unsafe { slot.value_unchecked_mut() })
         } else {
             None
         }
