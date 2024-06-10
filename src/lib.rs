@@ -583,6 +583,78 @@ impl<T> SlotMap<T> {
         }
     }
 
+    /// # Safety
+    ///
+    /// `index` must be in bounds of the slots vector and the slot must have been initialized and
+    /// must not be free.
+    #[inline(always)]
+    pub unsafe fn index_unchecked<'a>(
+        &'a self,
+        index: u32,
+        guard: impl Into<Cow<'a, epoch::Guard>>,
+    ) -> Ref<'a, T> {
+        // SAFETY: Ensured by the caller.
+        unsafe { self.index_unchecked_inner(index, guard.into()) }
+    }
+
+    #[inline(always)]
+    fn index_unchecked_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Ref<'a, T> {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(index as usize) };
+
+        let _generation = slot.generation.load(Acquire);
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The caller must ensure that the slot is initialized.
+        unsafe { Ref { slot, guard } }
+    }
+
+    /// # Safety
+    ///
+    /// * `index` must be in bounds of the slots vector and the slot must have been initialized and
+    ///   must not be free.
+    /// * You must ensure that the epoch is [pinned] before you call this method and that the
+    ///   returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that
+    ///   all accesses to `self` are externally synchronized (for example through the use of a
+    ///   `Mutex` or by being single-threaded).
+    ///
+    /// [pinned]: epoch::pin
+    #[inline(always)]
+    pub unsafe fn index_unchecked_unprotected(&self, index: u32) -> &T {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(index as usize) };
+
+        let _generation = slot.generation.load(Acquire);
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The caller must ensure that the slot is initialized.
+        // * The caller must ensure that the returned reference is protected by a guard before the
+        //   call and that the returned reference doesn't outlive said guard, or that
+        //   synchronization is ensured externally.
+        unsafe { slot.value_unchecked() }
+    }
+
+    /// # Safety
+    ///
+    /// `index` must be in bounds of the slots vector and the slot must have been initialized and
+    /// must not be free.
+    #[inline(always)]
+    pub unsafe fn index_unchecked_mut(&mut self, index: u32) -> &mut T {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked_mut(index as usize) };
+
+        // SAFETY:
+        // * The mutable reference makes sure that access to the slot is synchronized.
+        // * The caller must ensure that the slot is initialized.
+        unsafe { slot.value_unchecked_mut() }
+    }
+
     #[inline]
     pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard>>) -> Iter<'a, T> {
         Iter {
