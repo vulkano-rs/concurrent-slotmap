@@ -1,4 +1,4 @@
-#![allow(unused_unsafe, clippy::inline_always, clippy::unit_arg)]
+#![allow(unused_unsafe, clippy::inline_always)]
 // This should be `forbid` but there's a bug in rustc:
 // https://github.com/rust-lang/rust/issues/121483
 #![deny(unsafe_op_in_unsafe_fn)]
