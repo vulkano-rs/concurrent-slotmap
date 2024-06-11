@@ -511,6 +511,77 @@ impl<T> SlotMap<T> {
         }
     }
 
+    #[inline]
+    pub fn get_many_mut<const N: usize>(&mut self, ids: [SlotId; N]) -> Option<[&mut T; N]> {
+        fn get_many_check_valid<const N: usize>(ids: &[SlotId; N], len: u32) -> bool {
+            let mut valid = true;
+
+            for (i, id) in ids.iter().enumerate() {
+                valid &= id.index() < len;
+
+                for id2 in &ids[..i] {
+                    valid &= id.index() != id2.index();
+                }
+            }
+
+            valid
+        }
+
+        // Our capacity can never exceed `u32::MAX`, so the length of the slots can't either.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = self.slots.len() as u32;
+
+        if get_many_check_valid(&ids, len) {
+            // SAFETY: We checked that all indices are disjunct and in bounds of the slots vector.
+            unsafe { self.get_many_unchecked_mut(ids) }
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    unsafe fn get_many_unchecked_mut<const N: usize>(
+        &mut self,
+        ids: [SlotId; N],
+    ) -> Option<[&mut T; N]> {
+        let slots_ptr = self.slots.as_mut_ptr();
+        let mut refs = MaybeUninit::<[&mut T; N]>::uninit();
+        let refs_ptr = refs.as_mut_ptr().cast::<&mut T>();
+
+        for i in 0..N {
+            // SAFETY: `i` is in bounds of the array.
+            let id = unsafe { ids.get_unchecked(i) };
+
+            // SAFETY: The caller must ensure that `ids` contains only IDs whose indices are in
+            // bounds of the slots vector.
+            let slot_ptr = unsafe { slots_ptr.add(id.index() as usize) };
+
+            // SAFETY: The caller must ensure that `ids` contains only IDs with disjunct indices.
+            let slot = unsafe { &mut *slot_ptr };
+
+            let generation = *slot.generation.get_mut();
+
+            if generation != id.generation() {
+                return None;
+            }
+
+            // SAFETY:
+            // * The mutable reference makes sure that access to the slot is synchronized.
+            // * We checked that `id.generation` matches the slot's generation, which includes the
+            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
+            //   Since the generation matched, the slot's occupied bit must be set, which makes
+            //   reading the value safe as the only way the occupied bit can be set is in
+            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            let value = unsafe { slot.value_unchecked_mut() };
+
+            // SAFETY: `i` is in bounds of the array.
+            unsafe { *refs_ptr.add(i) = value };
+        }
+
+        // SAFETY: We initialized all the elements.
+        Some(unsafe { refs.assume_init() })
+    }
+
     #[inline(always)]
     pub fn index<'a>(
         &'a self,
@@ -1398,6 +1469,49 @@ mod tests {
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn get_many_mut() {
+        let mut map = SlotMap::new(3);
+
+        let x = map.insert_mut(1);
+        let y = map.insert_mut(2);
+        let z = map.insert_mut(3);
+
+        assert_eq!(map.get_many_mut([x, y]), Some([&mut 1, &mut 2]));
+        assert_eq!(map.get_many_mut([y, z]), Some([&mut 2, &mut 3]));
+        assert_eq!(map.get_many_mut([z, x]), Some([&mut 3, &mut 1]));
+
+        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
+        assert_eq!(map.get_many_mut([z, y, x]), Some([&mut 3, &mut 2, &mut 1]));
+
+        assert_eq!(map.get_many_mut([x, x]), None);
+        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_BIT)]), None);
+
+        map.remove_mut(y);
+
+        assert_eq!(map.get_many_mut([x, z]), Some([&mut 1, &mut 3]));
+
+        assert_eq!(map.get_many_mut([y]), None);
+        assert_eq!(map.get_many_mut([x, y]), None);
+        assert_eq!(map.get_many_mut([y, z]), None);
+
+        let y = map.insert_mut(2);
+
+        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
+
+        map.remove_mut(x);
+        map.remove_mut(z);
+
+        assert_eq!(map.get_many_mut([y]), Some([&mut 2]));
+
+        assert_eq!(map.get_many_mut([x]), None);
+        assert_eq!(map.get_many_mut([z]), None);
+
+        map.remove_mut(y);
+
+        assert_eq!(map.get_many_mut([]), Some([]));
     }
 
     #[test]
