@@ -95,6 +95,7 @@ impl<T> SlotMap<T> {
         self.insert_inner(value, guard.into())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn insert_inner<'a>(&'a self, value: T, _guard: Cow<'a, epoch::Guard>) -> SlotId {
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -554,10 +555,10 @@ impl<T> SlotMap<T> {
 
             // SAFETY: The caller must ensure that `ids` contains only IDs whose indices are in
             // bounds of the slots vector.
-            let slot_ptr = unsafe { slots_ptr.add(id.index() as usize) };
+            let slot = unsafe { slots_ptr.add(id.index() as usize) };
 
             // SAFETY: The caller must ensure that `ids` contains only IDs with disjunct indices.
-            let slot = unsafe { &mut *slot_ptr };
+            let slot = unsafe { &mut *slot };
 
             let generation = *slot.generation.get_mut();
 

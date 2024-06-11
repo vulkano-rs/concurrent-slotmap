@@ -40,7 +40,10 @@ pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 4;
 /// epoch boundary. It is important to pin the local epoch before doing any kind of access, such
 /// that no accesses can bleed into the previous epoch. Similarly, the pin must persist for as long
 /// as any accesses from the pinned epoch can persist.
+// The `unwrap` below can't actually happen in any reasonable program.
+#[allow(clippy::missing_panics_doc)]
 #[inline]
+#[must_use]
 pub fn pin() -> Guard {
     let local_ptr = local();
 
@@ -298,7 +301,7 @@ pub struct Guard {
 
 impl Guard {
     #[inline]
-    pub fn epoch(&self) -> u32 {
+    pub(crate) fn epoch(&self) -> u32 {
         self.local().epoch.load(Relaxed) & !PINNED_BIT
     }
 
