@@ -13,7 +13,7 @@ keywords = ["lock-free", "concurrent", "slotmap", "slot", "map", "arena", "alloc
 categories = ["concurrency", "data-structures", "memory-management"]
 
 [dependencies]
-virtual-buffer = { git = "https://github.com/vulkano-rs/virtual-buffer", rev = "8a735d778272904b6a14008f2da97adc581b5845" }
+virtual-buffer = "1.0"
 
 [dev-dependencies]
 slotmap = "1.0"
