@@ -323,10 +323,10 @@ impl From<Guard> for Cow<'_, Guard> {
 
 #[repr(C)]
 struct Global {
-    /// The global list of `Local`s participating in the memory reclamation.
+    /// The head of the global list of `Local`s participating in the memory reclamation.
     local_list_head: Cell<Option<NonNull<Local>>>,
 
-    /// The lock that protects `local_list_head`.
+    /// The lock that protects the local list.
     local_list_lock: AtomicBool,
 
     /// The number of `GlobalHandle`s to this `Global` that exist.
@@ -447,6 +447,9 @@ struct Local {
     /// The next `Local` in the global list of participants.
     next: Cell<Option<NonNull<Self>>>,
 
+    /// The previous `Local` in the global list of participants.
+    prev: Cell<Option<NonNull<Self>>>,
+
     /// The local epoch counter. When this epoch is pinned, it ensures that the global epoch cannot
     /// be advanced more than one step until it is unpinned.
     epoch: AtomicU32,
@@ -470,6 +473,7 @@ impl Local {
     fn register(global: &GlobalHandle) -> LocalHandle {
         let mut local = Box::new(Local {
             next: Cell::new(None),
+            prev: Cell::new(None),
             epoch: AtomicU32::new(0),
             _alignment: CacheAligned,
             global: global.clone(),
@@ -482,12 +486,18 @@ impl Local {
 
         global.lock_local_list();
 
-        local.next = Cell::new(global.local_list_head.get());
+        let head = global.local_list_head.get();
+        local.next = Cell::new(head);
 
         // SAFETY: `Box` is guaranteed to be non-null.
         let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(local)) };
 
         global.local_list_head.set(Some(ptr));
+
+        if let Some(head) = head {
+            // SAFETY: The list of locals always contains valid pointers.
+            unsafe { head.as_ref() }.prev.set(Some(ptr));
+        }
 
         // SAFETY: We locked the local list above.
         unsafe { global.unlock_local_list() };
@@ -498,50 +508,31 @@ impl Local {
     }
 
     #[inline(never)]
-    unsafe fn unregister(local: NonNull<Self>) {
-        // SAFETY: The caller must ensure that `local` is a valid pointer to a `Local`.
-        let global = unsafe { local.as_ref() }.global.global();
+    unsafe fn unregister(ptr: NonNull<Self>) {
+        // SAFETY: The caller must ensure that `local` is in the list of locals, which means it must
+        // be valid.
+        let local = unsafe { ptr.as_ref() };
+        let global = local.global.global();
 
         global.lock_local_list();
 
-        let head = global.local_list_head.get();
-
-        // FIXME: The only O(n) operation, also keeps a lock during.
-        if head == Some(local) {
+        if let Some(prev) = local.prev.get() {
             // SAFETY: The list of locals always contains valid pointers.
-            let next = unsafe { local.as_ref() }.next.get();
-
-            global.local_list_head.set(next);
+            unsafe { prev.as_ref() }.next.set(local.next.get());
         } else {
-            // SAFETY: The caller must ensure that `local` is present in the list of locals.
-            let mut curr = unsafe { head.unwrap_unchecked() };
+            global.local_list_head.set(local.next.get());
+        }
 
-            loop {
-                // SAFETY: The list of locals always contains valid pointers.
-                let next = unsafe { curr.as_ref() }.next.get();
-
-                // SAFETY: The caller must ensure that `local` is present in the list of locals.
-                let next = unsafe { next.unwrap_unchecked() };
-
-                if next == local {
-                    // SAFETY: The list of locals always contains valid pointers.
-                    let next = unsafe { next.as_ref() }.next.get();
-
-                    // SAFETY: The list of locals always contains valid pointers.
-                    unsafe { curr.as_ref() }.next.set(next);
-
-                    break;
-                }
-
-                curr = next;
-            }
+        if let Some(next) = local.next.get() {
+            // SAFETY: The list of locals always contains valid pointers.
+            unsafe { next.as_ref() }.prev.set(local.prev.get());
         }
 
         // SAFETY: We locked the local list above.
         unsafe { global.unlock_local_list() };
 
         // SAFETY: The caller must ensure that `local` can't be accessed after this point.
-        let _ = unsafe { Box::from_raw(local.as_ptr()) };
+        let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
     }
 
     #[inline]
