@@ -337,7 +337,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
                         // at least 2 steps from the last push into the queued list and we removed
                         // the list from the queue, which means that no other threads can be
                         // accessing any of the slots in the list.
-                        unsafe { self.collect_garbage(queued_head) };
+                        unsafe { self.collect_unchecked(queued_head) };
 
                         // SAFETY: The caller must ensure that the inner value was initialized and
                         // that said write was synchronized with and made visible here.
@@ -352,8 +352,47 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
+    pub fn try_collect(&self, guard: &epoch::Guard) {
+        let epoch = guard.epoch();
+        let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
+        let mut queued_state = queued_list.load(Acquire);
+        let mut backoff = Backoff::new();
+
+        loop {
+            let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
+            let queued_epoch = (queued_state >> 32) as u32;
+            let epoch_interval = epoch.wrapping_sub(queued_epoch);
+
+            if epoch_interval == 0 {
+                break;
+            } else {
+                let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
+
+                assert!(!local_epoch_is_behind_queue);
+
+                let new_state = u64::from(NIL) | u64::from(queued_epoch) << 32;
+
+                match queued_list.compare_exchange_weak(queued_state, new_state, Relaxed, Acquire) {
+                    Ok(_) => {
+                        // SAFETY: Having ended up here, the global epoch must have been advanced
+                        // at least 2 steps from the last push into the queued list and we removed
+                        // the list from the queue, which means that no other threads can be
+                        // accessing any of the slots in the list.
+                        unsafe { self.collect_unchecked(queued_head) };
+
+                        break;
+                    }
+                    Err(new_state) => {
+                        queued_state = new_state;
+                        backoff.spin();
+                    }
+                }
+            }
+        }
+    }
+
     #[cold]
-    unsafe fn collect_garbage(&self, queued_head: u32) {
+    unsafe fn collect_unchecked(&self, queued_head: u32) {
         if queued_head == NIL {
             // There is no garbage.
             return;
