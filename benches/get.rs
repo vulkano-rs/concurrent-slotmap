@@ -2,7 +2,6 @@
 
 extern crate test;
 
-use concurrent_slotmap::epoch;
 use std::{sync::RwLock, thread};
 use test::{black_box, Bencher};
 
@@ -12,7 +11,7 @@ const THREADS: u32 = 10;
 #[bench]
 fn concurrent_slotmap(b: &mut Bencher) {
     b.iter(|| {
-        let map = concurrent_slotmap::SlotMap::new(ITERATIONS, epoch::GlobalHandle::new());
+        let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
         let id = map.insert([0usize; 2], map.global().register_local().pin());
 
         thread::scope(|s| {

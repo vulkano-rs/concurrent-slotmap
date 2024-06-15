@@ -29,10 +29,11 @@ pub mod epoch;
 const NIL: u32 = u32::MAX;
 
 #[cfg_attr(not(doc), repr(C))]
-pub struct SlotMap<T> {
+pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
     slots: Vec<Slot<T>>,
     len: AtomicU32,
     global: epoch::GlobalHandle,
+    collector: C,
 
     _alignment1: CacheAligned,
 
@@ -58,13 +59,35 @@ pub struct SlotMap<T> {
     free_list_queue: [AtomicU64; 2],
 }
 
-impl<T> SlotMap<T> {
+impl<T> SlotMap<T, DefaultCollector> {
     #[must_use]
-    pub fn new(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
+    pub fn new(max_capacity: u32) -> Self {
+        Self::with_global(max_capacity, epoch::GlobalHandle::new())
+    }
+
+    #[must_use]
+    pub fn with_global(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
+        Self::with_global_and_collector(max_capacity, global, DefaultCollector)
+    }
+}
+
+impl<T, C: Collector<T>> SlotMap<T, C> {
+    #[must_use]
+    pub fn with_collector(max_capacity: u32, collector: C) -> Self {
+        Self::with_global_and_collector(max_capacity, epoch::GlobalHandle::new(), collector)
+    }
+
+    #[must_use]
+    pub fn with_global_and_collector(
+        max_capacity: u32,
+        global: epoch::GlobalHandle,
+        collector: C,
+    ) -> Self {
         SlotMap {
             slots: Vec::new(max_capacity as usize),
             len: AtomicU32::new(0),
             global,
+            collector,
             _alignment1: CacheAligned,
             free_list: AtomicU32::new(NIL),
             _alignment2: CacheAligned,
@@ -96,8 +119,15 @@ impl<T> SlotMap<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn global(&self) -> &epoch::GlobalHandle {
         &self.global
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn collector(&self) -> &C {
+        &self.collector
     }
 
     /// # Panics
@@ -338,8 +368,10 @@ impl<T> SlotMap<T> {
             // vector never shrinks, therefore the index must have staid in bounds.
             queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail as usize) };
 
+            let ptr = queued_tail_slot.value.get().cast::<T>();
+
             // SAFETY: The caller must ensure that we have exclusive access to this list.
-            unsafe { queued_tail_slot.value.get().cast::<T>().drop_in_place() };
+            unsafe { self.collector.collect(ptr) };
 
             let next_free = queued_tail_slot.next_free.load(Acquire);
 
@@ -797,7 +829,7 @@ impl<T> SlotMap<T> {
 
 // We don't want to print the `_alignment` fields.
 #[allow(clippy::missing_fields_in_debug)]
-impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
+impl<T: fmt::Debug, C: Collector<T>> fmt::Debug for SlotMap<T, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Slots;
 
@@ -807,9 +839,9 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        struct List<'a, T>(&'a SlotMap<T>, u32);
+        struct List<'a, T, C: Collector<T>>(&'a SlotMap<T, C>, u32);
 
-        impl<T> fmt::Debug for List<'_, T> {
+        impl<T, C: Collector<T>> fmt::Debug for List<'_, T, C> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let mut head = self.1;
                 let mut debug = f.debug_list();
@@ -828,9 +860,9 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        struct QueuedList<'a, T>(&'a SlotMap<T>, u64);
+        struct QueuedList<'a, T, C: Collector<T>>(&'a SlotMap<T, C>, u64);
 
-        impl<T> fmt::Debug for QueuedList<'_, T> {
+        impl<T, C: Collector<T>> fmt::Debug for QueuedList<'_, T, C> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let state = self.1;
                 let head = (state & 0xFFFF_FFFF) as u32;
@@ -862,7 +894,7 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
     }
 }
 
-impl<T> Drop for SlotMap<T> {
+impl<T, C: Collector<T>> Drop for SlotMap<T, C> {
     fn drop(&mut self) {
         if !core::mem::needs_drop::<T>() {
             return;
@@ -876,10 +908,12 @@ impl<T> Drop for SlotMap<T> {
                 // slots vector never shrinks, therefore the index must have staid in bounds.
                 let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
 
+                let ptr = slot.value.get_mut().as_mut_ptr();
+
                 // SAFETY: We can be certain that this slot has been initialized, since the only
                 // way in which it could have been queued for freeing is in `SlotMap::remove` if
                 // the slot was inserted before.
-                unsafe { slot.value.get_mut().assume_init_drop() };
+                unsafe { self.collector.collect(ptr) };
 
                 head = *slot.next_free.get_mut();
             }
@@ -887,17 +921,19 @@ impl<T> Drop for SlotMap<T> {
 
         for slot in &mut self.slots {
             if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                let ptr = slot.value.get_mut().as_mut_ptr();
+
                 // SAFETY:
                 // * The mutable reference makes sure that access to the slot is synchronized.
                 // * We checked that the slot is occupied, which means that it must have been
                 //   initialized in `SlotMap::insert[_mut]`.
-                unsafe { slot.value.get_mut().assume_init_drop() };
+                unsafe { self.collector.collect(ptr) };
             }
         }
     }
 }
 
-impl<'a, T> IntoIterator for &'a mut SlotMap<T> {
+impl<'a, T, C: Collector<T>> IntoIterator for &'a mut SlotMap<T, C> {
     type Item = (SlotId, &'a mut T);
 
     type IntoIter = IterMut<'a, T>;
@@ -1005,31 +1041,6 @@ impl<T: fmt::Debug> fmt::Debug for Ref<'_, T> {
 impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
-    }
-}
-
-#[repr(align(128))]
-struct CacheAligned;
-
-const SPIN_LIMIT: u32 = 6;
-
-struct Backoff {
-    step: u32,
-}
-
-impl Backoff {
-    fn new() -> Self {
-        Backoff { step: 0 }
-    }
-
-    fn spin(&mut self) {
-        for _ in 0..1 << self.step {
-            hint::spin_loop();
-        }
-
-        if self.step <= SPIN_LIMIT {
-            self.step += 1;
-        }
     }
 }
 
@@ -1164,6 +1175,51 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 
 impl<T> FusedIterator for IterMut<'_, T> {}
 
+pub trait Collector<T> {
+    /// # Safety
+    ///
+    /// This function has the same safety preconditions and semantics as [`ptr::drop_in_place`]. It
+    /// must be safe to drop the value pointed to by `ptr`.
+    ///
+    /// [`ptr::drop_in_place`]: core::ptr::drop_in_place
+    unsafe fn collect(&self, ptr: *mut T);
+}
+
+pub struct DefaultCollector;
+
+impl<T> Collector<T> for DefaultCollector {
+    #[inline(always)]
+    unsafe fn collect(&self, ptr: *mut T) {
+        // SAFETY: The caller must ensure that it is safe to drop the value.
+        unsafe { ptr.drop_in_place() }
+    }
+}
+
+#[repr(align(128))]
+struct CacheAligned;
+
+const SPIN_LIMIT: u32 = 6;
+
+struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Backoff { step: 0 }
+    }
+
+    fn spin(&mut self) {
+        for _ in 0..1 << self.step {
+            hint::spin_loop();
+        }
+
+        if self.step <= SPIN_LIMIT {
+            self.step += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use self::epoch::PINNINGS_BETWEEN_ADVANCE;
@@ -1172,7 +1228,7 @@ mod tests {
 
     #[test]
     fn basic_usage1() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let x = map.insert(69, guard);
@@ -1197,7 +1253,7 @@ mod tests {
 
     #[test]
     fn basic_usage2() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
@@ -1241,7 +1297,7 @@ mod tests {
 
     #[test]
     fn basic_usage3() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
@@ -1276,7 +1332,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut1() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(69);
         let y = map.insert_mut(42);
@@ -1300,7 +1356,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut2() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1343,7 +1399,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut3() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1377,7 +1433,7 @@ mod tests {
 
     #[test]
     fn iter1() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
@@ -1412,7 +1468,7 @@ mod tests {
 
     #[test]
     fn iter2() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
@@ -1443,7 +1499,7 @@ mod tests {
 
     #[test]
     fn iter3() {
-        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(10);
         let guard = &map.global().register_local().pin();
 
         let _ = map.insert(1, guard);
@@ -1481,7 +1537,7 @@ mod tests {
 
     #[test]
     fn get_many_mut() {
-        let mut map = SlotMap::new(3, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(3);
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1524,7 +1580,7 @@ mod tests {
 
     #[test]
     fn iter_mut1() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(1);
         let _ = map.insert_mut(2);
@@ -1558,7 +1614,7 @@ mod tests {
 
     #[test]
     fn iter_mut2() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1588,7 +1644,7 @@ mod tests {
 
     #[test]
     fn iter_mut3() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let _ = map.insert_mut(1);
         let x = map.insert_mut(2);
@@ -1625,7 +1681,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut1() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(0);
         let y = map.insert_mut(0);
@@ -1648,7 +1704,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut2() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(0);
 
@@ -1678,7 +1734,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut3() {
-        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let mut map = SlotMap::new(10);
 
         let x = map.insert_mut(0);
         let y = map.insert_mut(0);
@@ -1726,7 +1782,7 @@ mod tests {
     fn multi_threaded1() {
         const THREADS: u32 = 2;
 
-        let map = SlotMap::new(ITERATIONS, epoch::GlobalHandle::new());
+        let map = SlotMap::new(ITERATIONS);
 
         thread::scope(|s| {
             let inserter = || {
@@ -1766,7 +1822,7 @@ mod tests {
     fn multi_threaded2() {
         const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE as u32 * 3;
 
-        let map = SlotMap::new(ITERATIONS / 2, epoch::GlobalHandle::new());
+        let map = SlotMap::new(ITERATIONS / 2);
 
         thread::scope(|s| {
             let insert_remover = || {
@@ -1802,7 +1858,7 @@ mod tests {
 
     #[test]
     fn multi_threaded3() {
-        let map = SlotMap::new(ITERATIONS / 10, epoch::GlobalHandle::new());
+        let map = SlotMap::new(ITERATIONS / 10);
 
         thread::scope(|s| {
             let inserter = || {
