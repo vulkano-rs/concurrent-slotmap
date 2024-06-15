@@ -3,7 +3,11 @@
 // https://github.com/rust-lang/rust/issues/121483
 #![deny(unsafe_op_in_unsafe_fn)]
 #![forbid(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
+use alloc::borrow::Cow;
 use core::{
     cell::UnsafeCell,
     fmt, hint,
@@ -17,7 +21,6 @@ use core::{
         Ordering::{Acquire, Relaxed, Release},
     },
 };
-use std::borrow::Cow;
 use virtual_buffer::vec::Vec;
 
 pub mod epoch;
@@ -29,6 +32,7 @@ const NIL: u32 = u32::MAX;
 pub struct SlotMap<T> {
     slots: Vec<Slot<T>>,
     len: AtomicU32,
+    global: epoch::GlobalHandle,
 
     _alignment1: CacheAligned,
 
@@ -56,10 +60,11 @@ pub struct SlotMap<T> {
 
 impl<T> SlotMap<T> {
     #[must_use]
-    pub fn new(max_capacity: u32) -> Self {
+    pub fn new(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
         SlotMap {
             slots: Vec::new(max_capacity as usize),
             len: AtomicU32::new(0),
+            global,
             _alignment1: CacheAligned,
             free_list: AtomicU32::new(NIL),
             _alignment2: CacheAligned,
@@ -88,6 +93,11 @@ impl<T> SlotMap<T> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[inline]
+    pub fn global(&self) -> &epoch::GlobalHandle {
+        &self.global
     }
 
     #[inline]
@@ -751,6 +761,14 @@ impl<T> SlotMap<T> {
 #[allow(clippy::missing_fields_in_debug)]
 impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Slots;
+
+        impl fmt::Debug for Slots {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.pad("[..]")
+            }
+        }
+
         struct List<'a, T>(&'a SlotMap<T>, u32);
 
         impl<T> fmt::Debug for List<'_, T> {
@@ -788,11 +806,11 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        let _guard = epoch::pin();
         let mut debug = f.debug_struct("SlotMap");
         debug
-            .field("slots", &self.slots)
+            .field("slots", &Slots)
             .field("len", &self.len)
+            .field("global", &self.global)
             .field("free_list", &List(self, self.free_list.load(Acquire)))
             .field(
                 "free_list_queue",
@@ -841,17 +859,6 @@ impl<T> Drop for SlotMap<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a SlotMap<T> {
-    type Item = (SlotId, Ref<'a, T>);
-
-    type IntoIter = Iter<'a, T>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter(epoch::pin())
-    }
-}
-
 impl<'a, T> IntoIterator for &'a mut SlotMap<T> {
     type Item = (SlotId, &'a mut T);
 
@@ -894,44 +901,6 @@ impl<T> Slot<T> {
     unsafe fn value_unchecked_mut(&mut self) -> &mut T {
         // SAFETY: The caller must ensure that the slot has been initialized.
         unsafe { self.value.get_mut().assume_init_mut() }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for Slot<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Nil;
-
-        impl fmt::Debug for Nil {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.pad("NIL")
-            }
-        }
-
-        let _guard = epoch::pin();
-        let generation = self.generation.load(Acquire);
-
-        let mut debug = f.debug_struct("Slot");
-        debug.field("generation", &generation);
-
-        if generation & OCCUPIED_BIT != 0 {
-            // SAFETY:
-            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * We checked that the slot is occupied, which means that it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
-            debug.field("value", unsafe { self.value_unchecked() });
-        } else {
-            let next_free = self.next_free.load(Relaxed);
-
-            if next_free == NIL {
-                debug.field("next_free", &Nil);
-            } else {
-                debug.field("next_free", &next_free);
-            }
-        }
-
-        debug.finish()
     }
 }
 
@@ -1165,8 +1134,8 @@ mod tests {
 
     #[test]
     fn basic_usage1() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let x = map.insert(69, guard);
         let y = map.insert(42, guard);
@@ -1190,8 +1159,8 @@ mod tests {
 
     #[test]
     fn basic_usage2() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1234,8 +1203,8 @@ mod tests {
 
     #[test]
     fn basic_usage3() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1269,7 +1238,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut1() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(69);
         let y = map.insert_mut(42);
@@ -1293,7 +1262,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut2() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1336,7 +1305,7 @@ mod tests {
 
     #[test]
     fn basic_usage_mut3() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1370,8 +1339,8 @@ mod tests {
 
     #[test]
     fn iter1() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
         let _ = map.insert(2, guard);
@@ -1405,8 +1374,8 @@ mod tests {
 
     #[test]
     fn iter2() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1436,8 +1405,8 @@ mod tests {
 
     #[test]
     fn iter3() {
-        let map = SlotMap::new(10);
-        let guard = &epoch::pin();
+        let map = SlotMap::new(10, epoch::GlobalHandle::new());
+        let guard = &map.global().register_local().pin();
 
         let _ = map.insert(1, guard);
         let x = map.insert(2, guard);
@@ -1474,7 +1443,7 @@ mod tests {
 
     #[test]
     fn get_many_mut() {
-        let mut map = SlotMap::new(3);
+        let mut map = SlotMap::new(3, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1517,7 +1486,7 @@ mod tests {
 
     #[test]
     fn iter_mut1() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(1);
         let _ = map.insert_mut(2);
@@ -1551,7 +1520,7 @@ mod tests {
 
     #[test]
     fn iter_mut2() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
@@ -1581,7 +1550,7 @@ mod tests {
 
     #[test]
     fn iter_mut3() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let _ = map.insert_mut(1);
         let x = map.insert_mut(2);
@@ -1618,7 +1587,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut1() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(0);
         let y = map.insert_mut(0);
@@ -1641,7 +1610,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut2() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(0);
 
@@ -1671,7 +1640,7 @@ mod tests {
 
     #[test]
     fn reusing_slots_mut3() {
-        let mut map = SlotMap::new(10);
+        let mut map = SlotMap::new(10, epoch::GlobalHandle::new());
 
         let x = map.insert_mut(0);
         let y = map.insert_mut(0);
@@ -1719,12 +1688,14 @@ mod tests {
     fn multi_threaded1() {
         const THREADS: u32 = 2;
 
-        let map = SlotMap::new(ITERATIONS);
+        let map = SlotMap::new(ITERATIONS, epoch::GlobalHandle::new());
 
         thread::scope(|s| {
             let inserter = || {
+                let local = map.global().register_local();
+
                 for _ in 0..ITERATIONS / THREADS {
-                    map.insert(0, epoch::pin());
+                    map.insert(0, local.pin());
                 }
             };
 
@@ -1737,8 +1708,10 @@ mod tests {
 
         thread::scope(|s| {
             let remover = || {
+                let local = map.global().register_local();
+
                 for index in 0..ITERATIONS {
-                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), epoch::pin());
+                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), local.pin());
                 }
             };
 
@@ -1755,23 +1728,27 @@ mod tests {
     fn multi_threaded2() {
         const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE * 3;
 
-        let map = SlotMap::new(ITERATIONS / 2);
+        let map = SlotMap::new(ITERATIONS / 2, epoch::GlobalHandle::new());
 
         thread::scope(|s| {
             let insert_remover = || {
+                let local = map.global().register_local();
+
                 for _ in 0..ITERATIONS / 6 {
-                    let x = map.insert(0, epoch::pin());
-                    let y = map.insert(0, epoch::pin());
-                    map.remove(y, epoch::pin());
-                    let z = map.insert(0, epoch::pin());
-                    map.remove(x, epoch::pin());
-                    map.remove(z, epoch::pin());
+                    let x = map.insert(0, local.pin());
+                    let y = map.insert(0, local.pin());
+                    map.remove(y, local.pin());
+                    let z = map.insert(0, local.pin());
+                    map.remove(x, local.pin());
+                    map.remove(z, local.pin());
                 }
             };
             let iterator = || {
+                let local = map.global().register_local();
+
                 for _ in 0..ITERATIONS / CAPACITY * 2 {
                     for index in 0..CAPACITY {
-                        if let Some(value) = map.index(index, epoch::pin()) {
+                        if let Some(value) = map.index(index, local.pin()) {
                             let _ = *value;
                         }
                     }
@@ -1787,26 +1764,32 @@ mod tests {
 
     #[test]
     fn multi_threaded3() {
-        let map = SlotMap::new(ITERATIONS / 10);
+        let map = SlotMap::new(ITERATIONS / 10, epoch::GlobalHandle::new());
 
         thread::scope(|s| {
             let inserter = || {
+                let local = map.global().register_local();
+
                 for i in 0..ITERATIONS {
                     if i % 10 == 0 {
-                        map.insert(0, epoch::pin());
+                        map.insert(0, local.pin());
                     } else {
                         thread::yield_now();
                     }
                 }
             };
             let remover = || {
+                let local = map.global().register_local();
+
                 for _ in 0..ITERATIONS {
-                    map.remove_index(0, epoch::pin());
+                    map.remove_index(0, local.pin());
                 }
             };
             let getter = || {
+                let local = map.global().register_local();
+
                 for _ in 0..ITERATIONS {
-                    if let Some(value) = map.index(0, epoch::pin()) {
+                    if let Some(value) = map.index(0, local.pin()) {
                         let _ = *value;
                     }
                 }

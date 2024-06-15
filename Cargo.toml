@@ -17,3 +17,7 @@ virtual-buffer = "1.0"
 
 [dev-dependencies]
 slotmap = "1.0"
+
+[features]
+default = ["std"]
+std = ["virtual-buffer/std"]

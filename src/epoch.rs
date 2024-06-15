@@ -11,20 +11,16 @@
 // * Implementing `Clone` for `Guard` to allow use inside `Cow`.
 // * Other small miscellaneous changes.
 
-use crate::CacheAligned;
+use crate::{Backoff, CacheAligned};
+use alloc::{borrow::Cow, boxed::Box};
 use core::{
     cell::Cell,
     fmt,
     ptr::NonNull,
     sync::atomic::{
-        self, AtomicU32,
+        self, AtomicBool, AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
-};
-use std::{
-    borrow::Cow,
-    sync::{Mutex, TryLockError},
-    thread,
 };
 
 /// The bit of `Local::epoch` which signifies that the participant is pinned.
@@ -36,118 +32,305 @@ pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
 #[cfg(miri)]
 pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 4;
 
-/// Pins the local epoch, such that no accesses done while the returned `Guard` exists can cross an
-/// epoch boundary. It is important to pin the local epoch before doing any kind of access, such
-/// that no accesses can bleed into the previous epoch. Similarly, the pin must persist for as long
-/// as any accesses from the pinned epoch can persist.
-// The `unwrap` below can't actually happen in any reasonable program.
-#[allow(clippy::missing_panics_doc)]
-#[inline]
-#[must_use]
-pub fn pin() -> Guard {
-    let local_ptr = local();
+/// A handle to a global epoch.
+pub struct GlobalHandle {
+    ptr: NonNull<Global>,
+}
 
-    // SAFETY: `local()` always returns a pointer valid for access by the current thread.
-    let local = unsafe { local_ptr.as_ref() };
+// SAFETY: `Global` is `Send + Sync` and its lifetime is enforced with reference counting.
+unsafe impl Send for GlobalHandle {}
 
-    let guard_count = local.guard_count.get();
-    local.guard_count.set(guard_count.checked_add(1).unwrap());
+// SAFETY: `Global` is `Send + Sync` and its lifetime is enforced with reference counting.
+unsafe impl Sync for GlobalHandle {}
 
-    if guard_count == 0 {
-        let global_epoch = global().epoch.load(Relaxed);
-        let new_epoch = global_epoch | PINNED_BIT;
-        local.epoch.store(new_epoch, Relaxed);
+impl Default for GlobalHandle {
+    /// Creates a new global epoch.
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-        // This fence acts two-fold:
-        // * It synchronizes with the `Release` store of the global epoch in `Global::try_advance`,
-        //   which in turn ensures that the accesses all other participants did in a previous epoch
-        //   are visible to us going forward when crossing an epoch boundary.
-        // * It ensures that that no accesses we do going forward can be ordered before this point,
-        //   therefore "bleeding" into the previous epoch, when crossing an epoch boundary.
-        atomic::fence(SeqCst);
+impl GlobalHandle {
+    /// Creates a new global epoch.
+    #[must_use]
+    pub fn new() -> Self {
+        Global::register()
+    }
 
-        local.pin_count.set(local.pin_count.get().wrapping_add(1));
+    /// Registers a new local epoch in the global list of participants.
+    #[must_use]
+    pub fn register_local(&self) -> LocalHandle {
+        Local::register(self)
+    }
 
-        if local.pin_count.get() % PINNINGS_BETWEEN_ADVANCE == 0 {
-            global().try_advance();
+    #[inline]
+    fn global(&self) -> &Global {
+        // SAFETY: The constructor of `GlobalHandle` must ensure that the pointer stays valid for
+        // the lifetime of the handle.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl Clone for GlobalHandle {
+    /// Creates a new handle to the same global epoch.
+    #[inline]
+    fn clone(&self) -> Self {
+        #[allow(clippy::cast_sign_loss)]
+        if self.global().handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
+            abort();
+        }
+
+        // SAFETY: We incremented the `handle_count` above, such that the handle's drop
+        // implementation cannot drop the `Global` while another handle still exists.
+        unsafe { GlobalHandle { ptr: self.ptr } }
+    }
+}
+
+impl fmt::Debug for GlobalHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalHandle").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GlobalHandle {
+    /// Returns `true` if both handles refer to the same global epoch counter.
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Eq for GlobalHandle {}
+
+impl Drop for GlobalHandle {
+    /// Drops the handle.
+    ///
+    /// If there are no other handles to this global epoch, the global epoch will be dropped.
+    #[inline]
+    fn drop(&mut self) {
+        if self.global().handle_count.fetch_sub(1, Release) == 1 {
+            // SAFETY: The handle count has gone to zero, which means that no other threads can
+            // register a new handle. `Global::unregister` ensures that the drop is synchronized
+            // with the above decrement, such that no access to the `Global` can be ordered after
+            // the drop.
+            unsafe { Global::unregister(self.ptr) };
         }
     }
-
-    // SAFETY:
-    // * We incremented the `guard_count` above, such that the guard's drop implementation cannot
-    //   unpin the participant while another guard still exists.
-    // * We made sure to pin the participant if it wasn't already and made sure that accesses from
-    //   this point on can't leak into the previous epoch.
-    unsafe { Guard { local: local_ptr } }
 }
 
-#[inline]
-fn global() -> &'static Global {
-    static GLOBAL: Global = Global::new();
-
-    &GLOBAL
+/// A handle to a local epoch.
+pub struct LocalHandle {
+    ptr: NonNull<Local>,
 }
 
-#[inline]
-fn local() -> NonNull<Local> {
-    thread_local! {
-        static LOCAL: Cell<Option<NonNull<Local>>> = const { Cell::new(None) };
+impl LocalHandle {
+    /// Pins the local epoch, such that no accesses done while the returned `Guard` exists can
+    /// cross an epoch boundary. It is important to pin the local epoch before doing any kind of
+    /// access, such that no accesses can bleed into the previous epoch. Similarly, the pin must
+    /// persist for as long as any accesses from the pinned epoch can persist.
+    //
+    // The `unwrap` below can't actually happen in any reasonable program.
+    #[allow(clippy::missing_panics_doc)]
+    #[inline]
+    #[must_use]
+    pub fn pin(&self) -> Guard {
+        let local = self.local();
+        let global = local.global();
 
-        static THREAD_GUARD: ThreadGuard = const { ThreadGuard { local: Cell::new(None) } };
+        let guard_count = local.guard_count.get();
+        local.guard_count.set(guard_count.checked_add(1).unwrap());
+
+        if guard_count == 0 {
+            let global_epoch = global.epoch.load(Relaxed);
+            let new_epoch = global_epoch | PINNED_BIT;
+            local.epoch.store(new_epoch, Relaxed);
+
+            // This fence acts two-fold:
+            // * It synchronizes with the `Release` store of the global epoch in
+            //   `Global::try_advance`, which in turn ensures that the accesses all other
+            //   participants did in a previous epoch are visible to us going forward when crossing
+            //   an epoch boundary.
+            // * It ensures that that no accesses we do going forward can be ordered before this
+            //   point, therefore "bleeding" into the previous epoch, when crossing an epoch
+            //   boundary.
+            atomic::fence(SeqCst);
+
+            local.pin_count.set(local.pin_count.get().wrapping_add(1));
+
+            if local.pin_count.get() % PINNINGS_BETWEEN_ADVANCE == 0 {
+                global.try_advance();
+            }
+        }
+
+        // SAFETY:
+        // * We incremented the `guard_count` above, such that the guard's drop implementation
+        //   cannot unpin the participant while another guard still exists.
+        // * We made sure to pin the participant if it wasn't already and made sure that accesses
+        //   from this point on can't leak into the previous epoch.
+        unsafe { Guard { local: self.ptr } }
     }
 
-    struct ThreadGuard {
-        local: Cell<Option<NonNull<Local>>>,
+    /// Returns a handle to the global epoch.
+    #[inline]
+    #[must_use]
+    pub fn global(&self) -> &GlobalHandle {
+        &self.local().global
     }
 
-    impl Drop for ThreadGuard {
-        fn drop(&mut self) {
-            let local = self.local.get().unwrap();
+    #[inline]
+    fn local(&self) -> &Local {
+        // SAFETY: The constructor of `LocalHandle` must ensure that the pointer stays valid for the
+        // lifetime of the handle.
+        unsafe { self.ptr.as_ref() }
+    }
+}
 
-            // SAFETY: `Local::register` always returns a pointer valid for access by the current
-            // thread, and the pointer is stored in the thread's TLS. It must have staid valid
-            // until now because this place is the only one which invalidates it.
-            let guard_count = unsafe { local.as_ref() }.guard_count.get();
+impl Clone for LocalHandle {
+    /// Creates a new handle to the same local epoch.
+    #[inline]
+    fn clone(&self) -> Self {
+        let local = self.local();
 
-            if guard_count == 0 {
-                let _ = LOCAL.try_with(|cell| cell.set(None));
+        local.handle_count.set(local.handle_count.get() + 1);
 
-                // SAFETY: We checked that the `guard_count` is zero, which means that no guards
-                // exist which could attempt to access the pointer. We also ensured that any future
-                // calls to `local` can't access this pointer by unsetting `LOCAL` above.
-                unsafe { Local::unregister(local) };
-            } else if !thread::panicking() {
-                unreachable!(
-                    "the only way to reach this is by leaking an `epoch::Guard` or by storing one \
-                    inside TLS; both are very naughty",
-                );
+        // SAFETY: We incremented the `handle_count` above, such that the handle's drop
+        // implementation cannot drop the `Local` while another handle still exists.
+        unsafe { LocalHandle { ptr: self.ptr } }
+    }
+}
+
+impl fmt::Debug for LocalHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalHandle").finish_non_exhaustive()
+    }
+}
+
+impl Drop for LocalHandle {
+    /// Drops the handle.
+    ///
+    /// If there are no other handles or guards that refer to this local epoch, it will be
+    /// unregistered from the global list of participants.
+    #[inline]
+    fn drop(&mut self) {
+        let local = self.local();
+
+        // SAFETY: The constructor of `LocalHandle` must ensure that `handle_count` has been
+        // incremented before construction of the handle.
+        unsafe { local.handle_count.set(local.handle_count.get() - 1) };
+
+        if local.handle_count.get() == 0 && local.guard_count.get() == 0 {
+            // SAFETY: We checked that both the handle count and guard count went to zero, which
+            // means that no other references to the `Local` can exist after this point.
+            unsafe { Local::unregister(self.ptr) };
+        }
+    }
+}
+
+/// A guard that keeps the local epoch pinned.
+pub struct Guard {
+    local: NonNull<Local>,
+}
+
+impl Guard {
+    /// Returns a handle to the global epoch.
+    #[inline]
+    #[must_use]
+    pub fn global(&self) -> &GlobalHandle {
+        &self.local().global
+    }
+
+    #[inline]
+    pub(crate) fn epoch(&self) -> u32 {
+        self.local().epoch.load(Relaxed) & !PINNED_BIT
+    }
+
+    #[inline]
+    fn local(&self) -> &Local {
+        // SAFETY: The constructor of `Guard` must ensure that the pointer stays valid for the
+        // lifetime of the guard.
+        unsafe { self.local.as_ref() }
+    }
+}
+
+impl Clone for Guard {
+    /// Creates a new guard for the same local epoch.
+    #[inline]
+    fn clone(&self) -> Self {
+        let local = self.local();
+
+        let guard_count = local.guard_count.get();
+        local.guard_count.set(guard_count.checked_add(1).unwrap());
+
+        // SAFETY:
+        // * We incremented the `guard_count` above, such that the guard's drop implementation
+        //   cannot unpin the participant while another guard still exists.
+        // * The participant is already pinned, as this guard's existence is a proof of that.
+        unsafe { Guard { local: self.local } }
+    }
+}
+
+impl fmt::Debug for Guard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Guard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Guard {
+    /// Drops the guard.
+    ///
+    /// If there are no other guards keeping the local epoch pinned, it will be unpinned. If there
+    /// are also no handles to the local epoch, it will be unregistered from the global list of
+    /// participants.
+    #[inline]
+    fn drop(&mut self) {
+        let local = self.local();
+
+        // SAFETY: The constructor of `Guard` must ensure that the `guard_count` has been
+        // incremented before construction of the guard.
+        unsafe { local.guard_count.set(local.guard_count.get() - 1) };
+
+        if local.guard_count.get() == 0 {
+            // SAFETY:
+            // * The `Release` ordering synchronizes with the `Acquire` fence in
+            //   `Global::try_advance`, which in turn ensures that all accesses done by us until
+            //   this point are visible to all other participants when crossing an epoch boundary.
+            // * We checked that the guard count went to zero, which means that no other guards can
+            //   exist and it is safe to unpin the participant.
+            unsafe { local.epoch.store(0, Release) };
+
+            if local.handle_count.get() == 0 {
+                // SAFETY: We checked that both the handle count and guard count went to zero, which
+                // means that no other references to the `Local` can exist after this point.
+                unsafe { Local::unregister(self.local) };
             }
         }
     }
+}
 
-    #[cold]
-    fn local_slow() -> NonNull<Local> {
-        let local = Local::register();
-
-        LOCAL.with(|cell| cell.set(Some(local)));
-        THREAD_GUARD.with(|guard| guard.local.set(Some(local)));
-
-        local
+impl<'a> From<&'a Guard> for Cow<'a, Guard> {
+    #[inline]
+    fn from(guard: &'a Guard) -> Self {
+        Cow::Borrowed(guard)
     }
+}
 
-    LOCAL.with(|cell| {
-        if let Some(local) = cell.get() {
-            local
-        } else {
-            local_slow()
-        }
-    })
+impl From<Guard> for Cow<'_, Guard> {
+    #[inline]
+    fn from(guard: Guard) -> Self {
+        Cow::Owned(guard)
+    }
 }
 
 #[repr(C)]
 struct Global {
     /// The global list of `Local`s participating in the memory reclamation.
-    local_list_head: Mutex<Option<NonNull<Local>>>,
+    local_list_head: Cell<Option<NonNull<Local>>>,
+
+    /// The lock that protects `local_list_head`.
+    local_list_lock: AtomicBool,
+
+    /// The number of `GlobalHandle`s to this `Global` that exist.
+    handle_count: AtomicUsize,
 
     _alignment: CacheAligned,
 
@@ -160,12 +343,56 @@ struct Global {
 unsafe impl Sync for Global {}
 
 impl Global {
-    const fn new() -> Self {
-        Global {
-            local_list_head: Mutex::new(None),
+    fn register() -> GlobalHandle {
+        let global = Box::new(Global {
+            local_list_head: Cell::new(None),
+            local_list_lock: AtomicBool::new(false),
+            handle_count: AtomicUsize::new(1),
             _alignment: CacheAligned,
             epoch: AtomicU32::new(0),
+        });
+
+        // SAFETY: `Box` is guaranteed to be non-null.
+        let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(global)) };
+
+        // SAFETY: We initialized the `handle_count` to 1, such that the handle's drop
+        // implementation cannot drop the `Global` while another handle still exists.
+        unsafe { GlobalHandle { ptr } }
+    }
+
+    #[inline(never)]
+    unsafe fn unregister(global: NonNull<Global>) {
+        // `Acquire` synchronizes with the `Release` ordering in `GlobalHandle::drop`.
+        //
+        // SAFETY: The caller must ensure that `global` is a valid pointer to a `Global`.
+        unsafe { global.as_ref() }.handle_count.load(Acquire);
+
+        // SAFETY: The caller must ensure that the `Global` can't be accessed after this point.
+        let _ = unsafe { Box::from_raw(global.as_ptr()) };
+    }
+
+    fn lock_local_list(&self) {
+        let mut backoff = Backoff::new();
+
+        loop {
+            match self
+                .local_list_lock
+                .compare_exchange_weak(false, true, Acquire, Relaxed)
+            {
+                Ok(_) => break,
+                Err(_) => backoff.spin(),
+            }
         }
+    }
+
+    fn try_lock_local_list(&self) -> bool {
+        self.local_list_lock
+            .compare_exchange(false, true, Acquire, Relaxed)
+            .is_ok()
+    }
+
+    unsafe fn unlock_local_list(&self) {
+        self.local_list_lock.store(false, Release);
     }
 
     #[cold]
@@ -176,14 +403,12 @@ impl Global {
         // global epoch.
         atomic::fence(SeqCst);
 
-        let head = match self.local_list_head.try_lock() {
-            Ok(guard) => guard,
-            // There is no way in which a panic can happen while holding the lock.
-            Err(TryLockError::Poisoned(err)) => err.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
+        if !self.try_lock_local_list() {
+            // Another thread beat us to it.
+            return;
+        }
 
-        let mut head = *head;
+        let mut head = self.local_list_head.get();
 
         while let Some(local) = head {
             // SAFETY: The list of locals always contains valid pointers.
@@ -191,11 +416,17 @@ impl Global {
             let local_epoch = local.epoch.load(Relaxed);
 
             if local_epoch & PINNED_BIT != 0 && local_epoch & !PINNED_BIT != global_epoch {
+                // SAFETY: We locked the local list above.
+                unsafe { self.unlock_local_list() };
+
                 return;
             }
 
             head = local.next.get();
         }
+
+        // SAFETY: We locked the local list above.
+        unsafe { self.unlock_local_list() };
 
         let new_epoch = global_epoch.wrapping_add(2);
 
@@ -222,7 +453,13 @@ struct Local {
 
     _alignment: CacheAligned,
 
-    /// The number of `Guard`s that exist.
+    /// A handle to the `Global` which this `Local` is participating in.
+    global: GlobalHandle,
+
+    /// The number of `LocalHandle`s to this participant that exist.
+    handle_count: Cell<usize>,
+
+    /// The number of `Guard`s of this participant that exist.
     guard_count: Cell<u32>,
 
     /// The number of pinnings this participant has gone through in total.
@@ -230,41 +467,51 @@ struct Local {
 }
 
 impl Local {
-    fn register() -> NonNull<Self> {
+    fn register(global: &GlobalHandle) -> LocalHandle {
         let mut local = Box::new(Local {
             next: Cell::new(None),
             epoch: AtomicU32::new(0),
             _alignment: CacheAligned,
+            global: global.clone(),
+            handle_count: Cell::new(1),
             guard_count: Cell::new(0),
             pin_count: Cell::new(0),
         });
 
-        let mut head = match global().local_list_head.lock() {
-            Ok(guard) => guard,
-            // There is no way in which a panic can happen while holding the lock.
-            Err(err) => err.into_inner(),
-        };
+        let global = global.global();
 
-        local.next = Cell::new(*head);
+        global.lock_local_list();
+
+        local.next = Cell::new(global.local_list_head.get());
 
         // SAFETY: `Box` is guaranteed to be non-null.
-        let local = unsafe { NonNull::new_unchecked(Box::into_raw(local)) };
+        let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(local)) };
 
-        *head = Some(local);
+        global.local_list_head.set(Some(ptr));
 
-        local
+        // SAFETY: We locked the local list above.
+        unsafe { global.unlock_local_list() };
+
+        // SAFETY: We initialized the `handle_count` to 1, such that the handle's drop
+        // implementation cannot drop the `Local` while another handle still exists.
+        unsafe { LocalHandle { ptr } }
     }
 
+    #[inline(never)]
     unsafe fn unregister(local: NonNull<Self>) {
-        let mut head = match global().local_list_head.lock() {
-            Ok(guard) => guard,
-            // There is no way in which a panic can happen while holding the lock.
-            Err(err) => err.into_inner(),
-        };
+        // SAFETY: The caller must ensure that `local` is a valid pointer to a `Local`.
+        let global = unsafe { local.as_ref() }.global.global();
 
-        if *head == Some(local) {
+        global.lock_local_list();
+
+        let head = global.local_list_head.get();
+
+        // FIXME: The only O(n) operation, also keeps a lock during.
+        if head == Some(local) {
             // SAFETY: The list of locals always contains valid pointers.
-            *head = unsafe { local.as_ref() }.next.get();
+            let next = unsafe { local.as_ref() }.next.get();
+
+            global.local_list_head.set(next);
         } else {
             // SAFETY: The caller must ensure that `local` is present in the list of locals.
             let mut curr = unsafe { head.unwrap_unchecked() };
@@ -290,82 +537,30 @@ impl Local {
             }
         }
 
+        // SAFETY: We locked the local list above.
+        unsafe { global.unlock_local_list() };
+
         // SAFETY: The caller must ensure that `local` can't be accessed after this point.
         let _ = unsafe { Box::from_raw(local.as_ptr()) };
     }
-}
-
-pub struct Guard {
-    local: NonNull<Local>,
-}
-
-impl Guard {
-    #[inline]
-    pub(crate) fn epoch(&self) -> u32 {
-        self.local().epoch.load(Relaxed) & !PINNED_BIT
-    }
 
     #[inline]
-    fn local(&self) -> &Local {
-        // SAFETY: The constructor of `Guard` must ensure that the pointer stays valid for the
-        // lifetime of the guard.
-        unsafe { self.local.as_ref() }
+    fn global(&self) -> &Global {
+        self.global.global()
     }
 }
 
-impl Clone for Guard {
-    #[inline]
-    fn clone(&self) -> Self {
-        let local = self.local();
-        let guard_count = local.guard_count.get();
+/// Polyfill for `core::intrinsics::abort`.
+#[cold]
+fn abort() -> ! {
+    struct PanicOnDrop;
 
-        local.guard_count.set(guard_count.checked_add(1).unwrap());
-
-        // SAFETY:
-        // * We incremented the `guard_count` above, such that the guard's drop implementation
-        //   cannot unpin the participant while another guard still exists.
-        // * The participant is already pinned, as this guard's existence is a proof of that.
-        unsafe { Guard { local: self.local } }
-    }
-}
-
-impl Drop for Guard {
-    #[inline]
-    fn drop(&mut self) {
-        let local = self.local();
-
-        // SAFETY: The constructor of `Guard` must ensure that the `guard_count` has been
-        // incremented before construction of the guard.
-        unsafe { local.guard_count.set(local.guard_count.get() - 1) };
-
-        if local.guard_count.get() == 0 {
-            // SAFETY:
-            // * The `Release` ordering synchronizes with the `Acquire` fence in
-            //   `Global::try_advance`, which in turn ensures that all accesses done by us until
-            //   this point are visible to all other participants when crossing an epoch boundary.
-            // * We checked that the guard count went to zero, which means that no other guards can
-            //   exist and it is safe to unpin the participant.
-            unsafe { local.epoch.store(0, Release) };
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!();
         }
     }
-}
 
-impl<'a> From<&'a Guard> for Cow<'a, Guard> {
-    #[inline]
-    fn from(guard: &'a Guard) -> Self {
-        Cow::Borrowed(guard)
-    }
-}
-
-impl From<Guard> for Cow<'_, Guard> {
-    #[inline]
-    fn from(guard: Guard) -> Self {
-        Cow::Owned(guard)
-    }
-}
-
-impl fmt::Debug for Guard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Guard").finish_non_exhaustive()
-    }
+    let _p = PanicOnDrop;
+    panic!();
 }
