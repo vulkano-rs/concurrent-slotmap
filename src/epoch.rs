@@ -58,6 +58,7 @@ impl GlobalHandle {
     }
 
     /// Registers a new local epoch in the global list of participants.
+    #[inline]
     #[must_use]
     pub fn register_local(&self) -> LocalHandle {
         Local::register(self)
@@ -239,6 +240,15 @@ impl Guard {
         &self.local().global
     }
 
+    /// Tries to advance the global epoch.
+    #[inline]
+    pub fn try_advance_global(&self) {
+        let local = self.local();
+        local.global().try_advance();
+        // This prevents us from trying to advance the global epoch in `LocalHandle::pin`.
+        local.pin_count.set(0);
+    }
+
     #[inline]
     pub(crate) fn epoch(&self) -> u32 {
         self.local().epoch.load(Relaxed) & !PINNED_BIT
@@ -395,7 +405,7 @@ impl Global {
         self.local_list_lock.store(false, Release);
     }
 
-    #[cold]
+    #[inline(never)]
     fn try_advance(&self) {
         let global_epoch = self.epoch.load(Relaxed);
 
@@ -470,6 +480,7 @@ struct Local {
 }
 
 impl Local {
+    #[inline(never)]
     fn register(global: &GlobalHandle) -> LocalHandle {
         let mut local = Box::new(Local {
             next: Cell::new(None),
