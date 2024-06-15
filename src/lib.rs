@@ -1726,7 +1726,7 @@ mod tests {
     // TODO: This test is just fundamentally broken.
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE * 3;
+        const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE as u32 * 3;
 
         let map = SlotMap::new(ITERATIONS / 2, epoch::GlobalHandle::new());
 

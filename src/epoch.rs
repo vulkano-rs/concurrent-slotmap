@@ -28,9 +28,9 @@ const PINNED_BIT: u32 = 1 << 0;
 
 /// The number of pinnings between a participant tries to advance the global epoch.
 #[cfg(not(miri))]
-pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 128;
+pub(crate) const PINNINGS_BETWEEN_ADVANCE: usize = 128;
 #[cfg(miri)]
-pub(crate) const PINNINGS_BETWEEN_ADVANCE: u32 = 4;
+pub(crate) const PINNINGS_BETWEEN_ADVANCE: usize = 4;
 
 /// A handle to a global epoch.
 pub struct GlobalHandle {
@@ -93,7 +93,7 @@ impl fmt::Debug for GlobalHandle {
 }
 
 impl PartialEq for GlobalHandle {
-    /// Returns `true` if both handles refer to the same global epoch counter.
+    /// Returns `true` if both handles refer to the same global epoch.
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.ptr == other.ptr
@@ -460,10 +460,10 @@ struct Local {
     handle_count: Cell<usize>,
 
     /// The number of `Guard`s of this participant that exist.
-    guard_count: Cell<u32>,
+    guard_count: Cell<usize>,
 
     /// The number of pinnings this participant has gone through in total.
-    pin_count: Cell<u32>,
+    pin_count: Cell<usize>,
 }
 
 impl Local {
