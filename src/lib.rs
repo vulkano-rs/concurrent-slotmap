@@ -100,13 +100,18 @@ impl<T> SlotMap<T> {
         &self.global
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
     pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard>>) -> SlotId {
         self.insert_inner(value, guard.into())
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn insert_inner<'a>(&'a self, value: T, _guard: Cow<'a, epoch::Guard>) -> SlotId {
+    fn insert_inner<'a>(&'a self, value: T, guard: Cow<'a, epoch::Guard>) -> SlotId {
+        assert_eq!(guard.global(), &self.global);
+
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
 
@@ -195,6 +200,9 @@ impl<T> SlotMap<T> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
     pub fn remove<'a>(
         &'a self,
@@ -205,6 +213,8 @@ impl<T> SlotMap<T> {
     }
 
     fn remove_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+        assert_eq!(guard.global(), &self.global);
+
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = id.generation().wrapping_add(1);
 
@@ -404,6 +414,8 @@ impl<T> SlotMap<T> {
         index: u32,
         guard: Cow<'a, epoch::Guard>,
     ) -> Option<Ref<'a, T>> {
+        assert_eq!(guard.global(), &self.global);
+
         let slot = self.slots.get(index as usize)?;
         let mut generation = slot.generation.load(Relaxed);
         let mut backoff = Backoff::new();
@@ -440,6 +452,9 @@ impl<T> SlotMap<T> {
         Some(unsafe { self.remove_inner_inner(index, guard) })
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline(always)]
     #[must_use]
     pub fn get<'a>(
@@ -452,6 +467,8 @@ impl<T> SlotMap<T> {
 
     #[inline(always)]
     fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+        assert_eq!(guard.global(), &self.global);
+
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
 
@@ -593,6 +610,9 @@ impl<T> SlotMap<T> {
         Some(unsafe { refs.assume_init() })
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline(always)]
     pub fn index<'a>(
         &'a self,
@@ -604,6 +624,8 @@ impl<T> SlotMap<T> {
 
     #[inline(always)]
     fn index_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+        assert_eq!(guard.global(), &self.global);
+
         let slot = self.slots.get(index as usize)?;
         let generation = slot.generation.load(Acquire);
 
@@ -669,6 +691,10 @@ impl<T> SlotMap<T> {
     ///
     /// `index` must be in bounds of the slots vector and the slot must have been initialized and
     /// must not be free.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline(always)]
     pub unsafe fn index_unchecked<'a>(
         &'a self,
@@ -685,6 +711,8 @@ impl<T> SlotMap<T> {
         index: u32,
         guard: Cow<'a, epoch::Guard>,
     ) -> Ref<'a, T> {
+        assert_eq!(guard.global(), &self.global);
+
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
 
@@ -741,11 +769,21 @@ impl<T> SlotMap<T> {
         unsafe { slot.value_unchecked_mut() }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
     pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard>>) -> Iter<'a, T> {
+        self.iter_inner(guard.into())
+    }
+
+    #[inline]
+    fn iter_inner<'a>(&'a self, guard: Cow<'a, epoch::Guard>) -> Iter<'a, T> {
+        assert_eq!(guard.global(), &self.global);
+
         Iter {
             slots: self.slots.iter().enumerate(),
-            guard: guard.into(),
+            guard,
         }
     }
 
