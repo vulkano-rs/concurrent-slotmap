@@ -1,8 +1,5 @@
 #![allow(unused_unsafe, clippy::inline_always)]
-// This should be `forbid` but there's a bug in rustc:
-// https://github.com/rust-lang/rust/issues/121483
-#![deny(unsafe_op_in_unsafe_fn)]
-#![forbid(clippy::undocumented_unsafe_blocks)]
+#![forbid(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -134,12 +131,12 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
-    pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard>>) -> SlotId {
+    pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> SlotId {
         self.insert_inner(value, guard.into())
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn insert_inner<'a>(&'a self, value: T, guard: Cow<'a, epoch::Guard>) -> SlotId {
+    fn insert_inner<'a>(&'a self, value: T, guard: Cow<'a, epoch::Guard<'a>>) -> SlotId {
         assert_eq!(guard.global(), &self.global);
 
         let mut free_list_head = self.free_list.load(Acquire);
@@ -237,12 +234,16 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     pub fn remove<'a>(
         &'a self,
         id: SlotId,
-        guard: impl Into<Cow<'a, epoch::Guard>>,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
     ) -> Option<Ref<'a, T>> {
         self.remove_inner(id, guard.into())
     }
 
-    fn remove_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+    fn remove_inner<'a>(
+        &'a self,
+        id: SlotId,
+        guard: Cow<'a, epoch::Guard<'a>>,
+    ) -> Option<Ref<'a, T>> {
         assert_eq!(guard.global(), &self.global);
 
         let slot = self.slots.get(id.index as usize)?;
@@ -277,7 +278,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     unsafe fn remove_inner_inner<'a>(
         &'a self,
         index: u32,
-        guard: Cow<'a, epoch::Guard>,
+        guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Ref<'a, T> {
         // SAFETY: The caller must ensure that `index` is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
@@ -474,7 +475,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     fn remove_index<'a>(
         &'a self,
         index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard>>,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
     ) -> Option<Ref<'a, T>> {
         self.remove_index_inner(index, guard.into())
     }
@@ -483,7 +484,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     fn remove_index_inner<'a>(
         &'a self,
         index: u32,
-        guard: Cow<'a, epoch::Guard>,
+        guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Option<Ref<'a, T>> {
         assert_eq!(guard.global(), &self.global);
 
@@ -531,13 +532,13 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     pub fn get<'a>(
         &'a self,
         id: SlotId,
-        guard: impl Into<Cow<'a, epoch::Guard>>,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
     ) -> Option<Ref<'a, T>> {
         self.get_inner(id, guard.into())
     }
 
     #[inline(always)]
-    fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+    fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard<'a>>) -> Option<Ref<'a, T>> {
         assert_eq!(guard.global(), &self.global);
 
         let slot = self.slots.get(id.index as usize)?;
@@ -688,13 +689,17 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     pub fn index<'a>(
         &'a self,
         index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard>>,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
     ) -> Option<Ref<'a, T>> {
         self.index_inner(index, guard.into())
     }
 
     #[inline(always)]
-    fn index_inner<'a>(&'a self, index: u32, guard: Cow<'a, epoch::Guard>) -> Option<Ref<'a, T>> {
+    fn index_inner<'a>(
+        &'a self,
+        index: u32,
+        guard: Cow<'a, epoch::Guard<'a>>,
+    ) -> Option<Ref<'a, T>> {
         assert_eq!(guard.global(), &self.global);
 
         let slot = self.slots.get(index as usize)?;
@@ -770,7 +775,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     pub unsafe fn index_unchecked<'a>(
         &'a self,
         index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard>>,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
     ) -> Ref<'a, T> {
         // SAFETY: Ensured by the caller.
         unsafe { self.index_unchecked_inner(index, guard.into()) }
@@ -780,7 +785,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     unsafe fn index_unchecked_inner<'a>(
         &'a self,
         index: u32,
-        guard: Cow<'a, epoch::Guard>,
+        guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Ref<'a, T> {
         assert_eq!(guard.global(), &self.global);
 
@@ -844,12 +849,12 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
-    pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard>>) -> Iter<'a, T> {
+    pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> Iter<'a, T> {
         self.iter_inner(guard.into())
     }
 
     #[inline]
-    fn iter_inner<'a>(&'a self, guard: Cow<'a, epoch::Guard>) -> Iter<'a, T> {
+    fn iter_inner<'a>(&'a self, guard: Cow<'a, epoch::Guard<'a>>) -> Iter<'a, T> {
         assert_eq!(guard.global(), &self.global);
 
         Iter {
@@ -1056,7 +1061,7 @@ impl SlotId {
 pub struct Ref<'a, T> {
     slot: &'a Slot<T>,
     #[allow(dead_code)]
-    guard: Cow<'a, epoch::Guard>,
+    guard: Cow<'a, epoch::Guard<'a>>,
 }
 
 impl<T> Deref for Ref<'_, T> {
@@ -1085,7 +1090,7 @@ impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
 
 pub struct Iter<'a, T> {
     slots: iter::Enumerate<slice::Iter<'a, Slot<T>>>,
-    guard: Cow<'a, epoch::Guard>,
+    guard: Cow<'a, epoch::Guard<'a>>,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -1268,7 +1273,7 @@ mod tests {
     #[test]
     fn basic_usage1() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let x = map.insert(69, guard);
         let y = map.insert(42, guard);
@@ -1293,7 +1298,7 @@ mod tests {
     #[test]
     fn basic_usage2() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1337,7 +1342,7 @@ mod tests {
     #[test]
     fn basic_usage3() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1473,7 +1478,7 @@ mod tests {
     #[test]
     fn iter1() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let x = map.insert(1, guard);
         let _ = map.insert(2, guard);
@@ -1508,7 +1513,7 @@ mod tests {
     #[test]
     fn iter2() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1539,7 +1544,7 @@ mod tests {
     #[test]
     fn iter3() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().pin();
+        let guard = &map.global().register_local().into_inner().pin();
 
         let _ = map.insert(1, guard);
         let x = map.insert(2, guard);

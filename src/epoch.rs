@@ -16,6 +16,7 @@ use alloc::{borrow::Cow, boxed::Box};
 use core::{
     cell::Cell,
     fmt,
+    marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{
         self, AtomicBool, AtomicU32, AtomicUsize,
@@ -60,7 +61,7 @@ impl GlobalHandle {
     /// Registers a new local epoch in the global list of participants.
     #[inline]
     #[must_use]
-    pub fn register_local(&self) -> LocalHandle {
+    pub fn register_local(&self) -> UniqueLocalHandle {
         Local::register(self)
     }
 
@@ -119,6 +120,46 @@ impl Drop for GlobalHandle {
     }
 }
 
+/// A [`LocalHandle`] that can be safely sent to other threads.
+///
+/// This is enforced through ownership over the local epoch and by using borrowed guards.
+pub struct UniqueLocalHandle {
+    inner: LocalHandle,
+}
+
+impl UniqueLocalHandle {
+    /// This function behaves the same as [`LocalHandle::pin`], except that it returns a guard
+    /// whose lifetime is bound to this handle.
+    #[inline]
+    #[must_use]
+    pub fn pin(&self) -> Guard<'_> {
+        self.inner.pin()
+    }
+
+    /// Returns a handle to the global epoch.
+    #[inline]
+    #[must_use]
+    pub fn global(&self) -> &GlobalHandle {
+        self.inner.global()
+    }
+
+    /// Returns the inner handle, consuming the unique wrapper.
+    ///
+    /// This allows you to make clones of the handle and get access to `'static` guards, however
+    /// you lose the ability to send the handle to another thread in turn.
+    #[inline]
+    #[must_use]
+    pub fn into_inner(self) -> LocalHandle {
+        self.inner
+    }
+}
+
+// SAFETY: The constructor of `UniqueLocalHandle` must ensure that the handle is unique, which
+// means that no other `LocalHandle`s referencing the same `Local` can exist. This, together with
+// the fact that we don't allow any access to the `Local` other than borrowed, ensures that the
+// `Local` cannot be accessed from more than one thread at a time.
+unsafe impl Send for UniqueLocalHandle {}
+
 /// A handle to a local epoch.
 pub struct LocalHandle {
     ptr: NonNull<Local>,
@@ -134,7 +175,7 @@ impl LocalHandle {
     #[allow(clippy::missing_panics_doc)]
     #[inline]
     #[must_use]
-    pub fn pin(&self) -> Guard {
+    pub fn pin(&self) -> Guard<'static> {
         let local = self.local();
         let global = local.global();
 
@@ -168,7 +209,7 @@ impl LocalHandle {
         //   cannot unpin the participant while another guard still exists.
         // * We made sure to pin the participant if it wasn't already and made sure that accesses
         //   from this point on can't leak into the previous epoch.
-        unsafe { Guard { local: self.ptr } }
+        unsafe { Guard::new(self.ptr) }
     }
 
     /// Returns a handle to the global epoch.
@@ -228,11 +269,19 @@ impl Drop for LocalHandle {
 }
 
 /// A guard that keeps the local epoch pinned.
-pub struct Guard {
+pub struct Guard<'a> {
     local: NonNull<Local>,
+    marker: PhantomData<&'a ()>,
 }
 
-impl Guard {
+impl Guard<'_> {
+    unsafe fn new(local: NonNull<Local>) -> Self {
+        Guard {
+            local,
+            marker: PhantomData,
+        }
+    }
+
     /// Returns a handle to the global epoch.
     #[inline]
     #[must_use]
@@ -262,7 +311,7 @@ impl Guard {
     }
 }
 
-impl Clone for Guard {
+impl Clone for Guard<'_> {
     /// Creates a new guard for the same local epoch.
     #[inline]
     fn clone(&self) -> Self {
@@ -275,17 +324,17 @@ impl Clone for Guard {
         // * We incremented the `guard_count` above, such that the guard's drop implementation
         //   cannot unpin the participant while another guard still exists.
         // * The participant is already pinned, as this guard's existence is a proof of that.
-        unsafe { Guard { local: self.local } }
+        unsafe { Guard::new(self.local) }
     }
 }
 
-impl fmt::Debug for Guard {
+impl fmt::Debug for Guard<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Guard").finish_non_exhaustive()
     }
 }
 
-impl Drop for Guard {
+impl Drop for Guard<'_> {
     /// Drops the guard.
     ///
     /// If there are no other guards keeping the local epoch pinned, it will be unpinned. If there
@@ -317,16 +366,16 @@ impl Drop for Guard {
     }
 }
 
-impl<'a> From<&'a Guard> for Cow<'a, Guard> {
+impl<'a> From<&'a Guard<'a>> for Cow<'a, Guard<'a>> {
     #[inline]
     fn from(guard: &'a Guard) -> Self {
         Cow::Borrowed(guard)
     }
 }
 
-impl From<Guard> for Cow<'_, Guard> {
+impl<'a> From<Guard<'a>> for Cow<'_, Guard<'a>> {
     #[inline]
-    fn from(guard: Guard) -> Self {
+    fn from(guard: Guard<'a>) -> Self {
         Cow::Owned(guard)
     }
 }
@@ -481,7 +530,7 @@ struct Local {
 
 impl Local {
     #[inline(never)]
-    fn register(global: &GlobalHandle) -> LocalHandle {
+    fn register(global: &GlobalHandle) -> UniqueLocalHandle {
         let mut local = Box::new(Local {
             next: Cell::new(None),
             prev: Cell::new(None),
@@ -515,7 +564,10 @@ impl Local {
 
         // SAFETY: We initialized the `handle_count` to 1, such that the handle's drop
         // implementation cannot drop the `Local` while another handle still exists.
-        unsafe { LocalHandle { ptr } }
+        let handle = unsafe { LocalHandle { ptr } };
+
+        // SAFETY: We just allocated this `Local`, and this is the only existing handle to it.
+        unsafe { UniqueLocalHandle { inner: handle } }
     }
 
     #[inline(never)]
