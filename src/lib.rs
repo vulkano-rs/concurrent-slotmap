@@ -1173,7 +1173,7 @@ pub struct IterMut<'a, T> {
 
 impl<T: fmt::Debug> fmt::Debug for IterMut<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Iter").finish_non_exhaustive()
+        f.debug_struct("IterMut").finish_non_exhaustive()
     }
 }
 
