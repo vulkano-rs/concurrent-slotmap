@@ -160,6 +160,12 @@ impl UniqueLocalHandle {
 // `Local` cannot be accessed from more than one thread at a time.
 unsafe impl Send for UniqueLocalHandle {}
 
+impl fmt::Debug for UniqueLocalHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UniqueLocalHandle").finish_non_exhaustive()
+    }
+}
+
 /// A handle to a local epoch.
 pub struct LocalHandle {
     ptr: NonNull<Local>,

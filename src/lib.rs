@@ -1,5 +1,5 @@
 #![allow(unused_unsafe, clippy::inline_always)]
-#![warn(rust_2018_idioms)]
+#![warn(rust_2018_idioms, missing_debug_implementations)]
 #![forbid(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -1094,6 +1094,12 @@ pub struct Iter<'a, T> {
     guard: Cow<'a, epoch::Guard<'a>>,
 }
 
+impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = (SlotId, Ref<'a, T>);
 
@@ -1165,6 +1171,12 @@ pub struct IterMut<'a, T> {
     slots: iter::Enumerate<slice::IterMut<'a, Slot<T>>>,
 }
 
+impl<T: fmt::Debug> fmt::Debug for IterMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+
 impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = (SlotId, &'a mut T);
 
@@ -1230,6 +1242,7 @@ pub trait Collector<T> {
     unsafe fn collect(&self, ptr: *mut T);
 }
 
+#[derive(Debug)]
 pub struct DefaultCollector;
 
 impl<T> Collector<T> for DefaultCollector {
