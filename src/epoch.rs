@@ -295,13 +295,14 @@ impl Guard<'_> {
         &self.local().global
     }
 
-    /// Tries to advance the global epoch.
+    /// Tries to advance the global epoch. Returns `true` if the epoch was successfully advanced.
     #[inline]
-    pub fn try_advance_global(&self) {
+    pub fn try_advance_global(&self) -> bool {
         let local = self.local();
-        local.global().try_advance();
         // This prevents us from trying to advance the global epoch in `LocalHandle::pin`.
         local.pin_count.set(0);
+
+        local.global().try_advance()
     }
 
     #[inline]
@@ -461,7 +462,7 @@ impl Global {
     }
 
     #[inline(never)]
-    fn try_advance(&self) {
+    fn try_advance(&self) -> bool {
         let global_epoch = self.epoch.load(Relaxed);
 
         // Ensure that none of the loads of the local epochs can be ordered before the load of the
@@ -470,7 +471,7 @@ impl Global {
 
         if !self.try_lock_local_list() {
             // Another thread beat us to it.
-            return;
+            return false;
         }
 
         let mut head = self.local_list_head.get();
@@ -484,7 +485,7 @@ impl Global {
                 // SAFETY: We locked the local list above.
                 unsafe { self.unlock_local_list() };
 
-                return;
+                return false;
             }
 
             head = local.next.get();
@@ -504,6 +505,8 @@ impl Global {
         // of all other participants from the previous epoch.
         atomic::fence(Acquire);
         self.epoch.store(new_epoch, Release);
+
+        true
     }
 }
 
