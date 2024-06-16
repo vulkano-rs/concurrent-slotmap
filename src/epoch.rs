@@ -368,7 +368,7 @@ impl Drop for Guard<'_> {
 
 impl<'a> From<&'a Guard<'a>> for Cow<'a, Guard<'a>> {
     #[inline]
-    fn from(guard: &'a Guard) -> Self {
+    fn from(guard: &'a Guard<'a>) -> Self {
         Cow::Borrowed(guard)
     }
 }

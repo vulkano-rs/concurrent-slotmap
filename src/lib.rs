@@ -1,4 +1,5 @@
 #![allow(unused_unsafe, clippy::inline_always)]
+#![warn(rust_2018_idioms)]
 #![forbid(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -353,7 +354,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
-    pub fn try_collect(&self, guard: &epoch::Guard) {
+    pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
         let epoch = guard.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
