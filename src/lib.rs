@@ -13,6 +13,7 @@ use core::{
     mem::MaybeUninit,
     num::NonZeroU32,
     ops::Deref,
+    panic::{RefUnwindSafe, UnwindSafe},
     slice,
     sync::atomic::{
         AtomicU32, AtomicU64,
@@ -56,6 +57,9 @@ pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
     /// other threads are accessing any of the slots in the list.
     free_list_queue: [AtomicU64; 2],
 }
+
+impl<T, C: Collector<T>> UnwindSafe for SlotMap<T, C> {}
+impl<T, C: Collector<T>> RefUnwindSafe for SlotMap<T, C> {}
 
 impl<T> SlotMap<T, DefaultCollector> {
     #[must_use]
