@@ -27,6 +27,12 @@ pub mod epoch;
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
 
+/// The number of low bits that can be used for tagged generations.
+const TAG_BITS: u32 = 8;
+
+/// The mask for tagged generations.
+const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
+
 #[cfg_attr(not(doc), repr(C))]
 pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
     slots: Vec<Slot<T>>,
@@ -137,12 +143,27 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     /// Panics if `guard.global()` does not equal `self.global()`.
     #[inline]
     pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> SlotId {
-        self.insert_inner(value, guard.into())
+        self.insert_inner(value, 0, guard.into())
+    }
+
+    /// # Panics
+    ///
+    /// - Panics if `guard.global()` does not equal `self.global()`.
+    /// - Panics if `tag` has more than the low 8 bits set.
+    #[inline]
+    pub fn insert_with_tag<'a>(
+        &'a self,
+        value: T,
+        tag: u32,
+        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
+    ) -> SlotId {
+        self.insert_inner(value, tag, guard.into())
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn insert_inner<'a>(&'a self, value: T, guard: Cow<'a, epoch::Guard<'a>>) -> SlotId {
+    fn insert_inner<'a>(&'a self, value: T, tag: u32, guard: Cow<'a, epoch::Guard<'a>>) -> SlotId {
         assert_eq!(guard.global(), &self.global);
+        assert_eq!(tag & !TAG_MASK, 0);
 
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -168,14 +189,17 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
                     // from the free-list such that no other threads can be writing the same slot.
                     unsafe { slot.value.get().cast::<T>().write(value) };
 
-                    let new_generation = slot.generation.fetch_add(1, Release).wrapping_add(1);
+                    let new_generation = slot
+                        .generation
+                        .fetch_add(OCCUPIED_BIT, Release)
+                        .wrapping_add(OCCUPIED_BIT);
 
                     self.len.fetch_add(1, Relaxed);
 
                     // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its
                     // generation's `OCCUPIED_BIT` unset, and since we incremented the generation,
                     // the bit must have been flipped again.
-                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation | tag) };
                 }
                 Err(new_head) => {
                     free_list_head = new_head;
@@ -192,11 +216,20 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         #[allow(clippy::cast_possible_truncation)]
         // SAFETY: The `OCCUPIED_BIT` is set.
         unsafe {
-            SlotId::new_unchecked(index as u32, OCCUPIED_BIT)
+            SlotId::new_unchecked(index as u32, OCCUPIED_BIT | tag)
         }
     }
 
     pub fn insert_mut(&mut self, value: T) -> SlotId {
+        self.insert_with_tag_mut(value, 0)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `tag` has more than the low 8 bits set.
+    pub fn insert_with_tag_mut(&mut self, value: T, tag: u32) -> SlotId {
+        assert_eq!(tag & !TAG_MASK, 0);
+
         let free_list_head = *self.free_list.get_mut();
 
         if free_list_head != NIL {
@@ -204,7 +237,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
 
-            let new_generation = slot.generation.get_mut().wrapping_add(1);
+            let new_generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT);
 
             *slot.generation.get_mut() = new_generation;
 
@@ -217,7 +250,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
             // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
             // flipped again.
-            return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+            return unsafe { SlotId::new_unchecked(free_list_head, new_generation | tag) };
         }
 
         let index = self.slots.push_mut(Slot::new(value));
@@ -228,7 +261,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         #[allow(clippy::cast_possible_truncation)]
         // SAFETY: The `OCCUPIED_BIT` is set.
         unsafe {
-            SlotId::new_unchecked(index as u32, OCCUPIED_BIT)
+            SlotId::new_unchecked(index as u32, OCCUPIED_BIT | tag)
         }
     }
 
@@ -252,7 +285,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         assert_eq!(guard.global(), &self.global);
 
         let slot = self.slots.get(id.index as usize)?;
-        let new_generation = id.generation().wrapping_add(1);
+        let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
 
         // This works thanks to the invariant of `SlotId` that the `OCCUPIED_BIT` of its generation
         // must be set. That means that the only outcome possible in case of success here is that
@@ -454,7 +487,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
-            *slot.generation.get_mut() = generation.wrapping_add(1);
+            *slot.generation.get_mut() = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
 
             *slot.next_free.get_mut() = *self.free_list.get_mut();
             *self.free_list.get_mut() = id.index;
@@ -502,9 +535,11 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
                 return None;
             }
 
+            let new_generation = (generation & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+
             match slot.generation.compare_exchange_weak(
                 generation,
-                generation.wrapping_add(1),
+                new_generation,
                 Acquire,
                 Relaxed,
             ) {
@@ -1006,7 +1041,7 @@ impl<'a, T, C: Collector<T>> IntoIterator for &'a mut SlotMap<T, C> {
     }
 }
 
-const OCCUPIED_BIT: u32 = 1;
+const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
 
 struct Slot<T> {
     generation: AtomicU32,
