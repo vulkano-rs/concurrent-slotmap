@@ -868,6 +868,19 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
+    /// # Safety
+    ///
+    /// You must ensure that the epoch is [pinned] before you call this method and that the
+    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
+    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
+    /// by being single-threaded).
+    #[inline]
+    pub unsafe fn iter_unprotected(&self) -> IterUnprotected<'_, T> {
+        IterUnprotected {
+            slots: self.slots.iter().enumerate(),
+        }
+    }
+
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
@@ -1170,6 +1183,85 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
 }
 
 impl<T> FusedIterator for Iter<'_, T> {}
+
+pub struct IterUnprotected<'a, T> {
+    slots: iter::Enumerate<slice::Iter<'a, Slot<T>>>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for IterUnprotected<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IterUnprotected").finish_non_exhaustive()
+    }
+}
+
+impl<'a, T> Iterator for IterUnprotected<'a, T> {
+    type Item = (SlotId, &'a T);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (index, slot) = self.slots.next()?;
+            let generation = slot.generation.load(Acquire);
+
+            if generation & OCCUPIED_BIT != 0 {
+                // Our capacity can never exceed `u32::MAX`.
+                #[allow(clippy::cast_possible_truncation)]
+                // SAFETY: We checked that the occupied bit is set.
+                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+
+                // SAFETY:
+                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
+                //   value is visible here.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
+                // * The caller of `SlotMap::iter_unprotected` must ensure that the returned
+                //   iterator is protected by a guard before the call and that the returned iterator
+                //   doesn't outlive said guard, or that synchronization is ensured externally.
+                let r = unsafe { slot.value_unchecked() };
+
+                break Some((id, r));
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.slots.len()))
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for IterUnprotected<'a, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let (index, slot) = self.slots.next_back()?;
+            let generation = slot.generation.load(Acquire);
+
+            if generation & OCCUPIED_BIT != 0 {
+                // Our capacity can never exceed `u32::MAX`.
+                #[allow(clippy::cast_possible_truncation)]
+                // SAFETY: We checked that the occupied bit is set.
+                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+
+                // SAFETY:
+                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
+                //   value is visible here.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
+                // * The caller of `SlotMap::iter_unprotected` must ensure that the returned
+                //   iterator is protected by a guard before the call and that the returned iterator
+                //   doesn't outlive said guard, or that synchronization is ensured externally.
+                let r = unsafe { slot.value_unchecked() };
+
+                break Some((id, r));
+            }
+        }
+    }
+}
+
+impl<T> FusedIterator for IterUnprotected<'_, T> {}
 
 pub struct IterMut<'a, T> {
     slots: iter::Enumerate<slice::IterMut<'a, Slot<T>>>,
