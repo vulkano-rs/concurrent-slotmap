@@ -191,15 +191,15 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
                     let new_generation = slot
                         .generation
-                        .fetch_add(OCCUPIED_BIT, Release)
-                        .wrapping_add(OCCUPIED_BIT);
+                        .fetch_add(OCCUPIED_BIT | tag, Release)
+                        .wrapping_add(OCCUPIED_BIT | tag);
 
                     self.len.fetch_add(1, Relaxed);
 
                     // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its
                     // generation's `OCCUPIED_BIT` unset, and since we incremented the generation,
                     // the bit must have been flipped again.
-                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation | tag) };
+                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
                 }
                 Err(new_head) => {
                     free_list_head = new_head;
@@ -208,7 +208,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             }
         }
 
-        let index = self.slots.push(Slot::new(value));
+        let index = self.slots.push(Slot::new(value, tag));
 
         self.len.fetch_add(1, Relaxed);
 
@@ -237,7 +237,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
 
-            let new_generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT);
+            let new_generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT | tag);
 
             *slot.generation.get_mut() = new_generation;
 
@@ -250,10 +250,10 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
             // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
             // flipped again.
-            return unsafe { SlotId::new_unchecked(free_list_head, new_generation | tag) };
+            return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
         }
 
-        let index = self.slots.push_mut(Slot::new(value));
+        let index = self.slots.push_mut(Slot::new(value, tag));
 
         *self.len.get_mut() += 1;
 
@@ -1053,9 +1053,9 @@ struct Slot<T> {
 unsafe impl<T: Sync> Sync for Slot<T> {}
 
 impl<T> Slot<T> {
-    fn new(value: T) -> Self {
+    fn new(value: T, tag: u32) -> Self {
         Slot {
-            generation: AtomicU32::new(OCCUPIED_BIT),
+            generation: AtomicU32::new(OCCUPIED_BIT | tag),
             next_free: AtomicU32::new(NIL),
             value: UnsafeCell::new(MaybeUninit::new(value)),
         }
@@ -1725,49 +1725,6 @@ mod tests {
     }
 
     #[test]
-    fn get_many_mut() {
-        let mut map = SlotMap::new(3);
-
-        let x = map.insert_mut(1);
-        let y = map.insert_mut(2);
-        let z = map.insert_mut(3);
-
-        assert_eq!(map.get_many_mut([x, y]), Some([&mut 1, &mut 2]));
-        assert_eq!(map.get_many_mut([y, z]), Some([&mut 2, &mut 3]));
-        assert_eq!(map.get_many_mut([z, x]), Some([&mut 3, &mut 1]));
-
-        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
-        assert_eq!(map.get_many_mut([z, y, x]), Some([&mut 3, &mut 2, &mut 1]));
-
-        assert_eq!(map.get_many_mut([x, x]), None);
-        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_BIT)]), None);
-
-        map.remove_mut(y);
-
-        assert_eq!(map.get_many_mut([x, z]), Some([&mut 1, &mut 3]));
-
-        assert_eq!(map.get_many_mut([y]), None);
-        assert_eq!(map.get_many_mut([x, y]), None);
-        assert_eq!(map.get_many_mut([y, z]), None);
-
-        let y = map.insert_mut(2);
-
-        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
-
-        map.remove_mut(x);
-        map.remove_mut(z);
-
-        assert_eq!(map.get_many_mut([y]), Some([&mut 2]));
-
-        assert_eq!(map.get_many_mut([x]), None);
-        assert_eq!(map.get_many_mut([z]), None);
-
-        map.remove_mut(y);
-
-        assert_eq!(map.get_many_mut([]), Some([]));
-    }
-
-    #[test]
     fn iter_mut1() {
         let mut map = SlotMap::new(10);
 
@@ -1956,6 +1913,68 @@ mod tests {
         map.remove_mut(x3);
         map.remove_mut(y3);
         map.remove_mut(z2);
+    }
+
+    #[test]
+    fn get_many_mut() {
+        let mut map = SlotMap::new(3);
+
+        let x = map.insert_mut(1);
+        let y = map.insert_mut(2);
+        let z = map.insert_mut(3);
+
+        assert_eq!(map.get_many_mut([x, y]), Some([&mut 1, &mut 2]));
+        assert_eq!(map.get_many_mut([y, z]), Some([&mut 2, &mut 3]));
+        assert_eq!(map.get_many_mut([z, x]), Some([&mut 3, &mut 1]));
+
+        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
+        assert_eq!(map.get_many_mut([z, y, x]), Some([&mut 3, &mut 2, &mut 1]));
+
+        assert_eq!(map.get_many_mut([x, x]), None);
+        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_BIT)]), None);
+
+        map.remove_mut(y);
+
+        assert_eq!(map.get_many_mut([x, z]), Some([&mut 1, &mut 3]));
+
+        assert_eq!(map.get_many_mut([y]), None);
+        assert_eq!(map.get_many_mut([x, y]), None);
+        assert_eq!(map.get_many_mut([y, z]), None);
+
+        let y = map.insert_mut(2);
+
+        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
+
+        map.remove_mut(x);
+        map.remove_mut(z);
+
+        assert_eq!(map.get_many_mut([y]), Some([&mut 2]));
+
+        assert_eq!(map.get_many_mut([x]), None);
+        assert_eq!(map.get_many_mut([z]), None);
+
+        map.remove_mut(y);
+
+        assert_eq!(map.get_many_mut([]), Some([]));
+    }
+
+    #[test]
+    fn tagged() {
+        let map = SlotMap::new(1);
+        let guard = &map.global().register_local().into_inner().pin();
+
+        let x = map.insert_with_tag(42, 1, guard);
+        assert_eq!(x.generation() & TAG_MASK, 1);
+        assert_eq!(map.get(x, guard).as_deref(), Some(&42));
+    }
+
+    #[test]
+    fn tagged_mut() {
+        let mut map = SlotMap::new(1);
+
+        let x = map.insert_with_tag_mut(42, 1);
+        assert_eq!(x.generation() & TAG_MASK, 1);
+        assert_eq!(map.get_mut(x), Some(&mut 42));
     }
 
     // TODO: Testing concurrent generational collections is the most massive pain in the ass. We
