@@ -1114,6 +1114,11 @@ impl SlotId {
     pub const fn generation(self) -> u32 {
         self.generation.get()
     }
+
+    #[inline(always)]
+    pub const fn tag(self) -> u32 {
+        self.generation() & !TAG_MASK
+    }
 }
 
 pub struct Ref<'a, T> {
