@@ -1080,7 +1080,7 @@ impl<T> Slot<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotId {
     index: u32,
     generation: NonZeroU32,
