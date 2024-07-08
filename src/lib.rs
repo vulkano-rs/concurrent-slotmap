@@ -391,7 +391,12 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` does not equal `self.global()`.
     pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
+        assert_eq!(guard.global(), &self.global);
+
         let epoch = guard.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
