@@ -1117,7 +1117,7 @@ impl SlotId {
 
     #[inline(always)]
     pub const fn tag(self) -> u32 {
-        self.generation() & !TAG_MASK
+        self.generation() & TAG_MASK
     }
 }
 
