@@ -1087,6 +1087,11 @@ pub struct SlotId {
 }
 
 impl SlotId {
+    pub const INVALID: Self = SlotId {
+        index: u32::MAX,
+        generation: NonZeroU32::MAX,
+    };
+
     #[cfg(test)]
     const fn new(index: u32, generation: u32) -> Self {
         assert!(generation & OCCUPIED_BIT != 0);
@@ -1116,8 +1121,9 @@ impl SlotId {
     }
 
     #[inline(always)]
+    #[must_use]
     pub const fn tag(self) -> u32 {
-        self.generation() & TAG_MASK
+        self.generation.get() & TAG_MASK
     }
 }
 
