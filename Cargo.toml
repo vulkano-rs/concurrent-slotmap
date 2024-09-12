@@ -9,7 +9,7 @@ documentation = "https://docs.rs/concurrent-slotmap"
 readme = "README.md"
 repository = "https://github.com/vulkano-rs/concurrent-slotmap"
 license = "MIT OR Apache-2.0"
-keywords = ["lock-free", "concurrent", "slotmap", "slot", "map", "arena", "allocator"]
+keywords = ["lock-free", "concurrent", "slotmap", "arena", "allocator"]
 categories = ["concurrency", "data-structures", "memory-management", "caching", "no-std"]
 
 [dependencies]
