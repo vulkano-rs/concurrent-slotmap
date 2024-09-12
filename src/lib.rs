@@ -208,16 +208,14 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             }
         }
 
-        let index = self.slots.push(Slot::new(value, tag));
+        // Our capacity can never exceed `u32::MAX`.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = self.slots.push(Slot::new(value, tag)) as u32;
 
         self.len.fetch_add(1, Relaxed);
 
-        // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
         // SAFETY: The `OCCUPIED_BIT` is set.
-        unsafe {
-            SlotId::new_unchecked(index as u32, OCCUPIED_BIT | tag)
-        }
+        unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
     }
 
     pub fn insert_mut(&mut self, value: T) -> SlotId {
@@ -253,16 +251,14 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
         }
 
-        let index = self.slots.push_mut(Slot::new(value, tag));
+        // Our capacity can never exceed `u32::MAX`.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = self.slots.push_mut(Slot::new(value, tag)) as u32;
 
         *self.len.get_mut() += 1;
 
-        // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
         // SAFETY: The `OCCUPIED_BIT` is set.
-        unsafe {
-            SlotId::new_unchecked(index as u32, OCCUPIED_BIT | tag)
-        }
+        unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
     }
 
     /// # Panics
@@ -1180,8 +1176,10 @@ impl<'a, T> Iterator for Iter<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 let guard = self.guard.clone();
 
@@ -1214,8 +1212,10 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 let guard = self.guard.clone();
 
@@ -1257,8 +1257,10 @@ impl<'a, T> Iterator for IterUnprotected<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 // SAFETY:
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -1292,8 +1294,10 @@ impl<'a, T> DoubleEndedIterator for IterUnprotected<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 // SAFETY:
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -1336,8 +1340,10 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 // SAFETY: We checked that the slot is occupied, which means that it must have been
                 // initialized in `SlotMap::insert[_mut]`.
@@ -1364,8 +1370,10 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             if generation & OCCUPIED_BIT != 0 {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
+                let index = index as u32;
+
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
-                let id = unsafe { SlotId::new_unchecked(index as u32, generation) };
+                let id = unsafe { SlotId::new_unchecked(index, generation) };
 
                 // SAFETY: We checked that the slot is occupied, which means that it must have been
                 // initialized in `SlotMap::insert[_mut]`.
