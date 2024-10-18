@@ -1088,8 +1088,8 @@ impl SlotId {
         generation: NonZeroU32::MAX,
     };
 
-    #[cfg(test)]
-    const fn new(index: u32, generation: u32) -> Self {
+    #[inline(always)]
+    pub const fn new(index: u32, generation: u32) -> Self {
         assert!(generation & OCCUPIED_BIT != 0);
 
         // SAFETY: We checked that the `OCCUPIED_BIT` is set.
