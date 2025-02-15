@@ -296,6 +296,7 @@ impl Guard<'_> {
     }
 
     /// Tries to advance the global epoch. Returns `true` if the epoch was successfully advanced.
+    #[allow(clippy::must_use_candidate)]
     #[inline]
     pub fn try_advance_global(&self) -> bool {
         let local = self.local();

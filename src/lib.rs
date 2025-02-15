@@ -405,27 +405,27 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
             if epoch_interval == 0 {
                 break;
-            } else {
-                let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
+            }
 
-                assert!(!local_epoch_is_behind_queue);
+            let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
 
-                let new_state = u64::from(NIL) | u64::from(queued_epoch) << 32;
+            assert!(!local_epoch_is_behind_queue);
 
-                match queued_list.compare_exchange_weak(queued_state, new_state, Relaxed, Acquire) {
-                    Ok(_) => {
-                        // SAFETY: Having ended up here, the global epoch must have been advanced
-                        // at least 2 steps from the last push into the queued list and we removed
-                        // the list from the queue, which means that no other threads can be
-                        // accessing any of the slots in the list.
-                        unsafe { self.collect_unchecked(queued_head) };
+            let new_state = u64::from(NIL) | u64::from(queued_epoch) << 32;
 
-                        break;
-                    }
-                    Err(new_state) => {
-                        queued_state = new_state;
-                        backoff.spin();
-                    }
+            match queued_list.compare_exchange_weak(queued_state, new_state, Relaxed, Acquire) {
+                Ok(_) => {
+                    // SAFETY: Having ended up here, the global epoch must have been advanced at
+                    // least 2 steps from the last push into the queued list and we removed the
+                    // list from the queue, which means that no other threads can be accessing any
+                    // of the slots in the list.
+                    unsafe { self.collect_unchecked(queued_head) };
+
+                    break;
+                }
+                Err(new_state) => {
+                    queued_state = new_state;
+                    backoff.spin();
                 }
             }
         }
@@ -1089,6 +1089,7 @@ impl SlotId {
     };
 
     #[inline(always)]
+    #[must_use]
     pub const fn new(index: u32, generation: u32) -> Self {
         assert!(generation & OCCUPIED_BIT != 0);
 
@@ -1202,7 +1203,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
+impl<T> DoubleEndedIterator for Iter<'_, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
@@ -1284,7 +1285,7 @@ impl<'a, T> Iterator for IterUnprotected<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for IterUnprotected<'a, T> {
+impl<T> DoubleEndedIterator for IterUnprotected<'_, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
@@ -1360,7 +1361,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
+impl<T> DoubleEndedIterator for IterMut<'_, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
