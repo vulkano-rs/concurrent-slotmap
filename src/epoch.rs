@@ -66,6 +66,11 @@ impl GlobalHandle {
     }
 
     #[inline]
+    pub(crate) fn epoch(&self) -> u32 {
+        self.global().epoch.load(Relaxed)
+    }
+
+    #[inline]
     fn global(&self) -> &Global {
         // SAFETY: The constructor of `GlobalHandle` must ensure that the pointer stays valid for
         // the lifetime of the handle.
@@ -304,11 +309,6 @@ impl Guard<'_> {
         local.pin_count.set(0);
 
         local.global().try_advance()
-    }
-
-    #[inline]
-    pub(crate) fn epoch(&self) -> u32 {
-        self.local().epoch.load(Relaxed) & !PINNED_BIT
     }
 
     #[inline]

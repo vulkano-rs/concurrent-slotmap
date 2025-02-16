@@ -16,8 +16,8 @@ use core::{
     panic::{RefUnwindSafe, UnwindSafe},
     slice,
     sync::atomic::{
-        AtomicU32, AtomicU64,
-        Ordering::{Acquire, Relaxed, Release},
+        self, AtomicU32, AtomicU64,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
 use virtual_buffer::vec::Vec;
@@ -317,7 +317,9 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         // SAFETY: The caller must ensure that `index` is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
 
-        let epoch = guard.epoch();
+        atomic::fence(SeqCst);
+
+        let epoch = guard.global().epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -346,18 +348,9 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
                     }
                 }
             } else {
-                let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
+                let global_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
 
-                // TODO: What's preventing this? If we pushed into the list as above in this case,
-                // it could happen that:
-                // * Thread A loads global epoch, preempts.
-                // * Thread B advances the global epoch twice to epoch E.
-                // * Thread A pins itself in epoch E - 4.
-                // * Thread A removes slot S, sees the last push into the queued list was E - 4.
-                // * Thread B removes slot P, sees the last push into the queued list was E - 4,
-                //   drops slot S which could still be accessed by thread A.
-                assert!(!local_epoch_is_behind_queue);
-
+                debug_assert!(!global_epoch_is_behind_queue);
                 debug_assert!(epoch_interval >= 4);
 
                 slot.next_free.store(NIL, Relaxed);
@@ -393,7 +386,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
         assert_eq!(guard.global(), &self.global);
 
-        let epoch = guard.epoch();
+        let epoch = guard.global().epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -407,9 +400,9 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
                 break;
             }
 
-            let local_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
+            let global_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
 
-            assert!(!local_epoch_is_behind_queue);
+            debug_assert!(!global_epoch_is_behind_queue);
 
             let new_state = u64::from(NIL) | u64::from(queued_epoch) << 32;
 
@@ -2050,12 +2043,11 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
-    // TODO: This test is just fundamentally broken.
     #[test]
     fn multi_threaded2() {
         const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE as u32 * 3;
 
-        let map = SlotMap::new(ITERATIONS / 2);
+        let map = SlotMap::new(CAPACITY);
 
         thread::scope(|s| {
             let insert_remover = || {
