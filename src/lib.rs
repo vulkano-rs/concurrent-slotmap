@@ -7,7 +7,6 @@ extern crate alloc;
 
 use alloc::borrow::Cow;
 use core::{
-    cell::UnsafeCell,
     fmt, hint,
     iter::{self, FusedIterator},
     mem::MaybeUninit,
@@ -20,9 +19,10 @@ use core::{
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
-use virtual_buffer::vec::Vec;
+use slot::{Slot, Vec};
 
 pub mod epoch;
+mod slot;
 
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
@@ -33,9 +33,12 @@ const TAG_BITS: u32 = 8;
 /// The mask for tagged generations.
 const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
 
+/// The bit used to signify that a slot is occupied.
+const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
+
 #[cfg_attr(not(doc), repr(C))]
 pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
-    slots: Vec<Slot<T>>,
+    slots: Vec<T>,
     len: AtomicU32,
     global: epoch::GlobalHandle,
     collector: C,
@@ -92,7 +95,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         collector: C,
     ) -> Self {
         SlotMap {
-            slots: Vec::new(max_capacity as usize),
+            slots: Vec::new(max_capacity),
             len: AtomicU32::new(0),
             global,
             collector,
@@ -106,12 +109,10 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
-    // Our capacity can never exceed `u32::MAX`.
-    #[allow(clippy::cast_possible_truncation)]
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> u32 {
-        self.slots.capacity() as u32
+        self.slots.capacity()
     }
 
     #[inline]
@@ -208,9 +209,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             }
         }
 
-        // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
-        let index = self.slots.push(Slot::new(value, tag)) as u32;
+        let index = self.slots.push_with_tag(value, tag);
 
         self.len.fetch_add(1, Relaxed);
 
@@ -251,9 +250,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
         }
 
-        // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
-        let index = self.slots.push_mut(Slot::new(value, tag)) as u32;
+        let index = self.slots.push_with_tag_mut(value, tag);
 
         *self.len.get_mut() += 1;
 
@@ -661,9 +658,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             valid
         }
 
-        // Our capacity can never exceed `u32::MAX`, so the length of the slots can't either.
-        #[allow(clippy::cast_possible_truncation)]
-        let len = self.slots.len() as u32;
+        let len = self.slots.capacity_mut();
 
         if get_many_check_valid(&ids, len) {
             // SAFETY: We checked that all indices are disjunct and in bounds of the slots vector.
@@ -1010,7 +1005,7 @@ impl<T, C: Collector<T>> Drop for SlotMap<T, C> {
             }
         }
 
-        for slot in &mut self.slots {
+        for slot in self.slots.as_mut_slice() {
             if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
                 let ptr = slot.value.get_mut().as_mut_ptr();
 
@@ -1032,40 +1027,6 @@ impl<'a, T, C: Collector<T>> IntoIterator for &'a mut SlotMap<T, C> {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
-    }
-}
-
-const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
-
-struct Slot<T> {
-    generation: AtomicU32,
-    next_free: AtomicU32,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-// SAFETY: The user of `Slot` must ensure that access to `Slot::value` is synchronized.
-unsafe impl<T: Sync> Sync for Slot<T> {}
-
-impl<T> Slot<T> {
-    fn new(value: T, tag: u32) -> Self {
-        Slot {
-            generation: AtomicU32::new(OCCUPIED_BIT | tag),
-            next_free: AtomicU32::new(NIL),
-            value: UnsafeCell::new(MaybeUninit::new(value)),
-        }
-    }
-
-    unsafe fn value_unchecked(&self) -> &T {
-        // SAFETY: The caller must ensure that access to the cell's inner value is synchronized.
-        let value = unsafe { &*self.value.get() };
-
-        // SAFETY: The caller must ensure that the slot has been initialized.
-        unsafe { value.assume_init_ref() }
-    }
-
-    unsafe fn value_unchecked_mut(&mut self) -> &mut T {
-        // SAFETY: The caller must ensure that the slot has been initialized.
-        unsafe { self.value.get_mut().assume_init_mut() }
     }
 }
 
