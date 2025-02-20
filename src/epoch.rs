@@ -5,7 +5,7 @@
 //
 // The differences include:
 // * Being stripped down to only the global and local epochs and the guard.
-// * Allowing retrieving the epoch a guard is pinned in.
+// * Allowing retrieving the global epoch.
 // * The list of locals is not lock-free (as there's no useful work for threads to do concurrently
 //   anyway) but instead protected by a mutex.
 // * Implementing `Clone` for `Guard` to allow use inside `Cow`.
@@ -17,7 +17,8 @@ use core::{
     cell::Cell,
     fmt,
     marker::PhantomData,
-    ptr::NonNull,
+    mem::{self, ManuallyDrop},
+    ptr::{self, NonNull},
     sync::atomic::{
         self, AtomicBool, AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
@@ -220,7 +221,7 @@ impl LocalHandle {
         //   cannot unpin the participant while another guard still exists.
         // * We made sure to pin the participant if it wasn't already and made sure that accesses
         //   from this point on can't leak into the previous epoch.
-        unsafe { Guard::new(self.ptr) }
+        unsafe { Guard::new(self.ptr.as_ptr()) }
     }
 
     /// Returns a handle to the global epoch.
@@ -274,37 +275,49 @@ impl Drop for LocalHandle {
         if local.handle_count.get() == 0 && local.guard_count.get() == 0 {
             // SAFETY: We checked that both the handle count and guard count went to zero, which
             // means that no other references to the `Local` can exist after this point.
-            unsafe { Local::unregister(self.ptr) };
+            unsafe { Local::unregister(self.ptr.as_ptr()) };
         }
     }
 }
 
 /// A guard that keeps the local epoch pinned.
 pub struct Guard<'a> {
-    local: NonNull<Local>,
+    local: *const Local,
     marker: PhantomData<&'a ()>,
 }
 
 impl Guard<'_> {
-    unsafe fn new(local: NonNull<Local>) -> Self {
+    unsafe fn new(local: *const Local) -> Self {
         Guard {
             local,
             marker: PhantomData,
         }
     }
 
+    const unsafe fn unprotected() -> Guard<'static> {
+        Guard {
+            local: ptr::null(),
+            marker: PhantomData,
+        }
+    }
+
     /// Returns a handle to the global epoch.
+    ///
+    /// Returns `None` if the guard is an [unprotected] guard.
     #[inline]
     #[must_use]
-    pub fn global(&self) -> &GlobalHandle {
-        &self.local().global
+    pub fn global(&self) -> Option<&GlobalHandle> {
+        self.local().map(|local| &local.global)
     }
 
     /// Tries to advance the global epoch. Returns `true` if the epoch was successfully advanced.
     #[allow(clippy::must_use_candidate)]
     #[inline]
     pub fn try_advance_global(&self) -> bool {
-        let local = self.local();
+        let Some(local) = self.local() else {
+            return false;
+        };
+
         // This prevents us from trying to advance the global epoch in `LocalHandle::pin`.
         local.pin_count.set(0);
 
@@ -312,7 +325,7 @@ impl Guard<'_> {
     }
 
     #[inline]
-    fn local(&self) -> &Local {
+    fn local(&self) -> Option<&Local> {
         // SAFETY: The constructor of `Guard` must ensure that the pointer stays valid for the
         // lifetime of the guard.
         unsafe { self.local.as_ref() }
@@ -323,15 +336,16 @@ impl Clone for Guard<'_> {
     /// Creates a new guard for the same local epoch.
     #[inline]
     fn clone(&self) -> Self {
-        let local = self.local();
-
-        let guard_count = local.guard_count.get();
-        local.guard_count.set(guard_count.checked_add(1).unwrap());
+        if let Some(local) = self.local() {
+            let guard_count = local.guard_count.get();
+            local.guard_count.set(guard_count.checked_add(1).unwrap());
+        }
 
         // SAFETY:
         // * We incremented the `guard_count` above, such that the guard's drop implementation
         //   cannot unpin the participant while another guard still exists.
         // * The participant is already pinned, as this guard's existence is a proof of that.
+        // * If the original guard was unprotected, the resulting guard is unprotected.
         unsafe { Guard::new(self.local) }
     }
 }
@@ -350,7 +364,9 @@ impl Drop for Guard<'_> {
     /// participants.
     #[inline]
     fn drop(&mut self) {
-        let local = self.local();
+        let Some(local) = self.local() else {
+            return;
+        };
 
         // SAFETY: The constructor of `Guard` must ensure that the `guard_count` has been
         // incremented before construction of the guard.
@@ -385,6 +401,28 @@ impl<'a> From<Guard<'a>> for Cow<'_, Guard<'a>> {
     #[inline]
     fn from(guard: Guard<'a>) -> Self {
         Cow::Owned(guard)
+    }
+}
+
+/// Returns a guard that doesn't protect any accesses.
+///
+/// This guard and all of its clones don't keep any local epoch pinned, and as such all accesses
+/// done with it are unsafe.
+///
+/// # Safety
+///
+/// Accesses done using the returned guard or any of its clones must be protected by other means,
+/// such as the local epoch being already pinned or that all accesses are externally synchronized
+/// (for example through the use of a `Mutex` or by being single-threaded).
+#[inline]
+pub const unsafe fn unprotected() -> &'static Guard<'static> {
+    // SAFETY: The caller must enforce the safety contract.
+    const GUARD: ManuallyDrop<Guard<'_>> = ManuallyDrop::new(unsafe { Guard::unprotected() });
+
+    // SAFETY: `ManuallyDrop<T>` has the same layout as `T`.
+    // HACK: `ManuallyDrop` really needs a const `as_ref` method.
+    unsafe {
+        mem::transmute::<&'static ManuallyDrop<Guard<'static>>, &'static Guard<'static>>(&GUARD)
     }
 }
 
@@ -581,10 +619,10 @@ impl Local {
     }
 
     #[inline(never)]
-    unsafe fn unregister(ptr: NonNull<Self>) {
+    unsafe fn unregister(ptr: *const Self) {
         // SAFETY: The caller must ensure that `local` is in the list of locals, which means it must
         // be valid.
-        let local = unsafe { ptr.as_ref() };
+        let local = unsafe { &*ptr };
         let global = local.global.global();
 
         global.lock_local_list();
@@ -605,7 +643,7 @@ impl Local {
         unsafe { global.unlock_local_list() };
 
         // SAFETY: The caller must ensure that `local` can't be accessed after this point.
-        let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
+        let _ = unsafe { Box::from_raw(ptr.cast_mut()) };
     }
 
     #[inline]

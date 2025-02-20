@@ -141,7 +141,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
     pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> SlotId {
         self.insert_inner(value, 0, guard.into())
@@ -149,7 +149,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.global()` does not equal `self.global()`.
+    /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag<'a>(
@@ -163,7 +163,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     #[allow(clippy::needless_pass_by_value)]
     fn insert_inner<'a>(&'a self, value: T, tag: u32, guard: Cow<'a, epoch::Guard<'a>>) -> SlotId {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
         assert_eq!(tag & !TAG_MASK, 0);
 
         let mut free_list_head = self.free_list.load(Acquire);
@@ -260,7 +260,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
     pub fn remove<'a>(
         &'a self,
@@ -275,7 +275,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         id: SlotId,
         guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Option<Ref<'a, T>> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
@@ -316,7 +316,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
         atomic::fence(SeqCst);
 
-        let epoch = guard.global().epoch();
+        let epoch = self.global().epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -379,11 +379,11 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(guard);
 
-        let epoch = guard.global().epoch();
+        let epoch = self.global().epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -515,7 +515,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         index: u32,
         guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Option<Ref<'a, T>> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         let slot = self.slots.get(index as usize)?;
         let mut generation = slot.generation.load(Relaxed);
@@ -557,7 +557,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     #[must_use]
     pub fn get<'a>(
@@ -570,7 +570,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     #[inline(always)]
     fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard<'a>>) -> Option<Ref<'a, T>> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
@@ -586,38 +586,6 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             //   reading the value safe as the only way the occupied bit can be set is in
             //   `SlotMap::insert[_mut]` after initialization of the slot.
             Some(unsafe { Ref { slot, guard } })
-        } else {
-            None
-        }
-    }
-
-    /// # Safety
-    ///
-    /// You must ensure that the epoch is [pinned] before you call this method and that the
-    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
-    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
-    /// by being single-threaded).
-    ///
-    /// [pinned]: epoch::pin
-    #[inline(always)]
-    pub unsafe fn get_unprotected(&self, id: SlotId) -> Option<&T> {
-        let slot = self.slots.get(id.index as usize)?;
-        let generation = slot.generation.load(Acquire);
-
-        if generation == id.generation() {
-            // SAFETY:
-            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
-            //   Since the generation matched, the slot's occupied bit must be set, which makes
-            //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert[_mut]` after initialization of the slot.
-            // * The caller must ensure that the returned reference is protected by a guard before
-            //   the call and that the returned reference doesn't outlive said guard, or that
-            //   synchronization is ensured externally.
-            Some(unsafe { slot.value_unchecked() })
         } else {
             None
         }
@@ -713,7 +681,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     pub fn index<'a>(
         &'a self,
@@ -729,7 +697,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         index: u32,
         guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Option<Ref<'a, T>> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         let slot = self.slots.get(index as usize)?;
         let generation = slot.generation.load(Acquire);
@@ -742,35 +710,6 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             // * We checked that the slot is occupied, which means that it must have been
             //   initialized in `SlotMap::insert[_mut]`.
             Some(unsafe { Ref { slot, guard } })
-        } else {
-            None
-        }
-    }
-
-    /// # Safety
-    ///
-    /// You must ensure that the epoch is [pinned] before you call this method and that the
-    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
-    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
-    /// by being single-threaded).
-    ///
-    /// [pinned]: epoch::pin
-    #[inline(always)]
-    pub unsafe fn index_unprotected(&self, index: u32) -> Option<&T> {
-        let slot = self.slots.get(index as usize)?;
-        let generation = slot.generation.load(Acquire);
-
-        if generation & OCCUPIED_BIT != 0 {
-            // SAFETY:
-            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * We checked that the slot is occupied, which means that it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
-            // * The caller must ensure that the returned reference is protected by a guard before
-            //   the call and that the returned reference doesn't outlive said guard, or that
-            //   synchronization is ensured externally.
-            Some(unsafe { slot.value_unchecked() })
         } else {
             None
         }
@@ -799,7 +738,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     pub unsafe fn index_unchecked<'a>(
         &'a self,
@@ -816,7 +755,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         index: u32,
         guard: Cow<'a, epoch::Guard<'a>>,
     ) -> Ref<'a, T> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
@@ -829,34 +768,6 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         //   visible here.
         // * The caller must ensure that the slot is initialized.
         unsafe { Ref { slot, guard } }
-    }
-
-    /// # Safety
-    ///
-    /// * `index` must be in bounds of the slots vector and the slot must have been initialized and
-    ///   must not be free.
-    /// * You must ensure that the epoch is [pinned] before you call this method and that the
-    ///   returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that
-    ///   all accesses to `self` are externally synchronized (for example through the use of a
-    ///   `Mutex` or by being single-threaded).
-    ///
-    /// [pinned]: epoch::pin
-    #[inline(always)]
-    pub unsafe fn index_unchecked_unprotected(&self, index: u32) -> &T {
-        // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(index as usize) };
-
-        let _generation = slot.generation.load(Acquire);
-
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The caller must ensure that the slot is initialized.
-        // * The caller must ensure that the returned reference is protected by a guard before the
-        //   call and that the returned reference doesn't outlive said guard, or that
-        //   synchronization is ensured externally.
-        unsafe { slot.value_unchecked() }
     }
 
     /// # Safety
@@ -876,7 +787,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` does not equal `self.global()`.
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
     pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> Iter<'a, T> {
         self.iter_inner(guard.into())
@@ -884,7 +795,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
     #[inline]
     fn iter_inner<'a>(&'a self, guard: Cow<'a, epoch::Guard<'a>>) -> Iter<'a, T> {
-        assert_eq!(guard.global(), &self.global);
+        self.check_guard(&guard);
 
         Iter {
             slots: self.slots.iter().enumerate(),
@@ -892,23 +803,24 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         }
     }
 
-    /// # Safety
-    ///
-    /// You must ensure that the epoch is [pinned] before you call this method and that the
-    /// returned reference doesn't outlive all [`epoch::Guard`]s active on the thread, or that all
-    /// accesses to `self` are externally synchronized (for example through the use of a `Mutex` or
-    /// by being single-threaded).
-    #[inline]
-    pub unsafe fn iter_unprotected(&self) -> IterUnprotected<'_, T> {
-        IterUnprotected {
-            slots: self.slots.iter().enumerate(),
-        }
-    }
-
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
             slots: self.slots.iter_mut().enumerate(),
+        }
+    }
+
+    #[inline(always)]
+    fn check_guard(&self, guard: &epoch::Guard<'_>) {
+        #[inline(never)]
+        fn global_mismatch() -> ! {
+            panic!("`guard.global()` is `Some` but does not equal `self.global()`");
+        }
+
+        if let Some(global) = guard.global() {
+            if global != self.global() {
+                global_mismatch();
+            }
         }
     }
 }
@@ -1189,89 +1101,6 @@ impl<T> DoubleEndedIterator for Iter<'_, T> {
 }
 
 impl<T> FusedIterator for Iter<'_, T> {}
-
-pub struct IterUnprotected<'a, T> {
-    slots: iter::Enumerate<slice::Iter<'a, Slot<T>>>,
-}
-
-impl<T: fmt::Debug> fmt::Debug for IterUnprotected<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IterUnprotected").finish_non_exhaustive()
-    }
-}
-
-impl<'a, T> Iterator for IterUnprotected<'a, T> {
-    type Item = (SlotId, &'a T);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let (index, slot) = self.slots.next()?;
-            let generation = slot.generation.load(Acquire);
-
-            if generation & OCCUPIED_BIT != 0 {
-                // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
-                let index = index as u32;
-
-                // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index, generation) };
-
-                // SAFETY:
-                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
-                //   value is visible here.
-                // * We checked that the slot is occupied, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
-                // * The caller of `SlotMap::iter_unprotected` must ensure that the returned
-                //   iterator is protected by a guard before the call and that the returned iterator
-                //   doesn't outlive said guard, or that synchronization is ensured externally.
-                let r = unsafe { slot.value_unchecked() };
-
-                break Some((id, r));
-            }
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len()))
-    }
-}
-
-impl<T> DoubleEndedIterator for IterUnprotected<'_, T> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        loop {
-            let (index, slot) = self.slots.next_back()?;
-            let generation = slot.generation.load(Acquire);
-
-            if generation & OCCUPIED_BIT != 0 {
-                // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
-                let index = index as u32;
-
-                // SAFETY: We checked that the occupied bit is set.
-                let id = unsafe { SlotId::new_unchecked(index, generation) };
-
-                // SAFETY:
-                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
-                //   value is visible here.
-                // * We checked that the slot is occupied, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
-                // * The caller of `SlotMap::iter_unprotected` must ensure that the returned
-                //   iterator is protected by a guard before the call and that the returned iterator
-                //   doesn't outlive said guard, or that synchronization is ensured externally.
-                let r = unsafe { slot.value_unchecked() };
-
-                break Some((id, r));
-            }
-        }
-    }
-}
-
-impl<T> FusedIterator for IterUnprotected<'_, T> {}
 
 pub struct IterMut<'a, T> {
     slots: iter::Enumerate<slice::IterMut<'a, Slot<T>>>,
