@@ -279,6 +279,7 @@ pub(crate) struct Slot<T> {
 unsafe impl<T: Sync> Sync for Slot<T> {}
 
 impl<T> Slot<T> {
+    #[inline(always)]
     pub unsafe fn value_unchecked(&self) -> &T {
         // SAFETY: The caller must ensure that access to the cell's inner value is synchronized.
         let value = unsafe { &*self.value.get() };
@@ -287,6 +288,7 @@ impl<T> Slot<T> {
         unsafe { value.assume_init_ref() }
     }
 
+    #[inline(always)]
     pub unsafe fn value_unchecked_mut(&mut self) -> &mut T {
         // SAFETY: The caller must ensure that the slot has been initialized.
         unsafe { self.value.get_mut().assume_init_mut() }

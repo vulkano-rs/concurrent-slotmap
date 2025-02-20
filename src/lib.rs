@@ -5,13 +5,11 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use core::{
     fmt, hint,
     iter::{self, FusedIterator},
     mem::MaybeUninit,
     num::NonZeroU32,
-    ops::Deref,
     panic::{RefUnwindSafe, UnwindSafe},
     slice,
     sync::atomic::{
@@ -143,8 +141,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn insert<'a>(&'a self, value: T, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> SlotId {
-        self.insert_inner(value, 0, guard.into())
+    pub fn insert<'a>(&'a self, value: T, guard: &'a epoch::Guard<'a>) -> SlotId {
+        self.insert_with_tag(value, 0, guard)
     }
 
     /// # Panics
@@ -156,14 +154,9 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         &'a self,
         value: T,
         tag: u32,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
+        guard: &'a epoch::Guard<'a>,
     ) -> SlotId {
-        self.insert_inner(value, tag, guard.into())
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    fn insert_inner<'a>(&'a self, value: T, tag: u32, guard: Cow<'a, epoch::Guard<'a>>) -> SlotId {
-        self.check_guard(&guard);
+        self.check_guard(guard);
         assert_eq!(tag & !TAG_MASK, 0);
 
         let mut free_list_head = self.free_list.load(Acquire);
@@ -262,20 +255,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn remove<'a>(
-        &'a self,
-        id: SlotId,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
-    ) -> Option<Ref<'a, T>> {
-        self.remove_inner(id, guard.into())
-    }
-
-    fn remove_inner<'a>(
-        &'a self,
-        id: SlotId,
-        guard: Cow<'a, epoch::Guard<'a>>,
-    ) -> Option<Ref<'a, T>> {
-        self.check_guard(&guard);
+    pub fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+        self.check_guard(guard);
 
         let slot = self.slots.get(id.index as usize)?;
         let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
@@ -302,15 +283,10 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         //   be set is in `SlotMap::insert[_mut]` after initialization of the slot.
         // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
         //   it into the free-lists.
-        Some(unsafe { self.remove_inner_inner(id.index, guard) })
+        Some(unsafe { self.remove_inner(id.index) })
     }
 
-    // Inner indeed.
-    unsafe fn remove_inner_inner<'a>(
-        &'a self,
-        index: u32,
-        guard: Cow<'a, epoch::Guard<'a>>,
-    ) -> Ref<'a, T> {
+    unsafe fn remove_inner(&self, index: u32) -> &T {
         // SAFETY: The caller must ensure that `index` is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
 
@@ -337,7 +313,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
                         // SAFETY: The caller must ensure that the inner value was initialized and
                         // that said write was synchronized with and made visible here.
-                        break unsafe { Ref { slot, guard } };
+                        break unsafe { slot.value_unchecked() };
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -366,7 +342,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
                         // SAFETY: The caller must ensure that the inner value was initialized and
                         // that said write was synchronized with and made visible here.
-                        break unsafe { Ref { slot, guard } };
+                        break unsafe { slot.value_unchecked() };
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -501,21 +477,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     }
 
     #[cfg(test)]
-    fn remove_index<'a>(
-        &'a self,
-        index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
-    ) -> Option<Ref<'a, T>> {
-        self.remove_index_inner(index, guard.into())
-    }
-
-    #[cfg(test)]
-    fn remove_index_inner<'a>(
-        &'a self,
-        index: u32,
-        guard: Cow<'a, epoch::Guard<'a>>,
-    ) -> Option<Ref<'a, T>> {
-        self.check_guard(&guard);
+    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+        self.check_guard(guard);
 
         let slot = self.slots.get(index as usize)?;
         let mut generation = slot.generation.load(Relaxed);
@@ -552,7 +515,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         //   initialization of the slot.
         // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
         //   it into the free-lists.
-        Some(unsafe { self.remove_inner_inner(index, guard) })
+        Some(unsafe { self.remove_inner(index) })
     }
 
     /// # Panics
@@ -560,17 +523,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     #[must_use]
-    pub fn get<'a>(
-        &'a self,
-        id: SlotId,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
-    ) -> Option<Ref<'a, T>> {
-        self.get_inner(id, guard.into())
-    }
-
-    #[inline(always)]
-    fn get_inner<'a>(&'a self, id: SlotId, guard: Cow<'a, epoch::Guard<'a>>) -> Option<Ref<'a, T>> {
-        self.check_guard(&guard);
+    pub fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+        self.check_guard(guard);
 
         let slot = self.slots.get(id.index as usize)?;
         let generation = slot.generation.load(Acquire);
@@ -585,7 +539,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             //   Since the generation matched, the slot's occupied bit must be set, which makes
             //   reading the value safe as the only way the occupied bit can be set is in
             //   `SlotMap::insert[_mut]` after initialization of the slot.
-            Some(unsafe { Ref { slot, guard } })
+            Some(unsafe { slot.value_unchecked() })
         } else {
             None
         }
@@ -683,21 +637,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
-    pub fn index<'a>(
-        &'a self,
-        index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
-    ) -> Option<Ref<'a, T>> {
-        self.index_inner(index, guard.into())
-    }
-
-    #[inline(always)]
-    fn index_inner<'a>(
-        &'a self,
-        index: u32,
-        guard: Cow<'a, epoch::Guard<'a>>,
-    ) -> Option<Ref<'a, T>> {
-        self.check_guard(&guard);
+    pub fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+        self.check_guard(guard);
 
         let slot = self.slots.get(index as usize)?;
         let generation = slot.generation.load(Acquire);
@@ -709,7 +650,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             //   is visible here.
             // * We checked that the slot is occupied, which means that it must have been
             //   initialized in `SlotMap::insert[_mut]`.
-            Some(unsafe { Ref { slot, guard } })
+            Some(unsafe { slot.value_unchecked() })
         } else {
             None
         }
@@ -740,22 +681,8 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
-    pub unsafe fn index_unchecked<'a>(
-        &'a self,
-        index: u32,
-        guard: impl Into<Cow<'a, epoch::Guard<'a>>>,
-    ) -> Ref<'a, T> {
-        // SAFETY: Ensured by the caller.
-        unsafe { self.index_unchecked_inner(index, guard.into()) }
-    }
-
-    #[inline(always)]
-    unsafe fn index_unchecked_inner<'a>(
-        &'a self,
-        index: u32,
-        guard: Cow<'a, epoch::Guard<'a>>,
-    ) -> Ref<'a, T> {
-        self.check_guard(&guard);
+    pub unsafe fn index_unchecked<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> &'a T {
+        self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
@@ -767,7 +694,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
         //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
         //   visible here.
         // * The caller must ensure that the slot is initialized.
-        unsafe { Ref { slot, guard } }
+        unsafe { slot.value_unchecked() }
     }
 
     /// # Safety
@@ -789,17 +716,11 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn iter<'a>(&'a self, guard: impl Into<Cow<'a, epoch::Guard<'a>>>) -> Iter<'a, T> {
-        self.iter_inner(guard.into())
-    }
-
-    #[inline]
-    fn iter_inner<'a>(&'a self, guard: Cow<'a, epoch::Guard<'a>>) -> Iter<'a, T> {
-        self.check_guard(&guard);
+    pub fn iter<'a>(&'a self, guard: &'a epoch::Guard<'a>) -> Iter<'a, T> {
+        self.check_guard(guard);
 
         Iter {
             slots: self.slots.iter().enumerate(),
-            guard,
         }
     }
 
@@ -990,39 +911,8 @@ impl SlotId {
     }
 }
 
-pub struct Ref<'a, T> {
-    slot: &'a Slot<T>,
-    #[allow(dead_code)]
-    guard: Cow<'a, epoch::Guard<'a>>,
-}
-
-impl<T> Deref for Ref<'_, T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: The constructor of `Ref` must ensure that the inner value was initialized and
-        // that said write was synchronized with and made visible here. As for future writes to the
-        // inner value, we know that none can happen as long as our `Guard` wasn't dropped.
-        unsafe { self.slot.value_unchecked() }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for Ref<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&**self, f)
-    }
-}
-
 pub struct Iter<'a, T> {
     slots: iter::Enumerate<slice::Iter<'a, Slot<T>>>,
-    guard: Cow<'a, epoch::Guard<'a>>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
@@ -1032,7 +922,7 @@ impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = (SlotId, Ref<'a, T>);
+    type Item = (SlotId, &'a T);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -1048,15 +938,13 @@ impl<'a, T> Iterator for Iter<'a, T> {
                 // SAFETY: We checked that the occupied bit is set.
                 let id = unsafe { SlotId::new_unchecked(index, generation) };
 
-                let guard = self.guard.clone();
-
                 // SAFETY:
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
                 //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
                 //   value is visible here.
                 // * We checked that the slot is occupied, which means that it must have been
                 //   initialized in `SlotMap::insert[_mut]`.
-                let r = unsafe { Ref { slot, guard } };
+                let r = unsafe { slot.value_unchecked() };
 
                 break Some((id, r));
             }
@@ -1084,15 +972,13 @@ impl<T> DoubleEndedIterator for Iter<'_, T> {
                 // SAFETY: We checked that the occupied bit is set.
                 let id = unsafe { SlotId::new_unchecked(index, generation) };
 
-                let guard = self.guard.clone();
-
                 // SAFETY:
                 // * The `Acquire` ordering when loading the slot's generation synchronizes with the
                 //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
                 //   value is visible here.
                 // * We checked that the slot is occupied, which means that it must have been
                 //   initialized in `SlotMap::insert[_mut]`.
-                let r = unsafe { Ref { slot, guard } };
+                let r = unsafe { slot.value_unchecked() };
 
                 break Some((id, r));
             }
@@ -1805,7 +1691,7 @@ mod tests {
                 let local = map.global().register_local();
 
                 for _ in 0..ITERATIONS / THREADS {
-                    map.insert(0, local.pin());
+                    map.insert(0, &local.pin());
                 }
             };
 
@@ -1821,7 +1707,7 @@ mod tests {
                 let local = map.global().register_local();
 
                 for index in 0..ITERATIONS {
-                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), local.pin());
+                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), &local.pin());
                 }
             };
 
@@ -1845,12 +1731,12 @@ mod tests {
                 let local = map.global().register_local();
 
                 for _ in 0..ITERATIONS / 6 {
-                    let x = map.insert(0, local.pin());
-                    let y = map.insert(0, local.pin());
-                    map.remove(y, local.pin());
-                    let z = map.insert(0, local.pin());
-                    map.remove(x, local.pin());
-                    map.remove(z, local.pin());
+                    let x = map.insert(0, &local.pin());
+                    let y = map.insert(0, &local.pin());
+                    map.remove(y, &local.pin());
+                    let z = map.insert(0, &local.pin());
+                    map.remove(x, &local.pin());
+                    map.remove(z, &local.pin());
                 }
             };
             let iterator = || {
@@ -1858,7 +1744,7 @@ mod tests {
 
                 for _ in 0..ITERATIONS / CAPACITY * 2 {
                     for index in 0..CAPACITY {
-                        if let Some(value) = map.index(index, local.pin()) {
+                        if let Some(value) = map.index(index, &local.pin()) {
                             let _ = *value;
                         }
                     }
@@ -1882,7 +1768,7 @@ mod tests {
 
                 for i in 0..ITERATIONS {
                     if i % 10 == 0 {
-                        map.insert(0, local.pin());
+                        map.insert(0, &local.pin());
                     } else {
                         thread::yield_now();
                     }
@@ -1892,14 +1778,14 @@ mod tests {
                 let local = map.global().register_local();
 
                 for _ in 0..ITERATIONS {
-                    map.remove_index(0, local.pin());
+                    map.remove_index(0, &local.pin());
                 }
             };
             let getter = || {
                 let local = map.global().register_local();
 
                 for _ in 0..ITERATIONS {
-                    if let Some(value) = map.index(0, local.pin()) {
+                    if let Some(value) = map.index(0, &local.pin()) {
                         let _ = *value;
                     }
                 }
