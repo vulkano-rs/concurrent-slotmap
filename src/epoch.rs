@@ -29,10 +29,7 @@ use core::{
 const PINNED_BIT: u32 = 1 << 0;
 
 /// The number of pinnings between a participant tries to advance the global epoch.
-#[cfg(not(miri))]
-pub(crate) const PINNINGS_BETWEEN_ADVANCE: usize = 128;
-#[cfg(miri)]
-pub(crate) const PINNINGS_BETWEEN_ADVANCE: usize = 4;
+pub(crate) const PINNINGS_BETWEEN_ADVANCE: usize = if cfg!(miri) { 4 } else { 128 };
 
 /// A handle to a global epoch.
 pub struct GlobalHandle {
