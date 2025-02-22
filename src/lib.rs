@@ -8,6 +8,7 @@ extern crate alloc;
 use core::{
     fmt, hint,
     iter::{self, FusedIterator},
+    marker::PhantomData,
     mem::MaybeUninit,
     num::NonZeroU32,
     panic::{RefUnwindSafe, UnwindSafe},
@@ -34,9 +35,14 @@ const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
 /// The bit used to signify that a slot is occupied.
 const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
 
-#[cfg_attr(not(doc), repr(C))]
-pub struct SlotMap<T> {
-    slots: Vec<T>,
+pub struct SlotMap<K, V> {
+    inner: SlotMapInner<V>,
+    marker: PhantomData<fn(K) -> K>,
+}
+
+#[repr(C)]
+struct SlotMapInner<V> {
+    slots: Vec<V>,
     len: AtomicU32,
     global: epoch::GlobalHandle,
 
@@ -64,41 +70,56 @@ pub struct SlotMap<T> {
     free_list_queue: [AtomicU64; 2],
 }
 
-impl<T> UnwindSafe for SlotMap<T> {}
-impl<T> RefUnwindSafe for SlotMap<T> {}
+impl<K, V> UnwindSafe for SlotMap<K, V> {}
+impl<K, V> RefUnwindSafe for SlotMap<K, V> {}
 
-impl<T> SlotMap<T> {
+impl<V> SlotMap<SlotId, V> {
     #[must_use]
     pub fn new(max_capacity: u32) -> Self {
-        Self::with_global(max_capacity, epoch::GlobalHandle::new())
+        Self::with_key(max_capacity)
     }
 
     #[must_use]
     pub fn with_global(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
+        Self::with_global_and_key(max_capacity, global)
+    }
+}
+
+impl<K, V> SlotMap<K, V> {
+    #[must_use]
+    pub fn with_key(max_capacity: u32) -> Self {
+        Self::with_global_and_key(max_capacity, epoch::GlobalHandle::new())
+    }
+
+    #[must_use]
+    pub fn with_global_and_key(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
         SlotMap {
-            slots: Vec::new(max_capacity),
-            len: AtomicU32::new(0),
-            global,
-            _alignment1: CacheAligned,
-            free_list: AtomicU32::new(NIL),
-            _alignment2: CacheAligned,
-            free_list_queue: [
-                AtomicU64::new(u64::from(NIL)),
-                AtomicU64::new(u64::from(NIL) | 2 << 32),
-            ],
+            inner: SlotMapInner {
+                slots: Vec::new(max_capacity),
+                len: AtomicU32::new(0),
+                global,
+                _alignment1: CacheAligned,
+                free_list: AtomicU32::new(NIL),
+                _alignment2: CacheAligned,
+                free_list_queue: [
+                    AtomicU64::new(u64::from(NIL)),
+                    AtomicU64::new(u64::from(NIL) | 2 << 32),
+                ],
+            },
+            marker: PhantomData,
         }
     }
 
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> u32 {
-        self.slots.capacity()
+        self.inner.slots.capacity()
     }
 
     #[inline]
     #[must_use]
     pub fn len(&self) -> u32 {
-        self.len.load(Relaxed)
+        self.inner.len.load(Relaxed)
     }
 
     #[inline]
@@ -110,14 +131,16 @@ impl<T> SlotMap<T> {
     #[inline]
     #[must_use]
     pub fn global(&self) -> &epoch::GlobalHandle {
-        &self.global
+        &self.inner.global
     }
+}
 
+impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn insert<'a>(&'a self, value: T, guard: &'a epoch::Guard<'a>) -> SlotId {
+    pub fn insert<'a>(&'a self, value: V, guard: &'a epoch::Guard<'a>) -> K {
         self.insert_with_tag(value, 0, guard)
     }
 
@@ -126,12 +149,144 @@ impl<T> SlotMap<T> {
     /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
-    pub fn insert_with_tag<'a>(
-        &'a self,
-        value: T,
-        tag: u32,
-        guard: &'a epoch::Guard<'a>,
-    ) -> SlotId {
+    pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> K {
+        K::from_id(self.inner.insert_with_tag(value, tag, guard))
+    }
+
+    #[inline]
+    pub fn insert_mut(&mut self, value: V) -> K {
+        self.insert_with_tag_mut(value, 0)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `tag` has more than the low 8 bits set.
+    #[inline]
+    pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
+        K::from_id(self.inner.insert_with_tag_mut(value, tag))
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline]
+    pub fn remove<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+        self.inner.remove(key.as_id(), guard)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline]
+    pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
+        self.inner.try_collect(guard);
+    }
+
+    #[inline]
+    pub fn remove_mut(&mut self, key: K) -> Option<V> {
+        self.inner.remove_mut(key.as_id())
+    }
+
+    #[cfg(test)]
+    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+        self.inner.remove_index(index, guard)
+    }
+
+    #[inline]
+    pub fn invalidate<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+        self.inner.invalidate(key.as_id(), guard)
+    }
+
+    /// # Safety
+    ///
+    /// * The slot must be currently [invalidated].
+    /// * At least two [epochs] must have passed since the slot was invalidated.
+    /// * The slot must not have been removed already.
+    ///
+    /// [invalidated]: Self::invalidate
+    /// [epochs]: epoch::GlobalHandle::epoch
+    #[inline]
+    pub unsafe fn remove_unchecked(&self, key: K) -> V {
+        // SAFETY: Enforced by the caller.
+        unsafe { self.inner.remove_unchecked(key.as_id()) }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline(always)]
+    #[must_use]
+    pub fn get<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+        self.inner.get(key.as_id(), guard)
+    }
+
+    #[inline(always)]
+    #[must_use]
+    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
+        self.inner.get_mut(key.as_id())
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get_many_mut<const N: usize>(&mut self, keys: [K; N]) -> Option<[&mut V; N]> {
+        self.inner.get_many_mut(keys.map(Key::as_id))
+    }
+
+    #[cfg(test)]
+    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+        self.inner.index(index, guard)
+    }
+
+    /// # Safety
+    ///
+    /// The slot must be currently occupied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline(always)]
+    #[must_use]
+    pub unsafe fn get_unchecked<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> &'a V {
+        // SAFETY: Enforced by the caller.
+        unsafe { self.inner.get_unchecked(key.as_id(), guard) }
+    }
+
+    /// # Safety
+    ///
+    /// The slot must be currently occupied.
+    #[inline(always)]
+    #[must_use]
+    pub unsafe fn get_unchecked_mut(&mut self, key: K) -> &mut V {
+        // SAFETY: Enforced by the caller.
+        unsafe { self.inner.get_unchecked_mut(key.as_id()) }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline]
+    #[must_use]
+    pub fn iter<'a>(&'a self, guard: &'a epoch::Guard<'a>) -> Iter<'a, K, V> {
+        self.inner.check_guard(guard);
+
+        Iter {
+            slots: self.inner.slots.iter().enumerate(),
+            marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            slots: self.inner.slots.iter_mut().enumerate(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<V> SlotMapInner<V> {
+    fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> SlotId {
         self.check_guard(guard);
         assert_eq!(tag & !TAG_MASK, 0);
 
@@ -157,7 +312,7 @@ impl<T> SlotMap<T> {
                     // SAFETY: `SlotMap::remove[_mut]` guarantees that the free-list only contains
                     // slots that are no longer read by any threads, and we have removed the slot
                     // from the free-list such that no other threads can be writing the same slot.
-                    unsafe { slot.value.get().cast::<T>().write(value) };
+                    unsafe { slot.value.get().cast::<V>().write(value) };
 
                     let new_generation = slot
                         .generation
@@ -186,14 +341,7 @@ impl<T> SlotMap<T> {
         unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
     }
 
-    pub fn insert_mut(&mut self, value: T) -> SlotId {
-        self.insert_with_tag_mut(value, 0)
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `tag` has more than the low 8 bits set.
-    pub fn insert_with_tag_mut(&mut self, value: T, tag: u32) -> SlotId {
+    fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
         let free_list_head = *self.free_list.get_mut();
@@ -227,11 +375,7 @@ impl<T> SlotMap<T> {
         unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
     }
 
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    #[inline]
-    pub fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         let slot = self.invalidate(id, guard)?;
 
         // SAFETY: We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting
@@ -247,7 +391,7 @@ impl<T> SlotMap<T> {
 
         atomic::fence(SeqCst);
 
-        let epoch = self.global().epoch();
+        let epoch = self.global.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -303,13 +447,10 @@ impl<T> SlotMap<T> {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
+    fn try_collect(&self, guard: &epoch::Guard<'_>) {
         self.check_guard(guard);
 
-        let epoch = self.global().epoch();
+        let epoch = self.global.epoch();
         let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
         let mut queued_state = queued_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -363,7 +504,7 @@ impl<T> SlotMap<T> {
             // vector never shrinks, therefore the index must have staid in bounds.
             queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail as usize) };
 
-            let ptr = queued_tail_slot.value.get().cast::<T>();
+            let ptr = queued_tail_slot.value.get().cast::<V>();
 
             // SAFETY: The caller must ensure that we have exclusive access to this list.
             unsafe { ptr.drop_in_place() };
@@ -399,7 +540,7 @@ impl<T> SlotMap<T> {
         }
     }
 
-    pub fn remove_mut(&mut self, id: SlotId) -> Option<T> {
+    fn remove_mut(&mut self, id: SlotId) -> Option<V> {
         let slot = self.slots.get_mut(id.index as usize)?;
         let generation = *slot.generation.get_mut();
 
@@ -420,14 +561,14 @@ impl<T> SlotMap<T> {
             //   `SlotMap::insert[_mut]` after initialization of the slot.
             // * We incremented the slot's generation such that its `OCCUPIED_BIT` is unset and its
             //   generation is advanced, such that future attempts to access the slot will fail.
-            Some(unsafe { slot.value.get().cast::<T>().read() })
+            Some(unsafe { slot.value.get().cast::<V>().read() })
         } else {
             None
         }
     }
 
     #[cfg(test)]
-    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(index as usize)?;
@@ -470,7 +611,7 @@ impl<T> SlotMap<T> {
         Some(unsafe { slot.value_unchecked() })
     }
 
-    pub fn invalidate<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    fn invalidate<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(id.index as usize)?;
@@ -499,21 +640,13 @@ impl<T> SlotMap<T> {
         Some(unsafe { slot.value_unchecked() })
     }
 
-    /// # Safety
-    ///
-    /// * The slot must be currently [invalidated].
-    /// * At least two [epochs] must have passed since the slot was invalidated.
-    /// * The slot must not have been removed already.
-    ///
-    /// [invalidated]: Self::invalidate
-    /// [epochs]: epoch::GlobalHandle::epoch
-    pub unsafe fn remove_unchecked(&self, id: SlotId) -> T {
+    unsafe fn remove_unchecked(&self, id: SlotId) -> V {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(id.index as usize) };
 
         // SAFETY: The caller must ensure that the slot is initialized and that no other threads can
         // be accessing the slot.
-        let value = unsafe { slot.value.get().cast::<T>().read() };
+        let value = unsafe { slot.value.get().cast::<V>().read() };
 
         let mut free_list_head = self.free_list.load(Acquire);
         let mut backoff = Backoff::new();
@@ -534,12 +667,8 @@ impl<T> SlotMap<T> {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
-    #[must_use]
-    pub fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(id.index as usize)?;
@@ -562,7 +691,7 @@ impl<T> SlotMap<T> {
     }
 
     #[inline(always)]
-    pub fn get_mut(&mut self, id: SlotId) -> Option<&mut T> {
+    fn get_mut(&mut self, id: SlotId) -> Option<&mut V> {
         let slot = self.slots.get_mut(id.index as usize)?;
         let generation = *slot.generation.get_mut();
 
@@ -581,7 +710,7 @@ impl<T> SlotMap<T> {
     }
 
     #[inline]
-    pub fn get_many_mut<const N: usize>(&mut self, ids: [SlotId; N]) -> Option<[&mut T; N]> {
+    fn get_many_mut<const N: usize>(&mut self, ids: [SlotId; N]) -> Option<[&mut V; N]> {
         fn get_many_check_valid<const N: usize>(ids: &[SlotId; N], len: u32) -> bool {
             let mut valid = true;
 
@@ -610,10 +739,10 @@ impl<T> SlotMap<T> {
     unsafe fn get_many_unchecked_mut<const N: usize>(
         &mut self,
         ids: [SlotId; N],
-    ) -> Option<[&mut T; N]> {
+    ) -> Option<[&mut V; N]> {
         let slots_ptr = self.slots.as_mut_ptr();
-        let mut refs = MaybeUninit::<[&mut T; N]>::uninit();
-        let refs_ptr = refs.as_mut_ptr().cast::<&mut T>();
+        let mut refs = MaybeUninit::<[&mut V; N]>::uninit();
+        let refs_ptr = refs.as_mut_ptr().cast::<&mut V>();
 
         for i in 0..N {
             // SAFETY: `i` is in bounds of the array.
@@ -650,7 +779,7 @@ impl<T> SlotMap<T> {
     }
 
     #[cfg(test)]
-    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(index as usize)?;
@@ -669,15 +798,8 @@ impl<T> SlotMap<T> {
         }
     }
 
-    /// # Safety
-    ///
-    /// The slot must be currently occupied.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
-    pub unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> &'a T {
+    unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> &'a V {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
@@ -693,11 +815,8 @@ impl<T> SlotMap<T> {
         unsafe { slot.value_unchecked() }
     }
 
-    /// # Safety
-    ///
-    /// The slot must be currently occupied.
     #[inline(always)]
-    pub unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut T {
+    unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut V {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked_mut(id.index as usize) };
 
@@ -705,25 +824,6 @@ impl<T> SlotMap<T> {
         // * The mutable reference makes sure that access to the slot is synchronized.
         // * The caller must ensure that the slot is initialized.
         unsafe { slot.value_unchecked_mut() }
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    #[inline]
-    pub fn iter<'a>(&'a self, guard: &'a epoch::Guard<'a>) -> Iter<'a, T> {
-        self.check_guard(guard);
-
-        Iter {
-            slots: self.slots.iter().enumerate(),
-        }
-    }
-
-    #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
-        IterMut {
-            slots: self.slots.iter_mut().enumerate(),
-        }
     }
 
     #[inline(always)]
@@ -734,16 +834,14 @@ impl<T> SlotMap<T> {
         }
 
         if let Some(global) = guard.global() {
-            if global != self.global() {
+            if global != &self.global {
                 global_mismatch();
             }
         }
     }
 }
 
-// We don't want to print the `_alignment` fields.
-#[allow(clippy::missing_fields_in_debug)]
-impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
+impl<K, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Slots;
 
@@ -753,9 +851,9 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        struct List<'a, T>(&'a SlotMap<T>, u32);
+        struct List<'a, V>(&'a SlotMapInner<V>, u32);
 
-        impl<T> fmt::Debug for List<'_, T> {
+        impl<V> fmt::Debug for List<'_, V> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let mut head = self.1;
                 let mut debug = f.debug_list();
@@ -774,9 +872,9 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        struct QueuedList<'a, T>(&'a SlotMap<T>, u64);
+        struct QueuedList<'a, V>(&'a SlotMapInner<V>, u64);
 
-        impl<T> fmt::Debug for QueuedList<'_, T> {
+        impl<V> fmt::Debug for QueuedList<'_, V> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let state = self.1;
                 let head = (state & 0xFFFF_FFFF) as u32;
@@ -790,71 +888,98 @@ impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
             }
         }
 
-        let mut debug = f.debug_struct("SlotMap");
-        debug
-            .field("slots", &Slots)
-            .field("len", &self.len)
-            .field("global", &self.global)
-            .field("free_list", &List(self, self.free_list.load(Acquire)))
-            .field(
-                "free_list_queue",
-                &[
-                    QueuedList(self, self.free_list_queue[0].load(Acquire)),
-                    QueuedList(self, self.free_list_queue[1].load(Acquire)),
-                ],
-            );
+        fn inner<V>(map: &SlotMapInner<V>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut debug = f.debug_struct("SlotMap");
+            debug
+                .field("slots", &Slots)
+                .field("len", &map.len)
+                .field("global", &map.global)
+                .field("free_list", &List(map, map.free_list.load(Acquire)))
+                .field(
+                    "free_list_queue",
+                    &[
+                        QueuedList(map, map.free_list_queue[0].load(Acquire)),
+                        QueuedList(map, map.free_list_queue[1].load(Acquire)),
+                    ],
+                );
 
-        debug.finish()
+            debug.finish()
+        }
+
+        inner(&self.inner, f)
     }
 }
 
-impl<T> Drop for SlotMap<T> {
+impl<K, V> Drop for SlotMap<K, V> {
     fn drop(&mut self) {
-        if !core::mem::needs_drop::<T>() {
-            return;
-        }
+        fn inner<V>(map: &mut SlotMapInner<V>) {
+            if !core::mem::needs_drop::<V>() {
+                return;
+            }
 
-        for list in &mut self.free_list_queue {
-            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
+            for list in &mut map.free_list_queue {
+                let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
 
-            while head != NIL {
-                // SAFETY: We always push indices of existing slots into the free-lists and the
-                // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
+                while head != NIL {
+                    // SAFETY: We always push indices of existing slots into the free-lists and the
+                    // slots vector never shrinks, therefore the index must have staid in bounds.
+                    let slot = unsafe { map.slots.get_unchecked_mut(head as usize) };
 
-                let ptr = slot.value.get_mut().as_mut_ptr();
+                    let ptr = slot.value.get_mut().as_mut_ptr();
 
-                // SAFETY: We can be certain that this slot has been initialized, since the only
-                // way in which it could have been queued for freeing is in `SlotMap::remove` if
-                // the slot was inserted before.
-                unsafe { ptr.drop_in_place() };
+                    // SAFETY: We can be certain that this slot has been initialized, since the only
+                    // way in which it could have been queued for freeing is in `SlotMap::remove` if
+                    // the slot was inserted before.
+                    unsafe { ptr.drop_in_place() };
 
-                head = *slot.next_free.get_mut();
+                    head = *slot.next_free.get_mut();
+                }
+            }
+
+            for slot in map.slots.as_mut_slice() {
+                if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                    let ptr = slot.value.get_mut().as_mut_ptr();
+
+                    // SAFETY:
+                    // * The mutable reference makes sure that access to the slot is synchronized.
+                    // * We checked that the slot is occupied, which means that it must have been
+                    //   initialized in `SlotMap::insert[_mut]`.
+                    unsafe { ptr.drop_in_place() };
+                }
             }
         }
 
-        for slot in self.slots.as_mut_slice() {
-            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
-                let ptr = slot.value.get_mut().as_mut_ptr();
-
-                // SAFETY:
-                // * The mutable reference makes sure that access to the slot is synchronized.
-                // * We checked that the slot is occupied, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
-                unsafe { ptr.drop_in_place() };
-            }
-        }
+        inner(&mut self.inner);
     }
 }
 
-impl<'a, T> IntoIterator for &'a mut SlotMap<T> {
-    type Item = (SlotId, &'a mut T);
+impl<'a, K: Key, V> IntoIterator for &'a mut SlotMap<K, V> {
+    type Item = (K, &'a mut V);
 
-    type IntoIter = IterMut<'a, T>;
+    type IntoIter = IterMut<'a, K, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
+    }
+}
+
+pub trait Key: Sized {
+    fn from_id(id: SlotId) -> Self;
+
+    #[allow(clippy::wrong_self_convention)]
+    fn as_id(self) -> SlotId;
+}
+
+impl Key for SlotId {
+    #[inline(always)]
+    fn from_id(id: SlotId) -> Self {
+        id
+    }
+
+    #[inline(always)]
+    fn as_id(self) -> SlotId {
+        self
     }
 }
 
@@ -917,18 +1042,43 @@ impl SlotId {
     }
 }
 
-pub struct Iter<'a, T> {
-    slots: iter::Enumerate<slice::Iter<'a, Slot<T>>>,
+#[macro_export]
+macro_rules! declare_key {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident $(;)?
+    ) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        $vis struct $name($crate::SlotId);
+
+        impl $crate::Key for $name {
+            #[inline(always)]
+            fn from_id(id: $crate::SlotId) -> Self {
+                $name(id)
+            }
+
+            #[inline(always)]
+            fn as_id(self) -> $crate::SlotId {
+                self.0
+            }
+        }
+    };
 }
 
-impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
+pub struct Iter<'a, K, V> {
+    slots: iter::Enumerate<slice::Iter<'a, Slot<V>>>,
+    marker: PhantomData<fn(K) -> K>,
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for Iter<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iter").finish_non_exhaustive()
     }
 }
 
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = (SlotId, &'a T);
+impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
+    type Item = (K, &'a V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -952,7 +1102,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
                 //   initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked() };
 
-                break Some((id, r));
+                break Some((K::from_id(id), r));
             }
         }
     }
@@ -963,7 +1113,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
     }
 }
 
-impl<T> DoubleEndedIterator for Iter<'_, T> {
+impl<K: Key, V> DoubleEndedIterator for Iter<'_, K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
@@ -986,26 +1136,27 @@ impl<T> DoubleEndedIterator for Iter<'_, T> {
                 //   initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked() };
 
-                break Some((id, r));
+                break Some((K::from_id(id), r));
             }
         }
     }
 }
 
-impl<T> FusedIterator for Iter<'_, T> {}
+impl<K: Key, V> FusedIterator for Iter<'_, K, V> {}
 
-pub struct IterMut<'a, T> {
-    slots: iter::Enumerate<slice::IterMut<'a, Slot<T>>>,
+pub struct IterMut<'a, K, V> {
+    slots: iter::Enumerate<slice::IterMut<'a, Slot<V>>>,
+    marker: PhantomData<fn(K) -> K>,
 }
 
-impl<T: fmt::Debug> fmt::Debug for IterMut<'_, T> {
+impl<K, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IterMut").finish_non_exhaustive()
     }
 }
 
-impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = (SlotId, &'a mut T);
+impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
+    type Item = (K, &'a mut V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -1025,7 +1176,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
                 // initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked_mut() };
 
-                break Some((id, r));
+                break Some((K::from_id(id), r));
             }
         }
     }
@@ -1036,7 +1187,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
-impl<T> DoubleEndedIterator for IterMut<'_, T> {
+impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
@@ -1055,13 +1206,13 @@ impl<T> DoubleEndedIterator for IterMut<'_, T> {
                 // initialized in `SlotMap::insert[_mut]`.
                 let r = unsafe { slot.value_unchecked_mut() };
 
-                break Some((id, r));
+                break Some((K::from_id(id), r));
             }
         }
     }
 }
 
-impl<T> FusedIterator for IterMut<'_, T> {}
+impl<K: Key, V> FusedIterator for IterMut<'_, K, V> {}
 
 #[repr(align(128))]
 struct CacheAligned;
