@@ -63,8 +63,9 @@ impl GlobalHandle {
         Local::register(self)
     }
 
+    /// Returns the global epoch.
     #[inline]
-    pub(crate) fn epoch(&self) -> u32 {
+    pub fn epoch(&self) -> u32 {
         self.global().epoch.load(Relaxed)
     }
 

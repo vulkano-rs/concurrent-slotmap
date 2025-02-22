@@ -232,37 +232,16 @@ impl<T> SlotMap<T> {
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
     pub fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
-        self.check_guard(guard);
+        let slot = self.invalidate(id, guard)?;
 
-        let slot = self.slots.get(id.index as usize)?;
-        let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+        // SAFETY: We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting
+        // to push it into the free-lists.
+        unsafe { self.defer_destroy(id.index) };
 
-        // This works thanks to the invariant of `SlotId` that the `OCCUPIED_BIT` of its generation
-        // must be set. That means that the only outcome possible in case of success here is that
-        // the `OCCUPIED_BIT` is unset and the generation is advanced.
-        if slot
-            .generation
-            .compare_exchange(id.generation(), new_generation, Acquire, Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The `compare_exchange` above succeeded, which means that the previous generation of the
-        //   slot must have matched `id.generation`. By `SlotId`'s invariant, its generation's
-        //   occupied bit must be set. Since the generation matched, the slot's occupied bit must
-        //   have been set, which makes reading the value safe as the only way the occupied bit can
-        //   be set is in `SlotMap::insert[_mut]` after initialization of the slot.
-        // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
-        //   it into the free-lists.
-        Some(unsafe { self.remove_inner(id.index) })
+        Some(slot)
     }
 
-    unsafe fn remove_inner(&self, index: u32) -> &T {
+    unsafe fn defer_destroy(&self, index: u32) {
         // SAFETY: The caller must ensure that `index` is in bounds.
         let slot = unsafe { self.slots.get_unchecked(index as usize) };
 
@@ -286,10 +265,7 @@ impl<T> SlotMap<T> {
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
                         self.len.fetch_sub(1, Relaxed);
-
-                        // SAFETY: The caller must ensure that the inner value was initialized and
-                        // that said write was synchronized with and made visible here.
-                        break unsafe { slot.value_unchecked() };
+                        break;
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -316,9 +292,7 @@ impl<T> SlotMap<T> {
                         // accessing any of the slots in the list.
                         unsafe { self.collect_unchecked(queued_head) };
 
-                        // SAFETY: The caller must ensure that the inner value was initialized and
-                        // that said write was synchronized with and made visible here.
-                        break unsafe { slot.value_unchecked() };
+                        break;
                     }
                     Err(new_state) => {
                         queued_state = new_state;
@@ -481,6 +455,10 @@ impl<T> SlotMap<T> {
             }
         }
 
+        // SAFETY: We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting
+        // to push it into the free-lists.
+        unsafe { self.defer_destroy(index) };
+
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
         //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
@@ -489,9 +467,71 @@ impl<T> SlotMap<T> {
         //   of the slot must have had its `OCCUPIED_BIT` set, which makes reading the value safe as
         //   the only way the occupied bit can be set is in `SlotMap::insert[_mut]` after
         //   initialization of the slot.
-        // * We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting to push
-        //   it into the free-lists.
-        Some(unsafe { self.remove_inner(index) })
+        Some(unsafe { slot.value_unchecked() })
+    }
+
+    pub fn invalidate<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+        self.check_guard(guard);
+
+        let slot = self.slots.get(id.index as usize)?;
+        let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+
+        // This works thanks to the invariant of `SlotId` that the `OCCUPIED_BIT` of its generation
+        // must be set. That means that the only outcome possible in case of success here is that
+        // the `OCCUPIED_BIT` is unset and the generation is advanced.
+        if slot
+            .generation
+            .compare_exchange(id.generation(), new_generation, Acquire, Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The `compare_exchange` above succeeded, which means that the previous generation of the
+        //   slot must have matched `id.generation`. By `SlotId`'s invariant, its generation's
+        //   occupied bit must be set. Since the generation matched, the slot's occupied bit must
+        //   have been set, which makes reading the value safe as the only way the occupied bit can
+        //   be set is in `SlotMap::insert[_mut]` after initialization of the slot.
+        Some(unsafe { slot.value_unchecked() })
+    }
+
+    /// # Safety
+    ///
+    /// * The slot must be currently [invalidated].
+    /// * At least two [epochs] must have passed since the slot was invalidated.
+    /// * The slot must not have been removed already.
+    ///
+    /// [invalidated]: Self::invalidate
+    /// [epochs]: epoch::GlobalHandle::epoch
+    pub unsafe fn remove_unchecked(&self, id: SlotId) -> T {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(id.index as usize) };
+
+        // SAFETY: The caller must ensure that the slot is initialized and that no other threads can
+        // be accessing the slot.
+        let value = unsafe { slot.value.get().cast::<T>().read() };
+
+        let mut free_list_head = self.free_list.load(Acquire);
+        let mut backoff = Backoff::new();
+
+        loop {
+            slot.next_free.store(free_list_head, Relaxed);
+
+            match self
+                .free_list
+                .compare_exchange_weak(free_list_head, id.index, Release, Acquire)
+            {
+                Ok(_) => break value,
+                Err(new_head) => {
+                    free_list_head = new_head;
+                    backoff.spin();
+                }
+            }
+        }
     }
 
     /// # Panics
