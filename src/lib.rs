@@ -6,7 +6,9 @@
 extern crate alloc;
 
 use core::{
-    fmt, hint,
+    cmp, fmt,
+    hash::{Hash, Hasher},
+    hint,
     iter::{self, FusedIterator},
     marker::PhantomData,
     mem::MaybeUninit,
@@ -979,10 +981,14 @@ impl Key for SlotId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(8))]
 pub struct SlotId {
+    #[cfg(target_endian = "little")]
     index: u32,
     generation: NonZeroU32,
+    #[cfg(target_endian = "big")]
+    index: u32,
 }
 
 impl SlotId {
@@ -1035,6 +1041,41 @@ impl SlotId {
     #[must_use]
     pub const fn tag(self) -> u32 {
         self.generation.get() & TAG_MASK
+    }
+
+    #[inline]
+    fn as_u64(self) -> u64 {
+        u64::from(self.index) | u64::from(self.generation.get()) << 32
+    }
+}
+
+impl PartialEq for SlotId {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_u64() == other.as_u64()
+    }
+}
+
+impl Eq for SlotId {}
+
+impl Hash for SlotId {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_u64().hash(state)
+    }
+}
+
+impl PartialOrd for SlotId {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SlotId {
+    #[inline]
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.as_u64().cmp(&other.as_u64())
     }
 }
 
