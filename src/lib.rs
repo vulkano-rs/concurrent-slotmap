@@ -910,46 +910,42 @@ impl<K, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
     }
 }
 
-impl<K, V> Drop for SlotMap<K, V> {
+impl<V> Drop for SlotMapInner<V> {
     fn drop(&mut self) {
-        fn inner<V>(map: &mut SlotMapInner<V>) {
-            if !core::mem::needs_drop::<V>() {
-                return;
-            }
+        if !core::mem::needs_drop::<V>() {
+            return;
+        }
 
-            for list in &mut map.free_list_queue {
-                let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
+        for list in &mut self.free_list_queue {
+            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
 
-                while head != NIL {
-                    // SAFETY: We always push indices of existing slots into the free-lists and the
-                    // slots vector never shrinks, therefore the index must have staid in bounds.
-                    let slot = unsafe { map.slots.get_unchecked_mut(head as usize) };
+            while head != NIL {
+                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // slots vector never shrinks, therefore the index must have staid in bounds.
+                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
 
-                    let ptr = slot.value.get_mut().as_mut_ptr();
+                let ptr = slot.value.get_mut().as_mut_ptr();
 
-                    // SAFETY: We can be certain that this slot has been initialized, since the only
-                    // way in which it could have been queued for freeing is in `SlotMap::remove` if
-                    // the slot was inserted before.
-                    unsafe { ptr.drop_in_place() };
+                // SAFETY: We can be certain that this slot has been initialized, since the only
+                // way in which it could have been queued for freeing is in `SlotMap::remove` if
+                // the slot was inserted before.
+                unsafe { ptr.drop_in_place() };
 
-                    head = *slot.next_free.get_mut();
-                }
-            }
-
-            for slot in map.slots.as_mut_slice() {
-                if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
-                    let ptr = slot.value.get_mut().as_mut_ptr();
-
-                    // SAFETY:
-                    // * The mutable reference makes sure that access to the slot is synchronized.
-                    // * We checked that the slot is occupied, which means that it must have been
-                    //   initialized in `SlotMap::insert[_mut]`.
-                    unsafe { ptr.drop_in_place() };
-                }
+                head = *slot.next_free.get_mut();
             }
         }
 
-        inner(&mut self.inner);
+        for slot in self.slots.as_mut_slice() {
+            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+                let ptr = slot.value.get_mut().as_mut_ptr();
+
+                // SAFETY:
+                // * The mutable reference makes sure that access to the slot is synchronized.
+                // * We checked that the slot is occupied, which means that it must have been
+                //   initialized in `SlotMap::insert[_mut]`.
+                unsafe { ptr.drop_in_place() };
+            }
+        }
     }
 }
 
