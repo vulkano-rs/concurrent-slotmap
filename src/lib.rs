@@ -35,11 +35,10 @@ const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
 const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
 
 #[cfg_attr(not(doc), repr(C))]
-pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
+pub struct SlotMap<T> {
     slots: Vec<T>,
     len: AtomicU32,
     global: epoch::GlobalHandle,
-    collector: C,
 
     _alignment1: CacheAligned,
 
@@ -65,10 +64,10 @@ pub struct SlotMap<T, C: Collector<T> = DefaultCollector> {
     free_list_queue: [AtomicU64; 2],
 }
 
-impl<T, C: Collector<T>> UnwindSafe for SlotMap<T, C> {}
-impl<T, C: Collector<T>> RefUnwindSafe for SlotMap<T, C> {}
+impl<T> UnwindSafe for SlotMap<T> {}
+impl<T> RefUnwindSafe for SlotMap<T> {}
 
-impl<T> SlotMap<T, DefaultCollector> {
+impl<T> SlotMap<T> {
     #[must_use]
     pub fn new(max_capacity: u32) -> Self {
         Self::with_global(max_capacity, epoch::GlobalHandle::new())
@@ -76,27 +75,10 @@ impl<T> SlotMap<T, DefaultCollector> {
 
     #[must_use]
     pub fn with_global(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
-        Self::with_global_and_collector(max_capacity, global, DefaultCollector)
-    }
-}
-
-impl<T, C: Collector<T>> SlotMap<T, C> {
-    #[must_use]
-    pub fn with_collector(max_capacity: u32, collector: C) -> Self {
-        Self::with_global_and_collector(max_capacity, epoch::GlobalHandle::new(), collector)
-    }
-
-    #[must_use]
-    pub fn with_global_and_collector(
-        max_capacity: u32,
-        global: epoch::GlobalHandle,
-        collector: C,
-    ) -> Self {
         SlotMap {
             slots: Vec::new(max_capacity),
             len: AtomicU32::new(0),
             global,
-            collector,
             _alignment1: CacheAligned,
             free_list: AtomicU32::new(NIL),
             _alignment2: CacheAligned,
@@ -129,12 +111,6 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
     #[must_use]
     pub fn global(&self) -> &epoch::GlobalHandle {
         &self.global
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn collector(&self) -> &C {
-        &self.collector
     }
 
     /// # Panics
@@ -416,7 +392,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
             let ptr = queued_tail_slot.value.get().cast::<T>();
 
             // SAFETY: The caller must ensure that we have exclusive access to this list.
-            unsafe { self.collector.collect(ptr) };
+            unsafe { ptr.drop_in_place() };
 
             let next_free = queued_tail_slot.next_free.load(Acquire);
 
@@ -748,7 +724,7 @@ impl<T, C: Collector<T>> SlotMap<T, C> {
 
 // We don't want to print the `_alignment` fields.
 #[allow(clippy::missing_fields_in_debug)]
-impl<T: fmt::Debug, C: Collector<T>> fmt::Debug for SlotMap<T, C> {
+impl<T: fmt::Debug> fmt::Debug for SlotMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Slots;
 
@@ -758,9 +734,9 @@ impl<T: fmt::Debug, C: Collector<T>> fmt::Debug for SlotMap<T, C> {
             }
         }
 
-        struct List<'a, T, C: Collector<T>>(&'a SlotMap<T, C>, u32);
+        struct List<'a, T>(&'a SlotMap<T>, u32);
 
-        impl<T, C: Collector<T>> fmt::Debug for List<'_, T, C> {
+        impl<T> fmt::Debug for List<'_, T> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let mut head = self.1;
                 let mut debug = f.debug_list();
@@ -779,9 +755,9 @@ impl<T: fmt::Debug, C: Collector<T>> fmt::Debug for SlotMap<T, C> {
             }
         }
 
-        struct QueuedList<'a, T, C: Collector<T>>(&'a SlotMap<T, C>, u64);
+        struct QueuedList<'a, T>(&'a SlotMap<T>, u64);
 
-        impl<T, C: Collector<T>> fmt::Debug for QueuedList<'_, T, C> {
+        impl<T> fmt::Debug for QueuedList<'_, T> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let state = self.1;
                 let head = (state & 0xFFFF_FFFF) as u32;
@@ -813,7 +789,7 @@ impl<T: fmt::Debug, C: Collector<T>> fmt::Debug for SlotMap<T, C> {
     }
 }
 
-impl<T, C: Collector<T>> Drop for SlotMap<T, C> {
+impl<T> Drop for SlotMap<T> {
     fn drop(&mut self) {
         if !core::mem::needs_drop::<T>() {
             return;
@@ -832,7 +808,7 @@ impl<T, C: Collector<T>> Drop for SlotMap<T, C> {
                 // SAFETY: We can be certain that this slot has been initialized, since the only
                 // way in which it could have been queued for freeing is in `SlotMap::remove` if
                 // the slot was inserted before.
-                unsafe { self.collector.collect(ptr) };
+                unsafe { ptr.drop_in_place() };
 
                 head = *slot.next_free.get_mut();
             }
@@ -846,13 +822,13 @@ impl<T, C: Collector<T>> Drop for SlotMap<T, C> {
                 // * The mutable reference makes sure that access to the slot is synchronized.
                 // * We checked that the slot is occupied, which means that it must have been
                 //   initialized in `SlotMap::insert[_mut]`.
-                unsafe { self.collector.collect(ptr) };
+                unsafe { ptr.drop_in_place() };
             }
         }
     }
 }
 
-impl<'a, T, C: Collector<T>> IntoIterator for &'a mut SlotMap<T, C> {
+impl<'a, T> IntoIterator for &'a mut SlotMap<T> {
     type Item = (SlotId, &'a mut T);
 
     type IntoIter = IterMut<'a, T>;
@@ -1056,27 +1032,6 @@ impl<T> DoubleEndedIterator for IterMut<'_, T> {
 }
 
 impl<T> FusedIterator for IterMut<'_, T> {}
-
-pub trait Collector<T> {
-    /// # Safety
-    ///
-    /// This function has the same safety preconditions and semantics as [`ptr::drop_in_place`]. It
-    /// must be safe to drop the value pointed to by `ptr`.
-    ///
-    /// [`ptr::drop_in_place`]: core::ptr::drop_in_place
-    unsafe fn collect(&self, ptr: *mut T);
-}
-
-#[derive(Debug)]
-pub struct DefaultCollector;
-
-impl<T> Collector<T> for DefaultCollector {
-    #[inline(always)]
-    unsafe fn collect(&self, ptr: *mut T) {
-        // SAFETY: The caller must ensure that it is safe to drop the value.
-        unsafe { ptr.drop_in_place() }
-    }
-}
 
 #[repr(align(128))]
 struct CacheAligned;
