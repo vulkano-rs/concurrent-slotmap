@@ -891,6 +891,8 @@ impl SlotId {
         generation: NonZeroU32::MAX,
     };
 
+    pub const OCCUPIED_BIT: u32 = OCCUPIED_BIT;
+
     #[inline(always)]
     #[must_use]
     pub const fn new(index: u32, generation: u32) -> Self {
@@ -900,7 +902,16 @@ impl SlotId {
         unsafe { SlotId::new_unchecked(index, generation) }
     }
 
-    const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
+    /// # Safety
+    ///
+    /// `generation` must have its [`OCCUPIED_BIT`] set.
+    ///
+    /// [`OCCUPIED_BIT`]: Self::OCCUPIED_BIT
+    #[inline(always)]
+    #[must_use]
+    pub const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
+        debug_assert!(generation & OCCUPIED_BIT != 0);
+
         // SAFETY: The caller must ensure that the `OCCUPIED_BIT` of `generation` is set, which
         // means it must be non-zero.
         let generation = unsafe { NonZeroU32::new_unchecked(generation) };
