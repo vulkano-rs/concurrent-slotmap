@@ -981,7 +981,7 @@ impl Key for SlotId {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 #[repr(C, align(8))]
 pub struct SlotId {
     #[cfg(target_endian = "little")]
@@ -1046,6 +1046,16 @@ impl SlotId {
     #[inline]
     fn as_u64(self) -> u64 {
         u64::from(self.index) | u64::from(self.generation.get()) << 32
+    }
+}
+
+impl fmt::Debug for SlotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::INVALID {
+            f.pad("INVALID")
+        } else {
+            write!(f, "{}v{}", self.index, self.generation.get())
+        }
     }
 }
 
