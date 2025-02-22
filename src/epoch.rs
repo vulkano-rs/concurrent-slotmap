@@ -65,6 +65,7 @@ impl GlobalHandle {
 
     /// Returns the global epoch.
     #[inline]
+    #[must_use]
     pub fn epoch(&self) -> u32 {
         self.global().epoch.load(Relaxed)
     }
@@ -413,6 +414,7 @@ impl<'a> From<Guard<'a>> for Cow<'_, Guard<'a>> {
 /// such as the local epoch being already pinned or that all accesses are externally synchronized
 /// (for example through the use of a `Mutex` or by being single-threaded).
 #[inline]
+#[must_use]
 pub const unsafe fn unprotected() -> &'static Guard<'static> {
     // SAFETY: The caller must enforce the safety contract.
     const GUARD: ManuallyDrop<Guard<'_>> = ManuallyDrop::new(unsafe { Guard::unprotected() });
