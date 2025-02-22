@@ -649,11 +649,8 @@ impl<T> SlotMap<T> {
         Some(unsafe { refs.assume_init() })
     }
 
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    #[inline(always)]
-    pub fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
+    #[cfg(test)]
+    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a T> {
         self.check_guard(guard);
 
         let slot = self.slots.get(index as usize)?;
@@ -672,36 +669,19 @@ impl<T> SlotMap<T> {
         }
     }
 
-    #[inline(always)]
-    pub fn index_mut(&mut self, index: u32) -> Option<&mut T> {
-        let slot = self.slots.get_mut(index as usize)?;
-        let generation = *slot.generation.get_mut();
-
-        if generation & OCCUPIED_BIT != 0 {
-            // SAFETY:
-            // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that the slot is occupied, which means that it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
-            Some(unsafe { slot.value_unchecked_mut() })
-        } else {
-            None
-        }
-    }
-
     /// # Safety
     ///
-    /// `index` must be in bounds of the slots vector and the slot must have been initialized and
-    /// must not be free.
+    /// The slot must be currently occupied.
     ///
     /// # Panics
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
-    pub unsafe fn index_unchecked<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> &'a T {
+    pub unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> &'a T {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(index as usize) };
+        let slot = unsafe { self.slots.get_unchecked(id.index as usize) };
 
         let _generation = slot.generation.load(Acquire);
 
@@ -715,12 +695,11 @@ impl<T> SlotMap<T> {
 
     /// # Safety
     ///
-    /// `index` must be in bounds of the slots vector and the slot must have been initialized and
-    /// must not be free.
+    /// The slot must be currently occupied.
     #[inline(always)]
-    pub unsafe fn index_unchecked_mut(&mut self, index: u32) -> &mut T {
+    pub unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut T {
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked_mut(index as usize) };
+        let slot = unsafe { self.slots.get_unchecked_mut(id.index as usize) };
 
         // SAFETY:
         // * The mutable reference makes sure that access to the slot is synchronized.
