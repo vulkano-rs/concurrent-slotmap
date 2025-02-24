@@ -34,7 +34,7 @@ const TAG_BITS: u32 = 8;
 /// The mask for tagged generations.
 const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
 
-/// The bit used to signify that a slot is occupied.
+/// The bit of the generation used to signify that the slot is occupied.
 const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
 
 pub struct SlotMap<K, V> {
@@ -996,6 +996,10 @@ impl SlotId {
         index: u32::MAX,
         generation: NonZeroU32::MAX,
     };
+
+    pub const TAG_BITS: u32 = TAG_BITS;
+
+    pub const TAG_MASK: u32 = TAG_MASK;
 
     pub const OCCUPIED_BIT: u32 = OCCUPIED_BIT;
 
