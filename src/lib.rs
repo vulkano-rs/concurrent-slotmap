@@ -1056,10 +1056,17 @@ impl SlotId {
 impl fmt::Debug for SlotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if *self == Self::INVALID {
-            f.pad("INVALID")
-        } else {
-            write!(f, "{}v{}", self.index, self.generation.get())
+            return f.write_str("INVALID");
         }
+
+        let generation = self.generation.get();
+        write!(f, "{}v{}", self.index, generation >> (TAG_BITS + 1))?;
+
+        if generation & !TAG_BITS != 0 {
+            write!(f, "t{}", generation & TAG_MASK)?;
+        }
+
+        Ok(())
     }
 }
 
