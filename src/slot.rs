@@ -281,15 +281,15 @@ impl<T> DerefMut for Vec<T> {
     }
 }
 
-pub(crate) struct Slot<T> {
+pub(crate) struct Slot<V> {
     pub generation: AtomicU32,
     pub next_free: AtomicU32,
-    pub value: UnsafeCell<MaybeUninit<T>>,
+    pub value: UnsafeCell<MaybeUninit<V>>,
 }
 
-impl<T> Slot<T> {
+impl<V> Slot<V> {
     #[inline(always)]
-    pub unsafe fn value_unchecked(&self) -> &T {
+    pub unsafe fn value_unchecked(&self) -> &V {
         // SAFETY: The caller must ensure that access to the cell's inner value is synchronized.
         let value = unsafe { &*self.value.get() };
 
@@ -298,7 +298,7 @@ impl<T> Slot<T> {
     }
 
     #[inline(always)]
-    pub unsafe fn value_unchecked_mut(&mut self) -> &mut T {
+    pub unsafe fn value_unchecked_mut(&mut self) -> &mut V {
         // SAFETY: The caller must ensure that the slot has been initialized.
         unsafe { self.value.get_mut().assume_init_mut() }
     }

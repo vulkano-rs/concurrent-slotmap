@@ -901,13 +901,20 @@ impl<V> SlotMapInner<V> {
     }
 }
 
-impl<K, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
+impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Slots;
+        struct Slots<'a, K, V>(&'a SlotMap<K, V>);
 
-        impl fmt::Debug for Slots {
+        impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for Slots<'_, K, V> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.pad("[..]")
+                let guard = &self.0.global().register_local().into_inner().pin();
+                let mut debug = f.debug_map();
+
+                for (k, v) in self.0.iter(guard) {
+                    debug.entry(&k, v);
+                }
+
+                debug.finish()
             }
         }
 
@@ -948,10 +955,8 @@ impl<K, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
             }
         }
 
-        fn inner<V>(map: &SlotMapInner<V>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let mut debug = f.debug_struct("SlotMap");
+        fn inner<V>(map: &SlotMapInner<V>, mut debug: fmt::DebugStruct<'_, '_>) -> fmt::Result {
             debug
-                .field("slots", &Slots)
                 .field("len", &map.len)
                 .field("global", &map.global)
                 .field("free_list", &List(map, map.free_list.load(Acquire)))
@@ -966,7 +971,10 @@ impl<K, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
             debug.finish()
         }
 
-        inner(&self.inner, f)
+        let mut debug = f.debug_struct("SlotMap");
+        debug.field("slots", &Slots(self));
+
+        inner(&self.inner, debug)
     }
 }
 
@@ -1120,7 +1128,7 @@ impl fmt::Debug for SlotId {
         let generation = self.generation.get();
         write!(f, "{}v{}", self.index, generation >> (TAG_BITS + 1))?;
 
-        if generation & !TAG_BITS != 0 {
+        if generation & TAG_MASK != 0 {
             write!(f, "t{}", generation & TAG_MASK)?;
         }
 
