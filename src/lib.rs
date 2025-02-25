@@ -82,7 +82,7 @@ struct SlotMapInner<V> {
 }
 
 // SAFETY: `SlotMap` is an owned collection, which makes it safe to send to another thread as long
-// as the value is safe to send to another a thread. The key is a phantom parameter.
+// as the value is safe to send to another thread. The key is a phantom parameter.
 unsafe impl<K, V: Send> Send for SlotMap<K, V> {}
 
 // SAFETY: `SlotMap` allows pushing through a shared reference, which allows a shared `SlotMap` to

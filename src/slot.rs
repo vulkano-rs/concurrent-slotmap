@@ -29,13 +29,10 @@ impl<T> Vec<T> {
     pub fn try_new(max_capacity: u32) -> Result<Self, TryReserveError> {
         assert!(mem::align_of::<Slot<T>>() <= page_size());
 
-        let size = align_up(
-            usize::try_from(max_capacity)
-                .ok()
-                .and_then(|cap| cap.checked_mul(mem::size_of::<Slot<T>>()))
-                .ok_or(CapacityOverflow)?,
-            page_size(),
-        );
+        let size = usize::try_from(max_capacity)
+            .ok()
+            .and_then(|cap| cap.checked_mul(mem::size_of::<Slot<T>>()))
+            .ok_or(CapacityOverflow)?;
 
         #[allow(clippy::cast_possible_wrap)]
         if size > isize::MAX as usize {
@@ -46,7 +43,7 @@ impl<T> Vec<T> {
             return Ok(Self::dangling(max_capacity));
         }
 
-        let allocation = Allocation::new(size).map_err(AllocError)?;
+        let allocation = Allocation::new(align_up(size, page_size())).map_err(AllocError)?;
 
         Ok(Vec {
             allocation,
