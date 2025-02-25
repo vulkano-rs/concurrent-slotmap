@@ -44,6 +44,15 @@ pub struct SlotMap<K, V> {
 
 #[repr(C)]
 struct SlotMapInner<V> {
+    /// ```compile_fail,E0597
+    /// let map = concurrent_slotmap::SlotMap::<_, &'static str>::new(1);
+    /// let guard = &map.global().register_local().into_inner().pin();
+    /// let id = {
+    ///     let s = "oh no".to_owned();
+    ///     map.insert(&s, guard)
+    /// };
+    /// dbg!(map.get(id, guard));
+    /// ```
     slots: Vec<V>,
     len: AtomicU32,
     global: epoch::GlobalHandle,
