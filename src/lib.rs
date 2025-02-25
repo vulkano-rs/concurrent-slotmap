@@ -152,7 +152,31 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> K {
-        K::from_id(self.inner.insert_with_tag(value, tag, guard))
+        self.insert_with_tag_with(tag, guard, |_| value)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    #[inline]
+    pub fn insert_with<'a>(&'a self, guard: &'a epoch::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
+        self.insert_with_tag_with(0, guard, f)
+    }
+
+    /// # Panics
+    ///
+    /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// - Panics if `tag` has more than the low 8 bits set.
+    #[inline]
+    pub fn insert_with_tag_with<'a>(
+        &'a self,
+        tag: u32,
+        guard: &'a epoch::Guard<'a>,
+        f: impl FnOnce(K) -> V,
+    ) -> K {
+        let f = |id| f(K::from_id(id));
+
+        K::from_id(self.inner.insert_with_tag_with(tag, guard, f))
     }
 
     #[inline]
@@ -165,7 +189,22 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
-        K::from_id(self.inner.insert_with_tag_mut(value, tag))
+        self.insert_with_tag_with_mut(tag, |_| value)
+    }
+
+    #[inline]
+    pub fn insert_with_mut(&mut self, f: impl FnOnce(K) -> V) -> K {
+        self.insert_with_tag_with_mut(0, f)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `tag` has more than the low 8 bits set.
+    #[inline]
+    pub fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(K) -> V) -> K {
+        let f = |id| f(K::from_id(id));
+
+        K::from_id(self.inner.insert_with_tag_with_mut(tag, f))
     }
 
     /// # Panics
@@ -288,7 +327,12 @@ impl<K: Key, V> SlotMap<K, V> {
 }
 
 impl<V> SlotMapInner<V> {
-    fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> SlotId {
+    fn insert_with_tag_with<'a>(
+        &'a self,
+        tag: u32,
+        guard: &'a epoch::Guard<'a>,
+        f: impl FnOnce(SlotId) -> V,
+    ) -> SlotId {
         self.check_guard(guard);
         assert_eq!(tag & !TAG_MASK, 0);
 
@@ -311,22 +355,26 @@ impl<V> SlotMapInner<V> {
                 .compare_exchange_weak(free_list_head, next_free, Release, Acquire)
             {
                 Ok(_) => {
-                    // SAFETY: `SlotMap::remove[_mut]` guarantees that the free-list only contains
-                    // slots that are no longer read by any threads, and we have removed the slot
-                    // from the free-list such that no other threads can be writing the same slot.
-                    unsafe { slot.value.get().cast::<V>().write(value) };
-
-                    let new_generation = slot
+                    let generation = slot
                         .generation
-                        .fetch_add(OCCUPIED_BIT | tag, Release)
+                        .load(Relaxed)
                         .wrapping_add(OCCUPIED_BIT | tag);
-
-                    self.len.fetch_add(1, Relaxed);
 
                     // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its
                     // generation's `OCCUPIED_BIT` unset, and since we incremented the generation,
                     // the bit must have been flipped again.
-                    return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+                    let id = unsafe { SlotId::new_unchecked(free_list_head, generation) };
+
+                    // SAFETY: `SlotMap::remove[_mut]` guarantees that the free-list only contains
+                    // slots that are no longer read by any threads, and we have removed the slot
+                    // from the free-list such that no other threads can be writing the same slot.
+                    unsafe { slot.value.get().cast::<V>().write(f(id)) };
+
+                    slot.generation.store(generation, Release);
+
+                    self.len.fetch_add(1, Relaxed);
+
+                    return id;
                 }
                 Err(new_head) => {
                     free_list_head = new_head;
@@ -335,15 +383,14 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        let index = self.slots.push_with_tag(value, tag);
+        let id = self.slots.push_with_tag_with(tag, f);
 
         self.len.fetch_add(1, Relaxed);
 
-        // SAFETY: The `OCCUPIED_BIT` is set.
-        unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
+        id
     }
 
-    fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> SlotId {
+    fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
         let free_list_head = *self.free_list.get_mut();
@@ -353,28 +400,29 @@ impl<V> SlotMapInner<V> {
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
 
-            let new_generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT | tag);
-
-            *slot.generation.get_mut() = new_generation;
-
             *self.free_list.get_mut() = *slot.next_free.get_mut();
 
-            *slot.value.get_mut() = MaybeUninit::new(value);
-
-            *self.len.get_mut() += 1;
+            let generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT | tag);
 
             // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
             // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
             // flipped again.
-            return unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+            let id = unsafe { SlotId::new_unchecked(free_list_head, generation) };
+
+            *slot.value.get_mut() = MaybeUninit::new(f(id));
+
+            *slot.generation.get_mut() = generation;
+
+            *self.len.get_mut() += 1;
+
+            return id;
         }
 
-        let index = self.slots.push_with_tag_mut(value, tag);
+        let id = self.slots.push_with_tag_with_mut(tag, f);
 
         *self.len.get_mut() += 1;
 
-        // SAFETY: The `OCCUPIED_BIT` is set.
-        unsafe { SlotId::new_unchecked(index, OCCUPIED_BIT | tag) }
+        id
     }
 
     fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {

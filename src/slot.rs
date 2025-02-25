@@ -1,4 +1,4 @@
-use crate::OCCUPIED_BIT;
+use crate::{SlotId, OCCUPIED_BIT};
 use core::{
     cell::UnsafeCell,
     cmp, fmt,
@@ -115,9 +115,7 @@ impl<T> Vec<T> {
         *self.capacity.get_mut()
     }
 
-    // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn push_with_tag(&self, value: T, tag: u32) -> u32 {
+    pub fn push_with_tag_with(&self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
         // This cannot overflow because our capacity can never exceed `isize::MAX` bytes, and
         // because `self.reserve_for_push()` resets `self.reserved_len` back to `self.max_capacity`
         // if it was overshot.
@@ -130,19 +128,25 @@ impl<T> Vec<T> {
         // SAFETY: We made sure that the index is in bounds above.
         let slot = unsafe { self.get_unchecked(index) };
 
+        // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = index as u32;
+        let generation = OCCUPIED_BIT | tag;
+
+        // SAFETY: The `OCCUPIED_BIT` is set.
+        let id = unsafe { SlotId::new_unchecked(index, generation) };
+
         // SAFETY: We reserved an index by incrementing `self.reserved_len`, which means that no
         // other threads can be attempting to write to this same slot. No other threads can be
         // reading this slot either until we update the generation below.
-        unsafe { slot.value.get().cast::<T>().write(value) };
+        unsafe { slot.value.get().cast::<T>().write(f(id)) };
 
-        slot.generation.store(OCCUPIED_BIT | tag, Release);
+        slot.generation.store(generation, Release);
 
-        index as u32
+        id
     }
 
-    // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn push_with_tag_mut(&mut self, value: T, tag: u32) -> u32 {
+    pub fn push_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
         let index = *self.reserved_len.get_mut();
 
         // This cannot overflow because our capacity can never exceed `isize::MAX` bytes, and
@@ -157,11 +161,19 @@ impl<T> Vec<T> {
         // SAFETY: We made sure that the index is in bounds above.
         let slot = unsafe { self.get_unchecked_mut(index) };
 
-        slot.value.get_mut().write(value);
+        // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = index as u32;
+        let generation = OCCUPIED_BIT | tag;
 
-        *slot.generation.get_mut() = OCCUPIED_BIT | tag;
+        // SAFETY: The `OCCUPIED_BIT` is set.
+        let id = unsafe { SlotId::new_unchecked(index, generation) };
 
-        index as u32
+        slot.value.get_mut().write(f(id));
+
+        *slot.generation.get_mut() = generation;
+
+        id
     }
 
     #[inline(never)]
