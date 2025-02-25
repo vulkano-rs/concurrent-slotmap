@@ -11,7 +11,7 @@ use core::{
     hint,
     iter::{self, FusedIterator},
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{self, MaybeUninit},
     num::NonZeroU32,
     panic::{RefUnwindSafe, UnwindSafe},
     slice,
@@ -356,7 +356,7 @@ impl<V> SlotMapInner<V> {
 
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
-            let slot = unsafe { self.slots.get_unchecked(free_list_head as usize) };
+            let slot = unsafe { self.slots.get_unchecked(free_list_head) };
 
             let next_free = slot.next_free.load(Relaxed);
 
@@ -408,7 +408,7 @@ impl<V> SlotMapInner<V> {
         if free_list_head != NIL {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
-            let slot = unsafe { self.slots.get_unchecked_mut(free_list_head as usize) };
+            let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
 
             *self.free_list.get_mut() = *slot.next_free.get_mut();
 
@@ -447,7 +447,7 @@ impl<V> SlotMapInner<V> {
 
     unsafe fn defer_destroy(&self, index: u32) {
         // SAFETY: The caller must ensure that `index` is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(index as usize) };
+        let slot = unsafe { self.slots.get_unchecked(index) };
 
         atomic::fence(SeqCst);
 
@@ -562,7 +562,7 @@ impl<V> SlotMapInner<V> {
         loop {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
-            queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail as usize) };
+            queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail) };
 
             let ptr = queued_tail_slot.value.get().cast::<V>();
 
@@ -601,7 +601,7 @@ impl<V> SlotMapInner<V> {
     }
 
     fn remove_mut(&mut self, id: SlotId) -> Option<V> {
-        let slot = self.slots.get_mut(id.index as usize)?;
+        let slot = self.slots.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
@@ -631,7 +631,7 @@ impl<V> SlotMapInner<V> {
     fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(index as usize)?;
+        let slot = self.slots.get(index)?;
         let mut generation = slot.generation.load(Relaxed);
         let mut backoff = Backoff::new();
 
@@ -674,7 +674,7 @@ impl<V> SlotMapInner<V> {
     fn invalidate<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(id.index as usize)?;
+        let slot = self.slots.get(id.index)?;
         let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
 
         // This works thanks to the invariant of `SlotId` that the `OCCUPIED_BIT` of its generation
@@ -702,7 +702,7 @@ impl<V> SlotMapInner<V> {
 
     unsafe fn remove_unchecked(&self, id: SlotId) -> V {
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index as usize) };
+        let slot = unsafe { self.slots.get_unchecked(id.index) };
 
         // SAFETY: The caller must ensure that the slot is initialized and that no other threads can
         // be accessing the slot.
@@ -731,7 +731,7 @@ impl<V> SlotMapInner<V> {
     fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(id.index as usize)?;
+        let slot = self.slots.get(id.index)?;
         let generation = slot.generation.load(Acquire);
 
         if generation == id.generation() {
@@ -752,7 +752,7 @@ impl<V> SlotMapInner<V> {
 
     #[inline(always)]
     fn get_mut(&mut self, id: SlotId) -> Option<&mut V> {
-        let slot = self.slots.get_mut(id.index as usize)?;
+        let slot = self.slots.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
@@ -800,7 +800,6 @@ impl<V> SlotMapInner<V> {
         &mut self,
         ids: [SlotId; N],
     ) -> Option<[&mut V; N]> {
-        let slots_ptr = self.slots.as_mut_ptr();
         let mut refs = MaybeUninit::<[&mut V; N]>::uninit();
         let refs_ptr = refs.as_mut_ptr().cast::<&mut V>();
 
@@ -808,12 +807,16 @@ impl<V> SlotMapInner<V> {
             // SAFETY: `i` is in bounds of the array.
             let id = unsafe { ids.get_unchecked(i) };
 
-            // SAFETY: The caller must ensure that `ids` contains only IDs whose indices are in
-            // bounds of the slots vector.
-            let slot = unsafe { slots_ptr.add(id.index() as usize) };
+            // SAFETY:
+            // * The caller must ensure that `ids` contains only IDs whose indices are in bounds of
+            //   the slots vector.
+            // * The caller must ensure that `ids` contains only IDs with disjunct indices.
+            let slot = unsafe { self.slots.get_unchecked_mut(id.index()) };
 
-            // SAFETY: The caller must ensure that `ids` contains only IDs with disjunct indices.
-            let slot = unsafe { &mut *slot };
+            // SAFETY: We unbind the lifetime to convince the borrow checker that we don't
+            // repeatedly borrow from `self.slots`. We don't for the same reasons as above.
+            // `Vec::get_unchecked_mut` also only borrows the one element and not the whole `Vec`.
+            let slot = unsafe { mem::transmute::<&mut Slot<V>, &mut Slot<V>>(slot) };
 
             let generation = *slot.generation.get_mut();
 
@@ -842,7 +845,7 @@ impl<V> SlotMapInner<V> {
     fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(index as usize)?;
+        let slot = self.slots.get(index)?;
         let generation = slot.generation.load(Acquire);
 
         if generation & OCCUPIED_BIT != 0 {
@@ -863,7 +866,7 @@ impl<V> SlotMapInner<V> {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index as usize) };
+        let slot = unsafe { self.slots.get_unchecked(id.index) };
 
         let _generation = slot.generation.load(Acquire);
 
@@ -878,7 +881,7 @@ impl<V> SlotMapInner<V> {
     #[inline(always)]
     unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut V {
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked_mut(id.index as usize) };
+        let slot = unsafe { self.slots.get_unchecked_mut(id.index) };
 
         // SAFETY:
         // * The mutable reference makes sure that access to the slot is synchronized.
@@ -930,7 +933,7 @@ impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
 
                     // SAFETY: We always push indices of existing slots into the free-lists and the
                     // slots vector never shrinks, therefore the index must have staid in bounds.
-                    let slot = unsafe { self.0.slots.get_unchecked(head as usize) };
+                    let slot = unsafe { self.0.slots.get_unchecked(head) };
 
                     head = slot.next_free.load(Acquire);
                 }
@@ -990,7 +993,7 @@ impl<V> Drop for SlotMapInner<V> {
             while head != NIL {
                 // SAFETY: We always push indices of existing slots into the free-lists and the
                 // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked_mut(head as usize) };
+                let slot = unsafe { self.slots.get_unchecked_mut(head) };
 
                 let ptr = slot.value.get_mut().as_mut_ptr();
 
@@ -1003,7 +1006,7 @@ impl<V> Drop for SlotMapInner<V> {
             }
         }
 
-        for slot in self.slots.as_mut_slice() {
+        for slot in self.slots.iter_mut() {
             if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
                 let ptr = slot.value.get_mut().as_mut_ptr();
 

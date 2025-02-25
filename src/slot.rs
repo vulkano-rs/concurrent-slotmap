@@ -4,7 +4,6 @@ use core::{
     cmp, fmt,
     marker::PhantomData,
     mem::{self, MaybeUninit},
-    ops::{Deref, DerefMut},
     slice,
     sync::atomic::{
         AtomicU32, AtomicUsize,
@@ -70,37 +69,22 @@ impl<T> Vec<T> {
         }
     }
 
-    pub fn as_slice(&self) -> &[Slot<T>] {
-        let capacity = self.capacity.load(Acquire) as usize;
-
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
-        // `Slot<T>` as it allows being zeroed. The `Acquire` ordering above synchronizes with the
-        // `Release` ordering when setting the capacity, making sure that the reserved capacity is
-        // visible here.
-        unsafe { slice::from_raw_parts(self.as_ptr(), capacity) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [Slot<T>] {
-        let capacity = self.capacity_mut() as usize;
-
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
-        // `Slot<T>` as it allows being zeroed. The mutable reference ensures synchronization in
-        // this case.
-        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), capacity) }
-    }
-
-    pub fn as_ptr(&self) -> *const Slot<T> {
+    #[inline]
+    fn as_ptr(&self) -> *const Slot<T> {
         self.allocation.ptr().cast()
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut Slot<T> {
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut Slot<T> {
         self.allocation.ptr().cast()
     }
 
+    #[inline]
     pub fn capacity(&self) -> u32 {
         self.capacity.load(Relaxed)
     }
 
+    #[inline]
     pub fn capacity_mut(&mut self) -> u32 {
         *self.capacity.get_mut()
     }
@@ -115,13 +99,13 @@ impl<T> Vec<T> {
             self.reserve_for_push(index);
         }
 
-        // SAFETY: We made sure that the index is in bounds above.
-        let slot = unsafe { self.get_unchecked(index) };
-
         // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
         #[allow(clippy::cast_possible_truncation)]
         let index = index as u32;
         let generation = OCCUPIED_BIT | tag;
+
+        // SAFETY: We made sure that the index is in bounds above.
+        let slot = unsafe { self.get_unchecked(index) };
 
         // SAFETY: The `OCCUPIED_BIT` is set.
         let id = unsafe { SlotId::new_unchecked(index, generation) };
@@ -148,13 +132,13 @@ impl<T> Vec<T> {
             self.reserve_for_push(index);
         }
 
-        // SAFETY: We made sure that the index is in bounds above.
-        let slot = unsafe { self.get_unchecked_mut(index) };
-
         // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
         #[allow(clippy::cast_possible_truncation)]
         let index = index as u32;
         let generation = OCCUPIED_BIT | tag;
+
+        // SAFETY: We made sure that the index is in bounds above.
+        let slot = unsafe { self.get_unchecked_mut(index) };
 
         // SAFETY: The `OCCUPIED_BIT` is set.
         let id = unsafe { SlotId::new_unchecked(index, generation) };
@@ -199,6 +183,82 @@ impl<T> Vec<T> {
             new_capacity,
             mem::size_of::<Slot<T>>(),
         )
+    }
+
+    #[inline]
+    pub fn get(&self, index: u32) -> Option<&Slot<T>> {
+        let capacity = self.capacity.load(Acquire);
+
+        if index >= capacity {
+            return None;
+        }
+
+        // SAFETY: We checked that the index is in bounds above.
+        let ptr = unsafe { self.as_ptr().add(index as usize) };
+
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // `Slot<T>` as it allows being zeroed. The `Acquire` ordering above synchronizes with the
+        // `Release` ordering when setting the capacity, making sure that the reserved capacity is
+        // visible here.
+        Some(unsafe { &*ptr })
+    }
+
+    #[inline]
+    pub unsafe fn get_unchecked(&self, index: u32) -> &Slot<T> {
+        let _capacity = self.capacity.load(Acquire);
+
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let ptr = unsafe { self.as_ptr().add(index as usize) };
+
+        // SAFETY: Same as in `get` above.
+        unsafe { &*ptr }
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, index: u32) -> Option<&mut Slot<T>> {
+        let capacity = self.capacity_mut();
+
+        if index >= capacity {
+            return None;
+        }
+
+        // SAFETY: We checked that the index is in bounds above.
+        let ptr = unsafe { self.as_mut_ptr().add(index as usize) };
+
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // `Slot<T>` as it allows being zeroed. The mutable reference ensures synchronization in
+        // this case.
+        Some(unsafe { &mut *ptr })
+    }
+
+    #[inline]
+    pub unsafe fn get_unchecked_mut(&mut self, index: u32) -> &mut Slot<T> {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let ptr = unsafe { self.as_mut_ptr().add(index as usize) };
+
+        // SAFETY: Same as in `get_mut` above.
+        unsafe { &mut *ptr }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> slice::Iter<'_, Slot<T>> {
+        let capacity = self.capacity.load(Acquire) as usize;
+
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // `Slot<T>` as it allows being zeroed. The `Acquire` ordering above synchronizes with the
+        // `Release` ordering when setting the capacity, making sure that the reserved capacity is
+        // visible here.
+        unsafe { slice::from_raw_parts(self.as_ptr(), capacity) }.iter()
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> slice::IterMut<'_, Slot<T>> {
+        let capacity = self.capacity_mut() as usize;
+
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // `Slot<T>` as it allows being zeroed. The mutable reference ensures synchronization in
+        // this case.
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), capacity) }.iter_mut()
     }
 }
 
@@ -263,22 +323,6 @@ fn capacity_overflow() -> ! {
 #[cold]
 fn handle_alloc_error(err: Error) -> ! {
     panic!("allocation failed: {err}");
-}
-
-impl<T> Deref for Vec<T> {
-    type Target = [Slot<T>];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-impl<T> DerefMut for Vec<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_mut_slice()
-    }
 }
 
 pub(crate) struct Slot<V> {
