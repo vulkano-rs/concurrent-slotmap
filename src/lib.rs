@@ -1057,6 +1057,13 @@ pub struct SlotId {
     index: u32,
 }
 
+impl Default for SlotId {
+    #[inline]
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
 impl SlotId {
     pub const INVALID: Self = SlotId {
         index: u32::MAX,
