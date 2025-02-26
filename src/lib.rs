@@ -1214,6 +1214,14 @@ pub struct Iter<'a, K, V> {
     marker: PhantomData<fn(K) -> K>,
 }
 
+// SAFETY: `Iter` semantically holds a reference to all values, and references are safe to send to
+// another thread as long as the value is `Sync`. The key is a phantom parameter.
+unsafe impl<K, V: Sync> Send for Iter<'_, K, V> {}
+
+// SAFETY: `Iter` semantically holds a reference to all values, and references are safe to share
+// among threads as long as the value is `Sync`. The key is a phantom parameter.
+unsafe impl<K, V: Sync> Sync for Iter<'_, K, V> {}
+
 impl<K, V: fmt::Debug> fmt::Debug for Iter<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iter").finish_non_exhaustive()
@@ -1291,6 +1299,15 @@ pub struct IterMut<'a, K, V> {
     slots: iter::Enumerate<slice::IterMut<'a, Slot<V>>>,
     marker: PhantomData<fn(K) -> K>,
 }
+
+// SAFETY: `IterMut` semantically holds a mutable reference to all values, and mutable references
+// are safe to send to another thread as long as the value is `Send`. The key is a phantom
+// parameter.
+unsafe impl<K, V: Send> Send for IterMut<'_, K, V> {}
+
+// SAFETY: `IterMut` semantically holds a mutable reference to all values, and mutable references
+// are safe to share among threads as long as the value is `Sync`. The key is a phantom parameter.
+unsafe impl<K, V: Sync> Sync for IterMut<'_, K, V> {}
 
 impl<K, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
