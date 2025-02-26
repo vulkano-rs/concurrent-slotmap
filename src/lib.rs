@@ -171,7 +171,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> K {
-        self.insert_with_tag_with(tag, guard, |_| value)
+        K::from_id(self.inner.insert_with_tag_with(tag, guard, |_| value))
     }
 
     /// # Panics
@@ -208,7 +208,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
-        self.insert_with_tag_with_mut(tag, |_| value)
+        K::from_id(self.inner.insert_with_tag_with_mut(tag, |_| value))
     }
 
     #[inline]
