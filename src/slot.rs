@@ -4,6 +4,7 @@ use core::{
     cmp, fmt,
     marker::PhantomData,
     mem::{self, MaybeUninit},
+    panic::{RefUnwindSafe, UnwindSafe},
     slice,
     sync::atomic::{
         AtomicU32, AtomicUsize,
@@ -327,6 +328,9 @@ pub(crate) struct Slot<V> {
     pub next_free: AtomicU32,
     pub value: UnsafeCell<MaybeUninit<V>>,
 }
+
+impl<V: UnwindSafe> UnwindSafe for Slot<V> {}
+impl<V: RefUnwindSafe> RefUnwindSafe for Slot<V> {}
 
 impl<V> Slot<V> {
     #[inline(always)]

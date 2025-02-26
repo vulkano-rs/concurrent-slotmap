@@ -18,6 +18,7 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::{self, ManuallyDrop},
+    panic::RefUnwindSafe,
     ptr::{self, NonNull},
     sync::atomic::{
         self, AtomicBool, AtomicU32, AtomicUsize,
@@ -447,6 +448,10 @@ struct Global {
 // SAFETY: Access to the linked list of locals is synchronized with a mutex.
 unsafe impl Sync for Global {}
 
+// While `Global` does contain a lock and/or interior mutability, this is never exposed to the user
+// and no invariant can be broken.
+impl RefUnwindSafe for Global {}
+
 impl Global {
     fn register() -> GlobalHandle {
         let global = Box::new(Global {
@@ -575,6 +580,10 @@ struct Local {
     /// The number of pinnings this participant has gone through in total.
     pin_count: Cell<usize>,
 }
+
+// While `Local` does contain interior mutability, this is never exposed to the user and no
+// invariant can be broken.
+impl RefUnwindSafe for Local {}
 
 impl Local {
     #[inline(never)]

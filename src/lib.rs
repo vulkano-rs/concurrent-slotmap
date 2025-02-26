@@ -13,7 +13,6 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     num::NonZeroU32,
-    panic::{RefUnwindSafe, UnwindSafe},
     slice,
     sync::atomic::{
         self, AtomicU32, AtomicU64,
@@ -90,9 +89,6 @@ unsafe impl<K, V: Send> Send for SlotMap<K, V> {}
 // any value from any thread. Therefore, it is safe to share `SlotMap` between threads as long as
 // the value is both sendable and shareable. The key is a phantom parameter.
 unsafe impl<K, V: Send + Sync> Sync for SlotMap<K, V> {}
-
-impl<K, V> UnwindSafe for SlotMap<K, V> {}
-impl<K, V> RefUnwindSafe for SlotMap<K, V> {}
 
 impl<V> SlotMap<SlotId, V> {
     #[must_use]
