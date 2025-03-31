@@ -120,7 +120,7 @@ impl<K, V> SlotMap<K, V> {
                 _alignment2: CacheAligned,
                 free_list_queue: [
                     AtomicU64::new(u64::from(NIL)),
-                    AtomicU64::new(u64::from(NIL) | 2 << 32),
+                    AtomicU64::new(u64::from(NIL)),
                 ],
             },
             marker: PhantomData,
@@ -469,7 +469,7 @@ impl<V> SlotMapInner<V> {
             if epoch_interval == 0 {
                 slot.next_free.store(queued_head, Relaxed);
 
-                let new_state = u64::from(index) | u64::from(queued_epoch) << 32;
+                let new_state = u64::from(index) | (u64::from(queued_epoch) << 32);
 
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
@@ -489,7 +489,7 @@ impl<V> SlotMapInner<V> {
 
                 slot.next_free.store(NIL, Relaxed);
 
-                let new_state = u64::from(index) | u64::from(epoch) << 32;
+                let new_state = u64::from(index) | (u64::from(epoch) << 32);
 
                 match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
                     Ok(_) => {
@@ -533,7 +533,7 @@ impl<V> SlotMapInner<V> {
 
             debug_assert!(!global_epoch_is_behind_queue);
 
-            let new_state = u64::from(NIL) | u64::from(queued_epoch) << 32;
+            let new_state = u64::from(NIL) | (u64::from(queued_epoch) << 32);
 
             match queued_list.compare_exchange_weak(queued_state, new_state, Relaxed, Acquire) {
                 Ok(_) => {
@@ -1130,7 +1130,7 @@ impl SlotId {
 
     #[inline]
     fn as_u64(self) -> u64 {
-        u64::from(self.index) | u64::from(self.generation.get()) << 32
+        u64::from(self.index) | (u64::from(self.generation.get()) << 32)
     }
 }
 
@@ -1409,21 +1409,21 @@ mod tests {
         let x = map.insert(69, guard);
         let y = map.insert(42, guard);
 
-        assert_eq!(map.get(x, guard).as_deref(), Some(&69));
-        assert_eq!(map.get(y, guard).as_deref(), Some(&42));
+        assert_eq!(map.get(x, guard), Some(&69));
+        assert_eq!(map.get(y, guard), Some(&42));
 
         map.remove(x, guard);
 
         let x2 = map.insert(12, guard);
 
-        assert_eq!(map.get(x2, guard).as_deref(), Some(&12));
-        assert_eq!(map.get(x, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard), Some(&12));
+        assert_eq!(map.get(x, guard), None);
 
         map.remove(y, guard);
         map.remove(x2, guard);
 
-        assert_eq!(map.get(y, guard).as_deref(), None);
-        assert_eq!(map.get(x2, guard).as_deref(), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(x2, guard), None);
     }
 
     #[test]
@@ -1435,39 +1435,39 @@ mod tests {
         let y = map.insert(2, guard);
         let z = map.insert(3, guard);
 
-        assert_eq!(map.get(x, guard).as_deref(), Some(&1));
-        assert_eq!(map.get(y, guard).as_deref(), Some(&2));
-        assert_eq!(map.get(z, guard).as_deref(), Some(&3));
+        assert_eq!(map.get(x, guard), Some(&1));
+        assert_eq!(map.get(y, guard), Some(&2));
+        assert_eq!(map.get(z, guard), Some(&3));
 
         map.remove(y, guard);
 
         let y2 = map.insert(20, guard);
 
-        assert_eq!(map.get(y2, guard).as_deref(), Some(&20));
-        assert_eq!(map.get(y, guard).as_deref(), None);
+        assert_eq!(map.get(y2, guard), Some(&20));
+        assert_eq!(map.get(y, guard), None);
 
         map.remove(x, guard);
         map.remove(z, guard);
 
         let x2 = map.insert(10, guard);
 
-        assert_eq!(map.get(x2, guard).as_deref(), Some(&10));
-        assert_eq!(map.get(x, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard), Some(&10));
+        assert_eq!(map.get(x, guard), None);
 
         let z2 = map.insert(30, guard);
 
-        assert_eq!(map.get(z2, guard).as_deref(), Some(&30));
-        assert_eq!(map.get(x, guard).as_deref(), None);
+        assert_eq!(map.get(z2, guard), Some(&30));
+        assert_eq!(map.get(x, guard), None);
 
         map.remove(x2, guard);
 
-        assert_eq!(map.get(x2, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard), None);
 
         map.remove(y2, guard);
         map.remove(z2, guard);
 
-        assert_eq!(map.get(y2, guard).as_deref(), None);
-        assert_eq!(map.get(z2, guard).as_deref(), None);
+        assert_eq!(map.get(y2, guard), None);
+        assert_eq!(map.get(z2, guard), None);
     }
 
     #[test]
@@ -1478,12 +1478,12 @@ mod tests {
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
 
-        assert_eq!(map.get(x, guard).as_deref(), Some(&1));
-        assert_eq!(map.get(y, guard).as_deref(), Some(&2));
+        assert_eq!(map.get(x, guard), Some(&1));
+        assert_eq!(map.get(y, guard), Some(&2));
 
         let z = map.insert(3, guard);
 
-        assert_eq!(map.get(z, guard).as_deref(), Some(&3));
+        assert_eq!(map.get(z, guard), Some(&3));
 
         map.remove(x, guard);
         map.remove(z, guard);
@@ -1491,18 +1491,18 @@ mod tests {
         let z2 = map.insert(30, guard);
         let x2 = map.insert(10, guard);
 
-        assert_eq!(map.get(x2, guard).as_deref(), Some(&10));
-        assert_eq!(map.get(z2, guard).as_deref(), Some(&30));
-        assert_eq!(map.get(x, guard).as_deref(), None);
-        assert_eq!(map.get(z, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard), Some(&10));
+        assert_eq!(map.get(z2, guard), Some(&30));
+        assert_eq!(map.get(x, guard), None);
+        assert_eq!(map.get(z, guard), None);
 
         map.remove(x2, guard);
         map.remove(y, guard);
         map.remove(z2, guard);
 
-        assert_eq!(map.get(x2, guard).as_deref(), None);
-        assert_eq!(map.get(y, guard).as_deref(), None);
-        assert_eq!(map.get(z2, guard).as_deref(), None);
+        assert_eq!(map.get(x2, guard), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(z2, guard), None);
     }
 
     #[test]
@@ -1951,7 +1951,7 @@ mod tests {
 
         let x = map.insert_with_tag(42, 1, guard);
         assert_eq!(x.generation() & TAG_MASK, 1);
-        assert_eq!(map.get(x, guard).as_deref(), Some(&42));
+        assert_eq!(map.get(x, guard), Some(&42));
     }
 
     #[test]
