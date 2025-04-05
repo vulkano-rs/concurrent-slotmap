@@ -26,7 +26,9 @@
         devShells.nightly = with pkgs; mkShell {
           buildInputs = [
             (rust-bin.selectLatestNightlyWith (
-              toolchain: toolchain.default.override { extensions = [ "rust-analyzer" "rust-src" ]; }
+              toolchain: toolchain.default.override {
+                extensions = [ "miri" "rust-analyzer" "rust-src" ];
+              }
             ))
           ];
         };
