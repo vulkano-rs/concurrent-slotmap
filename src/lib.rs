@@ -64,7 +64,7 @@ pub struct SlotMap<K, V> {
 struct SlotMapInner<V> {
     /// ```compile_fail,E0597
     /// let map = concurrent_slotmap::SlotMap::<_, &'static str>::new(1);
-    /// let guard = &map.global().register_local().into_inner().pin();
+    /// let guard = &map.pin();
     /// let id = {
     ///     let s = "oh no".to_owned();
     ///     map.insert(&s, guard)

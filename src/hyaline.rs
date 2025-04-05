@@ -521,7 +521,7 @@ impl Drop for LocalBatch {
 
 fn layout_for_capacity(capacity: usize) -> Layout {
     Layout::new::<Batch>()
-        .extend(Layout::array::<Batch>(capacity).unwrap())
+        .extend(Layout::array::<Node>(capacity).unwrap())
         .unwrap()
         .0
 }
