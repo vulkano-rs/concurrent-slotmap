@@ -1,7 +1,6 @@
 #![allow(unused_unsafe, clippy::inline_always)]
 #![warn(rust_2018_idioms, missing_debug_implementations)]
 #![forbid(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
-#![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
@@ -15,33 +14,53 @@ use core::{
     num::NonZeroU32,
     slice,
     sync::atomic::{
-        self, AtomicU32, AtomicU64,
-        Ordering::{Acquire, Relaxed, Release, SeqCst},
+        AtomicU32,
+        Ordering::{Acquire, Relaxed, Release},
     },
 };
 use slot::{Slot, Vec};
 
-pub mod epoch;
+pub mod hyaline;
 mod slot;
 
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
 
-/// The number of low bits that can be used for tagged generations.
+/// The number of low bits that can be used for user-tagged generations.
 const TAG_BITS: u32 = 8;
 
-/// The mask for tagged generations.
+/// The mask for user-tagged generations.
 const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
 
-/// The bit of the generation used to signify that the slot is occupied.
-const OCCUPIED_BIT: u32 = 1 << TAG_BITS;
+/// The number of bits following the user-tag bits that are used for the state of a slot.
+const STATE_BITS: u32 = 2;
+
+/// The mask for the state of a slot.
+const STATE_MASK: u32 = 0b11 << TAG_BITS;
+
+/// The state tag used to signify that the slot is vacant.
+const VACANT_TAG: u32 = 0b00 << TAG_BITS;
+
+/// The state tag used to signify that the slot is occupied.
+const OCCUPIED_TAG: u32 = 0b01 << TAG_BITS;
+
+/// The state tag used to signify that the slot has been invalidated.
+const INVALIDATED_TAG: u32 = 0b10 << TAG_BITS;
+
+/// The state tag used to signify that the invalidated slot has been reclaimed.
+const RECLAIMED_TAG: u32 = 0b11 << TAG_BITS;
+
+/// The mask for the generation.
+const GENERATION_MASK: u32 = u32::MAX << (TAG_BITS + STATE_BITS);
+
+/// A single generation.
+const ONE_GENERATION: u32 = 1 << (TAG_BITS + STATE_BITS);
 
 pub struct SlotMap<K, V> {
     inner: SlotMapInner<V>,
     marker: PhantomData<fn(K) -> K>,
 }
 
-#[repr(C)]
 struct SlotMapInner<V> {
     /// ```compile_fail,E0597
     /// let map = concurrent_slotmap::SlotMap::<_, &'static str>::new(1);
@@ -53,31 +72,17 @@ struct SlotMapInner<V> {
     /// dbg!(map.get(id, guard));
     /// ```
     slots: Vec<V>,
-    len: AtomicU32,
-    global: epoch::GlobalHandle,
+    collector: hyaline::CollectorHandle,
+    hot_data: *mut HotData,
+}
 
-    _alignment1: CacheAligned,
-
-    /// The free-list. This is the list of slots which have already been dropped and are ready to
-    /// be claimed by insert operations.
+#[repr(align(128))]
+struct HotData {
+    /// The list of slots which have already been dropped and are ready to be claimed by insert
+    /// operations.
     free_list: AtomicU32,
-
-    _alignment2: CacheAligned,
-
-    /// Free-lists queued for inclusion in the `free_list`. Since the global epoch can only be
-    /// advanced if all pinned local epochs are pinned in the current global epoch, we only need
-    /// two free-lists in the queue: one for the current global epoch and one for the previous
-    /// epoch. This way a thread can always push a slot into list `(epoch / 2) % 2`, and whenever
-    /// the global epoch is advanced, since we know that the lag can be at most one step, we can be
-    /// certain that the list which was lagging behind before the global epoch was advanced is now
-    /// safe to drop and prepend to the `free_list`.
-    ///
-    /// The atomic packs the list's head in the lower 32 bits and the epoch of the last push in the
-    /// upper 32 bits. The epoch must not be updated if it would be going backwards; it's only
-    /// updated when the last epoch is at least 2 steps behind the local epoch, at which point -
-    /// after removing the list from the queue and updating the epoch - we can be certain that no
-    /// other threads are accessing any of the slots in the list.
-    free_list_queue: [AtomicU64; 2],
+    /// The number of occupied slots.
+    len: AtomicU32,
 }
 
 // SAFETY: `SlotMap` is an owned collection, which makes it safe to send to another thread as long
@@ -95,33 +100,24 @@ impl<V> SlotMap<SlotId, V> {
     pub fn new(max_capacity: u32) -> Self {
         Self::with_key(max_capacity)
     }
-
-    #[must_use]
-    pub fn with_global(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
-        Self::with_global_and_key(max_capacity, global)
-    }
 }
 
 impl<K, V> SlotMap<K, V> {
     #[must_use]
     pub fn with_key(max_capacity: u32) -> Self {
-        Self::with_global_and_key(max_capacity, epoch::GlobalHandle::new())
-    }
+        let slots = Vec::new(max_capacity);
+        let hot_data = Box::into_raw(Box::new(HotData {
+            free_list: AtomicU32::new(NIL),
+            len: AtomicU32::new(0),
+        }));
+        // SAFETY: `slots` and `hot_data` outlive any calls into the collector.
+        let collector = unsafe { hyaline::CollectorHandle::new(&slots, hot_data) };
 
-    #[must_use]
-    pub fn with_global_and_key(max_capacity: u32, global: epoch::GlobalHandle) -> Self {
         SlotMap {
             inner: SlotMapInner {
-                slots: Vec::new(max_capacity),
-                len: AtomicU32::new(0),
-                global,
-                _alignment1: CacheAligned,
-                free_list: AtomicU32::new(NIL),
-                _alignment2: CacheAligned,
-                free_list_queue: [
-                    AtomicU64::new(u64::from(NIL)),
-                    AtomicU64::new(u64::from(NIL)),
-                ],
+                slots,
+                collector,
+                hot_data,
             },
             marker: PhantomData,
         }
@@ -136,7 +132,7 @@ impl<K, V> SlotMap<K, V> {
     #[inline]
     #[must_use]
     pub fn len(&self) -> u32 {
-        self.inner.len.load(Relaxed)
+        self.inner.len()
     }
 
     #[inline]
@@ -144,20 +140,19 @@ impl<K, V> SlotMap<K, V> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    #[inline]
-    #[must_use]
-    pub fn global(&self) -> &epoch::GlobalHandle {
-        &self.inner.global
-    }
 }
 
 impl<K: Key, V> SlotMap<K, V> {
+    #[inline]
+    pub fn pin(&self) -> hyaline::Guard<'_> {
+        self.inner.pin()
+    }
+
     /// # Panics
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn insert<'a>(&'a self, value: V, guard: &'a epoch::Guard<'a>) -> K {
+    pub fn insert<'a>(&'a self, value: V, guard: &'a hyaline::Guard<'a>) -> K {
         self.insert_with_tag(value, 0, guard)
     }
 
@@ -166,7 +161,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
-    pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a epoch::Guard<'a>) -> K {
+    pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
         K::from_id(self.inner.insert_with_tag_with(tag, guard, |_| value))
     }
 
@@ -174,7 +169,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn insert_with<'a>(&'a self, guard: &'a epoch::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
+    pub fn insert_with<'a>(&'a self, guard: &'a hyaline::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
         self.insert_with_tag_with(0, guard, f)
     }
 
@@ -186,7 +181,7 @@ impl<K: Key, V> SlotMap<K, V> {
     pub fn insert_with_tag_with<'a>(
         &'a self,
         tag: u32,
-        guard: &'a epoch::Guard<'a>,
+        guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(K) -> V,
     ) -> K {
         let f = |id| f(K::from_id(id));
@@ -226,16 +221,8 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
-    pub fn remove<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    pub fn remove<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove(key.as_id(), guard)
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    #[inline]
-    pub fn try_collect(&self, guard: &epoch::Guard<'_>) {
-        self.inner.try_collect(guard);
     }
 
     #[inline]
@@ -244,27 +231,18 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 
     #[cfg(test)]
-    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn remove_index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove_index(index, guard)
     }
 
     #[inline]
-    pub fn invalidate<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    pub fn invalidate<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.invalidate(key.as_id(), guard)
     }
 
-    /// # Safety
-    ///
-    /// * The slot must be currently [invalidated].
-    /// * At least two [epochs] must have passed since the slot was invalidated.
-    /// * The slot must not have been removed already.
-    ///
-    /// [invalidated]: Self::invalidate
-    /// [epochs]: epoch::GlobalHandle::epoch
     #[inline]
-    pub unsafe fn remove_unchecked(&self, key: K) -> V {
-        // SAFETY: Enforced by the caller.
-        unsafe { self.inner.remove_unchecked(key.as_id()) }
+    pub fn remove_invalidated(&self, key: K) -> Option<V> {
+        self.inner.remove_invalidated(key.as_id())
     }
 
     /// # Panics
@@ -272,7 +250,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     #[must_use]
-    pub fn get<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    pub fn get<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.get(key.as_id(), guard)
     }
 
@@ -289,7 +267,7 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 
     #[cfg(test)]
-    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.index(index, guard)
     }
 
@@ -302,7 +280,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline(always)]
     #[must_use]
-    pub unsafe fn get_unchecked<'a>(&'a self, key: K, guard: &'a epoch::Guard<'a>) -> &'a V {
+    pub unsafe fn get_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
         // SAFETY: Enforced by the caller.
         unsafe { self.inner.get_unchecked(key.as_id(), guard) }
     }
@@ -322,7 +300,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
     #[must_use]
-    pub fn iter<'a>(&'a self, guard: &'a epoch::Guard<'a>) -> Iter<'a, K, V> {
+    pub fn iter<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Iter<'a, K, V> {
         self.inner.check_guard(guard);
 
         Iter {
@@ -342,16 +320,20 @@ impl<K: Key, V> SlotMap<K, V> {
 }
 
 impl<V> SlotMapInner<V> {
+    fn pin(&self) -> hyaline::Guard<'_> {
+        self.collector.pin()
+    }
+
     fn insert_with_tag_with<'a>(
         &'a self,
         tag: u32,
-        guard: &'a epoch::Guard<'a>,
+        guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(SlotId) -> V,
     ) -> SlotId {
         self.check_guard(guard);
         assert_eq!(tag & !TAG_MASK, 0);
 
-        let mut free_list_head = self.free_list.load(Acquire);
+        let mut free_list_head = self.free_list().load(Acquire);
         let mut backoff = Backoff::new();
 
         loop {
@@ -365,29 +347,31 @@ impl<V> SlotMapInner<V> {
 
             let next_free = slot.next_free.load(Relaxed);
 
-            match self
-                .free_list
-                .compare_exchange_weak(free_list_head, next_free, Release, Acquire)
-            {
+            match self.free_list().compare_exchange_weak(
+                free_list_head,
+                next_free,
+                Release,
+                Acquire,
+            ) {
                 Ok(_) => {
-                    let generation = slot
-                        .generation
-                        .load(Relaxed)
-                        .wrapping_add(OCCUPIED_BIT | tag);
+                    let generation = slot.generation.load(Relaxed);
 
-                    // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its
-                    // generation's `OCCUPIED_BIT` unset, and since we incremented the generation,
-                    // the bit must have been flipped again.
-                    let id = unsafe { SlotId::new_unchecked(free_list_head, generation) };
+                    debug_assert!(generation & STATE_MASK == VACANT_TAG);
 
-                    // SAFETY: `SlotMap::remove[_mut]` guarantees that the free-list only contains
-                    // slots that are no longer read by any threads, and we have removed the slot
-                    // from the free-list such that no other threads can be writing the same slot.
+                    let new_generation = generation | OCCUPIED_TAG | tag;
+
+                    // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into
+                    // the free-list and we replaced the tag with `OCCUPIED_TAG` above.
+                    let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+
+                    // SAFETY: The free-list always contains slots that are no longer read by any
+                    // threads and we have removed the slot from the free-list such that no other
+                    // threads can be writing the same slot.
                     unsafe { slot.value.get().cast::<V>().write(f(id)) };
 
-                    slot.generation.store(generation, Release);
+                    slot.generation.store(new_generation, Release);
 
-                    self.len.fetch_add(1, Relaxed);
+                    self.hot_data().len.fetch_add(1, Relaxed);
 
                     return id;
                 }
@@ -400,7 +384,7 @@ impl<V> SlotMapInner<V> {
 
         let id = self.slots.push_with_tag_with(tag, f);
 
-        self.len.fetch_add(1, Relaxed);
+        self.hot_data().len.fetch_add(1, Relaxed);
 
         id
     }
@@ -408,224 +392,97 @@ impl<V> SlotMapInner<V> {
     fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
-        let free_list_head = *self.free_list.get_mut();
+        // SAFETY: The pointer is valid and we have exclusive access to the collection.
+        let hot_data = unsafe { &mut *self.hot_data };
+
+        let free_list_head = *hot_data.free_list.get_mut();
 
         if free_list_head != NIL {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
 
-            *self.free_list.get_mut() = *slot.next_free.get_mut();
+            *hot_data.free_list.get_mut() = *slot.next_free.get_mut();
 
-            let generation = slot.generation.get_mut().wrapping_add(OCCUPIED_BIT | tag);
+            let generation = *slot.generation.get_mut();
 
-            // SAFETY: `SlotMap::remove[_mut]` guarantees that a freed slot has its generation's
-            // `OCCUPIED_BIT` unset, and since we incremented the generation, the bit must have been
-            // flipped again.
-            let id = unsafe { SlotId::new_unchecked(free_list_head, generation) };
+            debug_assert!(generation & STATE_MASK == VACANT_TAG);
+
+            let new_generation = generation | OCCUPIED_TAG | tag;
+
+            // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into the
+            // free-list and we replaced the tag with `OCCUPIED_TAG` above.
+            let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
 
             *slot.value.get_mut() = MaybeUninit::new(f(id));
 
-            *slot.generation.get_mut() = generation;
+            *slot.generation.get_mut() = new_generation;
 
-            *self.len.get_mut() += 1;
+            *hot_data.len.get_mut() += 1;
 
             return id;
         }
 
         let id = self.slots.push_with_tag_with_mut(tag, f);
 
-        *self.len.get_mut() += 1;
+        *hot_data.len.get_mut() += 1;
 
         id
     }
 
-    fn remove<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
-        let slot = self.invalidate(id, guard)?;
-
-        // SAFETY: We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting
-        // to push it into the free-lists.
-        unsafe { self.defer_destroy(id.index) };
-
-        Some(slot)
-    }
-
-    unsafe fn defer_destroy(&self, index: u32) {
-        // SAFETY: The caller must ensure that `index` is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(index) };
-
-        atomic::fence(SeqCst);
-
-        let epoch = self.global.epoch();
-        let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
-        let mut queued_state = queued_list.load(Acquire);
-        let mut backoff = Backoff::new();
-
-        loop {
-            let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
-            let queued_epoch = (queued_state >> 32) as u32;
-            let epoch_interval = epoch.wrapping_sub(queued_epoch);
-
-            if epoch_interval == 0 {
-                slot.next_free.store(queued_head, Relaxed);
-
-                let new_state = u64::from(index) | (u64::from(queued_epoch) << 32);
-
-                match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
-                    Ok(_) => {
-                        self.len.fetch_sub(1, Relaxed);
-                        break;
-                    }
-                    Err(new_state) => {
-                        queued_state = new_state;
-                        backoff.spin();
-                    }
-                }
-            } else {
-                let global_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
-
-                debug_assert!(!global_epoch_is_behind_queue);
-                debug_assert!(epoch_interval >= 4);
-
-                slot.next_free.store(NIL, Relaxed);
-
-                let new_state = u64::from(index) | (u64::from(epoch) << 32);
-
-                match queued_list.compare_exchange_weak(queued_state, new_state, Release, Acquire) {
-                    Ok(_) => {
-                        self.len.fetch_sub(1, Relaxed);
-
-                        // SAFETY: Having ended up here, the global epoch must have been advanced
-                        // at least 2 steps from the last push into the queued list and we removed
-                        // the list from the queue, which means that no other threads can be
-                        // accessing any of the slots in the list.
-                        unsafe { self.collect_unchecked(queued_head) };
-
-                        break;
-                    }
-                    Err(new_state) => {
-                        queued_state = new_state;
-                        backoff.spin();
-                    }
-                }
-            }
-        }
-    }
-
-    fn try_collect(&self, guard: &epoch::Guard<'_>) {
+    fn remove<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let epoch = self.global.epoch();
-        let queued_list = &self.free_list_queue[((epoch >> 1) & 1) as usize];
-        let mut queued_state = queued_list.load(Acquire);
-        let mut backoff = Backoff::new();
+        let slot = self.slots.get(id.index)?;
+        let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
-        loop {
-            let queued_head = (queued_state & 0xFFFF_FFFF) as u32;
-            let queued_epoch = (queued_state >> 32) as u32;
-            let epoch_interval = epoch.wrapping_sub(queued_epoch);
-
-            if epoch_interval == 0 {
-                break;
-            }
-
-            let global_epoch_is_behind_queue = epoch_interval & (1 << 31) != 0;
-
-            debug_assert!(!global_epoch_is_behind_queue);
-
-            let new_state = u64::from(NIL) | (u64::from(queued_epoch) << 32);
-
-            match queued_list.compare_exchange_weak(queued_state, new_state, Relaxed, Acquire) {
-                Ok(_) => {
-                    // SAFETY: Having ended up here, the global epoch must have been advanced at
-                    // least 2 steps from the last push into the queued list and we removed the
-                    // list from the queue, which means that no other threads can be accessing any
-                    // of the slots in the list.
-                    unsafe { self.collect_unchecked(queued_head) };
-
-                    break;
-                }
-                Err(new_state) => {
-                    queued_state = new_state;
-                    backoff.spin();
-                }
-            }
-        }
-    }
-
-    #[cold]
-    unsafe fn collect_unchecked(&self, queued_head: u32) {
-        if queued_head == NIL {
-            // There is no garbage.
-            return;
+        if slot
+            .generation
+            .compare_exchange(id.generation(), new_generation, Acquire, Relaxed)
+            .is_err()
+        {
+            return None;
         }
 
-        let mut queued_tail = queued_head;
-        let mut queued_tail_slot;
+        self.hot_data().len.fetch_sub(1, Relaxed);
 
-        // Drop the queued free-list and find the tail slot.
-        loop {
-            // SAFETY: We always push indices of existing slots into the free-lists and the slots
-            // vector never shrinks, therefore the index must have staid in bounds.
-            queued_tail_slot = unsafe { self.slots.get_unchecked(queued_tail) };
+        // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
+        // the slot going forward.
+        unsafe { guard.defer_reclaim(id.index, &self.slots) };
 
-            let ptr = queued_tail_slot.value.get().cast::<V>();
-
-            // SAFETY: The caller must ensure that we have exclusive access to this list.
-            unsafe { ptr.drop_in_place() };
-
-            let next_free = queued_tail_slot.next_free.load(Acquire);
-
-            if next_free == NIL {
-                break;
-            }
-
-            queued_tail = next_free;
-        }
-
-        let mut free_list_head = self.free_list.load(Acquire);
-        let mut backoff = Backoff::new();
-
-        // Free the queued free-list by prepending it to the free-list.
-        loop {
-            queued_tail_slot.next_free.store(free_list_head, Relaxed);
-
-            match self.free_list.compare_exchange_weak(
-                free_list_head,
-                queued_head,
-                Release,
-                Acquire,
-            ) {
-                Ok(_) => break,
-                Err(new_head) => {
-                    free_list_head = new_head;
-                    backoff.spin();
-                }
-            }
-        }
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
+        //   slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
+        //   `SlotMap::insert[_mut]`.
+        Some(unsafe { slot.value_unchecked() })
     }
 
     fn remove_mut(&mut self, id: SlotId) -> Option<V> {
         let slot = self.slots.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
+        // SAFETY: The pointer is valid and we have exclusive access to the collection.
+        let hot_data = unsafe { &mut *self.hot_data };
+
         if generation == id.generation() {
-            *slot.generation.get_mut() = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+            let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
+            *slot.generation.get_mut() = new_generation;
 
-            *slot.next_free.get_mut() = *self.free_list.get_mut();
-            *self.free_list.get_mut() = id.index;
+            *slot.next_free.get_mut() = *hot_data.free_list.get_mut();
+            *hot_data.free_list.get_mut() = id.index;
 
-            *self.len.get_mut() -= 1;
+            *hot_data.len.get_mut() -= 1;
 
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
-            //   Since the generation matched, the slot's occupied bit must be set, which makes
-            //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert[_mut]` after initialization of the slot.
-            // * We incremented the slot's generation such that its `OCCUPIED_BIT` is unset and its
-            //   generation is advanced, such that future attempts to access the slot will fail.
+            // * We checked that `id.generation` matches the slot's generation, which means that the
+            //   previous state tag of the slot must have been `OCCUPIED_TAG`, which means it must
+            //   have been initialized in `SlotMap::insert[_mut]`.
+            // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
+            //   slot will fail.
             Some(unsafe { slot.value.get().cast::<V>().read() })
         } else {
             None
@@ -633,7 +490,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[cfg(test)]
-    fn remove_index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn remove_index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(index)?;
@@ -641,11 +498,11 @@ impl<V> SlotMapInner<V> {
         let mut backoff = Backoff::new();
 
         loop {
-            if generation & OCCUPIED_BIT == 0 {
+            if !is_occupied(generation) {
                 return None;
             }
 
-            let new_generation = (generation & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+            let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
             match slot.generation.compare_exchange_weak(
                 generation,
@@ -661,33 +518,61 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        // SAFETY: We unset the slot's `OCCUPIED_BIT` such that no other threads can be attempting
-        // to push it into the free-lists.
-        unsafe { self.defer_destroy(index) };
+        self.hot_data().len.fetch_sub(1, Relaxed);
+
+        // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
+        // the slot going forward.
+        unsafe { guard.defer_reclaim(index, &self.slots) };
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
         //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
         //   visible here.
-        // * The `compare_exchange_weak` above succeeded, which means that the previous generation
-        //   of the slot must have had its `OCCUPIED_BIT` set, which makes reading the value safe as
-        //   the only way the occupied bit can be set is in `SlotMap::insert[_mut]` after
-        //   initialization of the slot.
+        // * The `compare_exchange_weak` above succeeded, which means that the previous state tag of
+        //   the slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
+        //   `SlotMap::insert[_mut]`.
         Some(unsafe { slot.value_unchecked() })
     }
 
-    fn invalidate<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn invalidate<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(id.index)?;
-        let new_generation = (id.generation() & !TAG_MASK).wrapping_add(OCCUPIED_BIT);
+        let new_generation = (id.generation() & !STATE_MASK) | INVALIDATED_TAG;
 
-        // This works thanks to the invariant of `SlotId` that the `OCCUPIED_BIT` of its generation
-        // must be set. That means that the only outcome possible in case of success here is that
-        // the `OCCUPIED_BIT` is unset and the generation is advanced.
         if slot
             .generation
             .compare_exchange(id.generation(), new_generation, Acquire, Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+
+        self.hot_data().len.fetch_sub(1, Relaxed);
+
+        // SAFETY: We set the slot's state tag to `INVALIDATED_TAG` such that no other threads can
+        // access the slot going forward.
+        unsafe { guard.defer_reclaim_invalidated(id.index, &self.slots) };
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
+        //   slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
+        //   `SlotMap::insert[_mut]`.
+        Some(unsafe { slot.value_unchecked() })
+    }
+
+    fn remove_invalidated(&self, id: SlotId) -> Option<V> {
+        let slot = self.slots.get(id.index)?;
+
+        let old_generation = (id.generation() & !STATE_MASK) | RECLAIMED_TAG;
+        let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
+
+        if slot
+            .generation
+            .compare_exchange(old_generation, new_generation, Acquire, Relaxed)
             .is_err()
         {
             return None;
@@ -697,33 +582,26 @@ impl<V> SlotMapInner<V> {
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
         //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
         //   visible here.
-        // * The `compare_exchange` above succeeded, which means that the previous generation of the
-        //   slot must have matched `id.generation`. By `SlotId`'s invariant, its generation's
-        //   occupied bit must be set. Since the generation matched, the slot's occupied bit must
-        //   have been set, which makes reading the value safe as the only way the occupied bit can
-        //   be set is in `SlotMap::insert[_mut]` after initialization of the slot.
-        Some(unsafe { slot.value_unchecked() })
-    }
-
-    unsafe fn remove_unchecked(&self, id: SlotId) -> V {
-        // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index) };
-
-        // SAFETY: The caller must ensure that the slot is initialized and that no other threads can
-        // be accessing the slot.
+        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
+        //   slot must have been `RECLAIMED_TAG`, which means it must have been reclaimed in
+        //   `reclaim_invalidated`, which means it must have been invalidated in
+        //   `SlotMap::invalidate`, which means it must have been initialized in
+        //   `SlotMap::insert[_mut]`.
+        // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
+        //   slot will fail.
         let value = unsafe { slot.value.get().cast::<V>().read() };
 
-        let mut free_list_head = self.free_list.load(Acquire);
+        let mut free_list_head = self.free_list().load(Acquire);
         let mut backoff = Backoff::new();
 
         loop {
             slot.next_free.store(free_list_head, Relaxed);
 
             match self
-                .free_list
+                .free_list()
                 .compare_exchange_weak(free_list_head, id.index, Release, Acquire)
             {
-                Ok(_) => break value,
+                Ok(_) => break Some(value),
                 Err(new_head) => {
                     free_list_head = new_head;
                     backoff.spin();
@@ -733,7 +611,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline(always)]
-    fn get<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn get<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(id.index)?;
@@ -744,11 +622,9 @@ impl<V> SlotMapInner<V> {
             // * The `Acquire` ordering when loading the slot's generation synchronizes with the
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
             //   is visible here.
-            // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
-            //   Since the generation matched, the slot's occupied bit must be set, which makes
-            //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            // * We checked that `id.generation` matches the slot's generation, which means that the
+            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
             Some(unsafe { slot.value_unchecked() })
         } else {
             None
@@ -763,11 +639,9 @@ impl<V> SlotMapInner<V> {
         if generation == id.generation() {
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
-            //   Since the generation matched, the slot's occupied bit must be set, which makes
-            //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            // * We checked that `id.generation` matches the slot's generation, which means that the
+            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
             Some(unsafe { slot.value_unchecked_mut() })
         } else {
             None
@@ -831,11 +705,9 @@ impl<V> SlotMapInner<V> {
 
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which includes the
-            //   occupied bit. By `SlotId`'s invariant, its generation's occupied bit must be set.
-            //   Since the generation matched, the slot's occupied bit must be set, which makes
-            //   reading the value safe as the only way the occupied bit can be set is in
-            //   `SlotMap::insert[_mut]` after initialization of the slot.
+            // * We checked that `id.generation` matches the slot's generation, which means that the
+            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
+            //   initialized in `SlotMap::insert[_mut]`.
             let value = unsafe { slot.value_unchecked_mut() };
 
             // SAFETY: `i` is in bounds of the array.
@@ -847,13 +719,13 @@ impl<V> SlotMapInner<V> {
     }
 
     #[cfg(test)]
-    fn index<'a>(&'a self, index: u32, guard: &'a epoch::Guard<'a>) -> Option<&'a V> {
+    fn index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
         let slot = self.slots.get(index)?;
         let generation = slot.generation.load(Acquire);
 
-        if generation & OCCUPIED_BIT != 0 {
+        if is_occupied(generation) {
             // SAFETY:
             // * The `Acquire` ordering when loading the slot's generation synchronizes with the
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
@@ -867,7 +739,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline(always)]
-    unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a epoch::Guard<'a>) -> &'a V {
+    unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> &'a V {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
@@ -894,18 +766,102 @@ impl<V> SlotMapInner<V> {
         unsafe { slot.value_unchecked_mut() }
     }
 
+    #[inline]
+    fn collector(&self) -> &hyaline::Collector {
+        self.collector.collector()
+    }
+
+    fn free_list(&self) -> &AtomicU32 {
+        &self.hot_data().free_list
+    }
+
+    fn len(&self) -> u32 {
+        self.hot_data().len.load(Relaxed)
+    }
+
+    fn hot_data(&self) -> &HotData {
+        // SAFETY: The pointer is valid.
+        unsafe { &*self.hot_data }
+    }
+
     #[inline(always)]
-    fn check_guard(&self, guard: &epoch::Guard<'_>) {
+    fn check_guard(&self, guard: &hyaline::Guard<'_>) {
         #[inline(never)]
-        fn global_mismatch() -> ! {
-            panic!("`guard.global()` is `Some` but does not equal `self.global()`");
+        fn collector_mismatch() -> ! {
+            panic!("the given guard does not belong to this collection");
         }
 
-        if let Some(global) = guard.global() {
-            if global != &self.global {
-                global_mismatch();
+        if guard.collector() != self.collector() {
+            collector_mismatch();
+        }
+    }
+}
+
+unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>, hot_data: &HotData) {
+    let mut tail = head;
+    let mut tail_slot;
+
+    loop {
+        // SAFETY: The caller must ensure that `head` denotes a valid list of slots.
+        tail_slot = unsafe { &*slots.add(tail as usize) };
+
+        let ptr = tail_slot.value.get().cast::<V>();
+
+        // SAFETY: The caller must ensure that we have exclusive access to the slots in the list.
+        unsafe { ptr.drop_in_place() };
+
+        let next_free = tail_slot.next_free.load(Relaxed);
+
+        if next_free == NIL {
+            break;
+        }
+
+        tail = next_free;
+    }
+
+    let mut free_list_head = hot_data.free_list.load(Acquire);
+    let mut backoff = Backoff::new();
+
+    loop {
+        tail_slot.next_free.store(free_list_head, Relaxed);
+
+        match hot_data
+            .free_list
+            .compare_exchange_weak(free_list_head, head, Release, Acquire)
+        {
+            Ok(_) => break,
+            Err(new_head) => {
+                free_list_head = new_head;
+                backoff.spin();
             }
         }
+    }
+}
+
+unsafe fn reclaim_invalidated<V>(mut head: u32, slots: *const Slot<V>) {
+    loop {
+        // SAFETY: The caller must ensure that `head` denotes a valid list of slots.
+        let slot = unsafe { &*slots.add(head as usize) };
+
+        let generation = slot.generation.load(Relaxed);
+
+        debug_assert!(generation & STATE_MASK == INVALIDATED_TAG);
+
+        let new_generation = (generation & !STATE_MASK) | RECLAIMED_TAG;
+
+        let res = slot
+            .generation
+            .compare_exchange(generation, new_generation, Release, Relaxed);
+
+        debug_assert!(res.is_ok());
+
+        let next_free = slot.next_free.load(Relaxed);
+
+        if next_free == NIL {
+            break;
+        }
+
+        head = next_free;
     }
 }
 
@@ -915,7 +871,7 @@ impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
 
         impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for Slots<'_, K, V> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let guard = &self.0.global().register_local().into_inner().pin();
+                let guard = &self.0.pin();
                 let mut debug = f.debug_map();
 
                 for (k, v) in self.0.iter(guard) {
@@ -947,34 +903,11 @@ impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
             }
         }
 
-        struct QueuedList<'a, V>(&'a SlotMapInner<V>, u64);
-
-        impl<V> fmt::Debug for QueuedList<'_, V> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let state = self.1;
-                let head = (state & 0xFFFF_FFFF) as u32;
-                let epoch = (state >> 32) as u32;
-                let mut debug = f.debug_struct("QueuedList");
-                debug
-                    .field("entries", &List(self.0, head))
-                    .field("epoch", &epoch);
-
-                debug.finish()
-            }
-        }
-
         fn inner<V>(map: &SlotMapInner<V>, mut debug: fmt::DebugStruct<'_, '_>) -> fmt::Result {
             debug
-                .field("len", &map.len)
-                .field("global", &map.global)
-                .field("free_list", &List(map, map.free_list.load(Acquire)))
-                .field(
-                    "free_list_queue",
-                    &[
-                        QueuedList(map, map.free_list_queue[0].load(Acquire)),
-                        QueuedList(map, map.free_list_queue[1].load(Acquire)),
-                    ],
-                );
+                .field("len", &map.len())
+                .field("collector", &map.collector)
+                .field("free_list", &List(map, map.free_list().load(Acquire)));
 
             debug.finish()
         }
@@ -988,40 +921,21 @@ impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
 
 impl<V> Drop for SlotMapInner<V> {
     fn drop(&mut self) {
-        if !core::mem::needs_drop::<V>() {
-            return;
-        }
-
-        for list in &mut self.free_list_queue {
-            let mut head = (*list.get_mut() & 0xFFFF_FFFF) as u32;
-
-            while head != NIL {
-                // SAFETY: We always push indices of existing slots into the free-lists and the
-                // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked_mut(head) };
-
-                let ptr = slot.value.get_mut().as_mut_ptr();
-
-                // SAFETY: We can be certain that this slot has been initialized, since the only
-                // way in which it could have been queued for freeing is in `SlotMap::remove` if
-                // the slot was inserted before.
-                unsafe { ptr.drop_in_place() };
-
-                head = *slot.next_free.get_mut();
-            }
-        }
-
         for slot in self.slots.iter_mut() {
-            if *slot.generation.get_mut() & OCCUPIED_BIT != 0 {
+            if *slot.generation.get_mut() & STATE_MASK != VACANT_TAG {
                 let ptr = slot.value.get_mut().as_mut_ptr();
 
                 // SAFETY:
                 // * The mutable reference makes sure that access to the slot is synchronized.
-                // * We checked that the slot is occupied, which means that it must have been
+                // * We checked that the slot is not vacant, which means that it must have been
                 //   initialized in `SlotMap::insert[_mut]`.
                 unsafe { ptr.drop_in_place() };
             }
         }
+
+        // SAFETY: We allocated this pointer using `Box::new` and there can be no remaining
+        // references to the allocation since we are being dropped.
+        let _ = unsafe { Box::from_raw(self.hot_data) };
     }
 }
 
@@ -1082,29 +996,31 @@ impl SlotId {
 
     pub const TAG_MASK: u32 = TAG_MASK;
 
-    pub const OCCUPIED_BIT: u32 = OCCUPIED_BIT;
+    pub const STATE_MASK: u32 = STATE_MASK;
+
+    pub const OCCUPIED_TAG: u32 = OCCUPIED_TAG;
 
     #[inline(always)]
     #[must_use]
     pub const fn new(index: u32, generation: u32) -> Self {
-        assert!(generation & OCCUPIED_BIT != 0);
+        assert!(is_occupied(generation));
 
-        // SAFETY: We checked that the `OCCUPIED_BIT` is set.
+        // SAFETY: We checked that the state tag of `generation` is `OCCUPIED_TAG`.
         unsafe { SlotId::new_unchecked(index, generation) }
     }
 
     /// # Safety
     ///
-    /// `generation` must have its [`OCCUPIED_BIT`] set.
+    /// `generation`, when masked out with [`STATE_MASK`], must equal [`OCCUPIED_TAG`].
     ///
-    /// [`OCCUPIED_BIT`]: Self::OCCUPIED_BIT
+    /// [`STATE_MASK`]: Self::STATE_MASK
+    /// [`OCCUPIED_TAG`]: Self::OCCUPIED_TAG
     #[inline(always)]
     #[must_use]
     pub const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
-        debug_assert!(generation & OCCUPIED_BIT != 0);
+        debug_assert!(is_occupied(generation));
 
-        // SAFETY: The caller must ensure that the `OCCUPIED_BIT` of `generation` is set, which
-        // means it must be non-zero.
+        // SAFETY: The caller must ensure that the state tag of `generation` is `OCCUPIED_TAG`.
         let generation = unsafe { NonZeroU32::new_unchecked(generation) };
 
         SlotId { index, generation }
@@ -1140,11 +1056,11 @@ impl fmt::Debug for SlotId {
             return f.write_str("INVALID");
         }
 
-        let generation = self.generation.get();
-        write!(f, "{}v{}", self.index, generation >> (TAG_BITS + 1))?;
+        let generation = self.generation() >> (TAG_BITS + STATE_BITS);
+        write!(f, "{}v{}", self.index, generation)?;
 
-        if generation & TAG_MASK != 0 {
-            write!(f, "t{}", generation & TAG_MASK)?;
+        if self.generation() & TAG_MASK != 0 {
+            write!(f, "t{}", self.generation() & TAG_MASK)?;
         }
 
         Ok(())
@@ -1233,7 +1149,7 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
             let (index, slot) = self.slots.next()?;
             let generation = slot.generation.load(Acquire);
 
-            if generation & OCCUPIED_BIT != 0 {
+            if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
                 let index = index as u32;
@@ -1267,7 +1183,7 @@ impl<K: Key, V> DoubleEndedIterator for Iter<'_, K, V> {
             let (index, slot) = self.slots.next_back()?;
             let generation = slot.generation.load(Acquire);
 
-            if generation & OCCUPIED_BIT != 0 {
+            if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
                 let index = index as u32;
@@ -1320,7 +1236,7 @@ impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
             let (index, slot) = self.slots.next()?;
             let generation = *slot.generation.get_mut();
 
-            if generation & OCCUPIED_BIT != 0 {
+            if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
                 let index = index as u32;
@@ -1350,7 +1266,7 @@ impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
             let (index, slot) = self.slots.next_back()?;
             let generation = *slot.generation.get_mut();
 
-            if generation & OCCUPIED_BIT != 0 {
+            if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
                 #[allow(clippy::cast_possible_truncation)]
                 let index = index as u32;
@@ -1370,8 +1286,9 @@ impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
 
 impl<K: Key, V> FusedIterator for IterMut<'_, K, V> {}
 
-#[repr(align(128))]
-struct CacheAligned;
+const fn is_occupied(generation: u32) -> bool {
+    generation & STATE_MASK == OCCUPIED_TAG
+}
 
 const SPIN_LIMIT: u32 = 6;
 
@@ -1397,14 +1314,13 @@ impl Backoff {
 
 #[cfg(test)]
 mod tests {
-    use self::epoch::PINNINGS_BETWEEN_ADVANCE;
     use super::*;
     use std::thread;
 
     #[test]
     fn basic_usage1() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert(69, guard);
         let y = map.insert(42, guard);
@@ -1429,7 +1345,7 @@ mod tests {
     #[test]
     fn basic_usage2() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1473,7 +1389,7 @@ mod tests {
     #[test]
     fn basic_usage3() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1609,7 +1525,7 @@ mod tests {
     #[test]
     fn iter1() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert(1, guard);
         let _ = map.insert(2, guard);
@@ -1644,7 +1560,7 @@ mod tests {
     #[test]
     fn iter2() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert(1, guard);
         let y = map.insert(2, guard);
@@ -1675,7 +1591,7 @@ mod tests {
     #[test]
     fn iter3() {
         let map = SlotMap::new(10);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let _ = map.insert(1, guard);
         let x = map.insert(2, guard);
@@ -1917,7 +1833,7 @@ mod tests {
         assert_eq!(map.get_many_mut([z, y, x]), Some([&mut 3, &mut 2, &mut 1]));
 
         assert_eq!(map.get_many_mut([x, x]), None);
-        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_BIT)]), None);
+        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_TAG)]), None);
 
         map.remove_mut(y);
 
@@ -1947,7 +1863,7 @@ mod tests {
     #[test]
     fn tagged() {
         let map = SlotMap::new(1);
-        let guard = &map.global().register_local().into_inner().pin();
+        let guard = &map.pin();
 
         let x = map.insert_with_tag(42, 1, guard);
         assert_eq!(x.generation() & TAG_MASK, 1);
@@ -1977,10 +1893,8 @@ mod tests {
 
         thread::scope(|s| {
             let inserter = || {
-                let local = map.global().register_local();
-
                 for _ in 0..ITERATIONS / THREADS {
-                    map.insert(0, &local.pin());
+                    map.insert(0, &map.pin());
                 }
             };
 
@@ -1989,14 +1903,10 @@ mod tests {
             }
         });
 
-        assert_eq!(map.len(), ITERATIONS);
-
         thread::scope(|s| {
             let remover = || {
-                let local = map.global().register_local();
-
                 for index in 0..ITERATIONS {
-                    let _ = map.remove(SlotId::new(index, OCCUPIED_BIT), &local.pin());
+                    let _ = map.remove(SlotId::new(index, OCCUPIED_TAG), &map.pin());
                 }
             };
 
@@ -2010,30 +1920,25 @@ mod tests {
 
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = PINNINGS_BETWEEN_ADVANCE as u32 * 3;
+        const CAPACITY: u32 = if cfg!(miri) { 10 } else { 1000 };
 
-        // TODO: Why does ThreadSanitizer need more than `CAPACITY` slots, but only in CI???
-        let map = SlotMap::new(ITERATIONS / 2);
+        let map = SlotMap::new(CAPACITY);
 
         thread::scope(|s| {
             let insert_remover = || {
-                let local = map.global().register_local();
-
                 for _ in 0..ITERATIONS / 6 {
-                    let x = map.insert(0, &local.pin());
-                    let y = map.insert(0, &local.pin());
-                    map.remove(y, &local.pin());
-                    let z = map.insert(0, &local.pin());
-                    map.remove(x, &local.pin());
-                    map.remove(z, &local.pin());
+                    let x = map.insert(0, &map.pin());
+                    let y = map.insert(0, &map.pin());
+                    map.remove(y, &map.pin());
+                    let z = map.insert(0, &map.pin());
+                    map.remove(x, &map.pin());
+                    map.remove(z, &map.pin());
                 }
             };
             let iterator = || {
-                let local = map.global().register_local();
-
                 for _ in 0..ITERATIONS / CAPACITY * 2 {
                     for index in 0..CAPACITY {
-                        if let Some(value) = map.index(index, &local.pin()) {
+                        if let Some(value) = map.index(index, &map.pin()) {
                             let _ = *value;
                         }
                     }
@@ -2053,28 +1958,22 @@ mod tests {
 
         thread::scope(|s| {
             let inserter = || {
-                let local = map.global().register_local();
-
                 for i in 0..ITERATIONS {
                     if i % 10 == 0 {
-                        map.insert(0, &local.pin());
+                        map.insert(0, &map.pin());
                     } else {
                         thread::yield_now();
                     }
                 }
             };
             let remover = || {
-                let local = map.global().register_local();
-
                 for _ in 0..ITERATIONS {
-                    map.remove_index(0, &local.pin());
+                    map.remove_index(0, &map.pin());
                 }
             };
             let getter = || {
-                let local = map.global().register_local();
-
                 for _ in 0..ITERATIONS {
-                    if let Some(value) = map.index(0, &local.pin()) {
+                    if let Some(value) = map.index(0, &map.pin()) {
                         let _ = *value;
                     }
                 }

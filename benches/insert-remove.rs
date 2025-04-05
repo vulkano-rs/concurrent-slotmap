@@ -16,11 +16,9 @@ fn concurrent_slotmap(b: &mut Bencher) {
         thread::scope(|s| {
             for _ in 0..THREADS {
                 s.spawn(|| {
-                    let local = map.global().register_local();
-
                     for _ in black_box(0..ITERATIONS / THREADS) {
-                        let id = map.insert(black_box([0usize; 2]), &local.pin());
-                        map.remove(black_box(id), &local.pin());
+                        let id = map.insert(black_box([0usize; 2]), &map.pin());
+                        map.remove(black_box(id), &map.pin());
                     }
                 });
             }

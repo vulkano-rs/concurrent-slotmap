@@ -1,4 +1,4 @@
-use crate::{SlotId, OCCUPIED_BIT};
+use crate::{SlotId, OCCUPIED_TAG};
 use core::{
     cell::UnsafeCell,
     cmp, fmt,
@@ -68,7 +68,7 @@ impl<T> Vec<T> {
     }
 
     #[inline]
-    fn as_ptr(&self) -> *const Slot<T> {
+    pub(crate) fn as_ptr(&self) -> *const Slot<T> {
         self.allocation.ptr().cast()
     }
 
@@ -100,12 +100,12 @@ impl<T> Vec<T> {
         // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
         #[allow(clippy::cast_possible_truncation)]
         let index = index as u32;
-        let generation = OCCUPIED_BIT | tag;
+        let generation = OCCUPIED_TAG | tag;
 
         // SAFETY: We made sure that the index is in bounds above.
         let slot = unsafe { self.get_unchecked(index) };
 
-        // SAFETY: The `OCCUPIED_BIT` is set.
+        // SAFETY: The state tag of the generation is `OCCUPIED_TAG`.
         let id = unsafe { SlotId::new_unchecked(index, generation) };
 
         // SAFETY: We reserved an index by incrementing `self.reserved_len`, which means that no
@@ -133,12 +133,12 @@ impl<T> Vec<T> {
         // Our capacity can never exceed `self.max_capacity`, so the index has to fit in a `u32`.
         #[allow(clippy::cast_possible_truncation)]
         let index = index as u32;
-        let generation = OCCUPIED_BIT | tag;
+        let generation = OCCUPIED_TAG | tag;
 
         // SAFETY: We made sure that the index is in bounds above.
         let slot = unsafe { self.get_unchecked_mut(index) };
 
-        // SAFETY: The `OCCUPIED_BIT` is set.
+        // SAFETY: The state tag of the generation is `OCCUPIED_TAG`.
         let id = unsafe { SlotId::new_unchecked(index, generation) };
 
         slot.value.get_mut().write(f(id));
@@ -381,7 +381,6 @@ impl fmt::Display for TryReserveError {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for TryReserveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
