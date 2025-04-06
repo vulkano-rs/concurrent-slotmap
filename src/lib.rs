@@ -325,6 +325,24 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 }
 
+impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
+    /// # Panics
+    ///
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
+    #[inline]
+    pub fn revive_or_insert_with<'a>(
+        &'a self,
+        guard: &'a hyaline::Guard<'a>,
+        f: impl FnOnce(K) -> MaybeUninit<V>,
+    ) -> (K, &'a MaybeUninit<V>) {
+        let f = |id| f(K::from_id(id));
+
+        let (id, value) = self.inner.revive_or_insert_with(guard, f);
+
+        (K::from_id(id), value)
+    }
+}
+
 impl<V> SlotMapInner<V> {
     fn pin(&self) -> hyaline::Guard<'_> {
         self.collector.pin()
@@ -336,15 +354,39 @@ impl<V> SlotMapInner<V> {
         guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(SlotId) -> V,
     ) -> SlotId {
-        self.check_guard(guard);
         assert_eq!(tag & !TAG_MASK, 0);
+
+        let id = if let Some((id, slot)) = self.allocate_slot(tag, guard) {
+            // SAFETY: The free-list always contains slots that are no longer read by any threads
+            // and we have removed the slot from the free-list such that no other threads can be
+            // writing the same slot.
+            unsafe { slot.value.get().cast::<V>().write(f(id)) };
+
+            slot.generation.store(id.generation(), Release);
+
+            id
+        } else {
+            self.slots.push_with_tag_with(tag, f).0
+        };
+
+        self.header().len.fetch_add(1, Relaxed);
+
+        id
+    }
+
+    fn allocate_slot<'a>(
+        &'a self,
+        tag: u32,
+        guard: &'a hyaline::Guard<'a>,
+    ) -> Option<(SlotId, &'a Slot<V>)> {
+        self.check_guard(guard);
 
         let mut free_list_head = self.free_list().load(Acquire);
         let mut backoff = Backoff::new();
 
         loop {
             if free_list_head == NIL {
-                break;
+                break None;
             }
 
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
@@ -370,16 +412,7 @@ impl<V> SlotMapInner<V> {
                     // the free-list and we replaced the tag with `OCCUPIED_TAG` above.
                     let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
 
-                    // SAFETY: The free-list always contains slots that are no longer read by any
-                    // threads and we have removed the slot from the free-list such that no other
-                    // threads can be writing the same slot.
-                    unsafe { slot.value.get().cast::<V>().write(f(id)) };
-
-                    slot.generation.store(new_generation, Release);
-
-                    self.header().len.fetch_add(1, Relaxed);
-
-                    return id;
+                    break Some((id, slot));
                 }
                 Err(new_head) => {
                     free_list_head = new_head;
@@ -387,12 +420,6 @@ impl<V> SlotMapInner<V> {
                 }
             }
         }
-
-        let id = self.slots.push_with_tag_with(tag, f);
-
-        self.header().len.fetch_add(1, Relaxed);
-
-        id
     }
 
     fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
@@ -664,10 +691,10 @@ impl<V> SlotMapInner<V> {
             let mut valid = true;
 
             for (i, id) in ids.iter().enumerate() {
-                valid &= id.index() < len;
+                valid &= id.index < len;
 
                 for id2 in &ids[..i] {
-                    valid &= id.index() != id2.index();
+                    valid &= id.index != id2.index;
                 }
             }
 
@@ -700,7 +727,7 @@ impl<V> SlotMapInner<V> {
             // * The caller must ensure that `ids` contains only IDs whose indices are in bounds of
             //   the slots vector.
             // * The caller must ensure that `ids` contains only IDs with disjunct indices.
-            let slot = unsafe { self.slots.get_unchecked_mut(id.index()) };
+            let slot = unsafe { self.slots.get_unchecked_mut(id.index) };
 
             // SAFETY: We unbind the lifetime to convince the borrow checker that we don't
             // repeatedly borrow from `self.slots`. We don't for the same reasons as above.
@@ -803,6 +830,27 @@ impl<V> SlotMapInner<V> {
         if guard.collector() != self.collector() {
             collector_mismatch();
         }
+    }
+}
+
+impl<V> SlotMapInner<MaybeUninit<V>> {
+    fn revive_or_insert_with<'a>(
+        &'a self,
+        guard: &'a hyaline::Guard<'a>,
+        f: impl FnOnce(SlotId) -> MaybeUninit<V>,
+    ) -> (SlotId, &'a MaybeUninit<V>) {
+        let (id, slot) = if let Some((id, slot)) = self.allocate_slot(0, guard) {
+            slot.generation.store(id.generation(), Release);
+
+            (id, slot)
+        } else {
+            self.slots.push_with_tag_with(0, f)
+        };
+
+        self.header().len.fetch_add(1, Relaxed);
+
+        // SAFETY: The value is wrapped in `MaybeUninit`.
+        (id, unsafe { slot.value_unchecked() })
     }
 }
 
@@ -1881,6 +1929,30 @@ mod tests {
         let x = map.insert_with_tag_mut(42, 1);
         assert_eq!(x.generation() & TAG_MASK, 1);
         assert_eq!(map.get_mut(x), Some(&mut 42));
+    }
+
+    #[test]
+    fn revive_or_insert() {
+        let mut map = SlotMap::new(1);
+
+        let x = map.insert(MaybeUninit::new(Box::new(69)), &map.pin());
+        map.remove(x, &map.pin());
+
+        let guard = map.pin();
+        let (y, value) = map.revive_or_insert_with(&guard, |_| MaybeUninit::new(Box::new(42)));
+
+        assert_eq!(y, SlotId::new(x.index, x.generation() + ONE_GENERATION));
+
+        assert_eq!(
+            // SAFETY: The value is initialized.
+            unsafe { value.assume_init_ref() },
+            &Box::new(69),
+        );
+
+        drop(guard);
+
+        // SAFETY: The value is initialized.
+        unsafe { MaybeUninit::assume_init(map.remove_mut(y).unwrap()) };
     }
 
     // TODO: Testing concurrent generational collections is the most massive pain in the ass. We

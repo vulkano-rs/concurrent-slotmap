@@ -115,7 +115,7 @@ impl<T> Vec<T> {
         unsafe { &mut *self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
     }
 
-    pub fn push_with_tag_with(&self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
+    pub fn push_with_tag_with(&self, tag: u32, f: impl FnOnce(SlotId) -> T) -> (SlotId, &Slot<T>) {
         // This cannot overflow because our capacity can never exceed `isize::MAX` bytes, and
         // because `self.reserve_for_push()` resets `self.reserved_len` back to `self.max_capacity`
         // if it was overshot.
@@ -143,7 +143,7 @@ impl<T> Vec<T> {
 
         slot.generation.store(generation, Release);
 
-        id
+        (id, slot)
     }
 
     pub fn push_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
