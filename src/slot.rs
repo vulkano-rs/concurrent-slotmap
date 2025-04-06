@@ -1,11 +1,12 @@
-use crate::{SlotId, OCCUPIED_TAG};
+use crate::{Header, SlotId, NIL, OCCUPIED_TAG};
 use core::{
+    alloc::Layout,
     cell::UnsafeCell,
     cmp, fmt,
     marker::PhantomData,
     mem::{self, MaybeUninit},
     panic::{RefUnwindSafe, UnwindSafe},
-    slice,
+    ptr, slice,
     sync::atomic::{
         AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release},
@@ -16,6 +17,7 @@ use TryReserveErrorKind::{AllocError, CapacityOverflow};
 
 pub(crate) struct Vec<T> {
     allocation: virtual_buffer::Allocation,
+    slots: *mut Slot<T>,
     max_capacity: u32,
     capacity: AtomicU32,
     reserved_len: AtomicUsize,
@@ -28,6 +30,7 @@ impl<T> Vec<T> {
     }
 
     pub fn try_new(max_capacity: u32) -> Result<Self, TryReserveError> {
+        assert!(mem::align_of::<Header>() <= page_size());
         assert!(mem::align_of::<Slot<T>>() <= page_size());
 
         let size = usize::try_from(max_capacity)
@@ -40,41 +43,50 @@ impl<T> Vec<T> {
             return Err(CapacityOverflow.into());
         }
 
-        if size == 0 {
-            return Ok(Self::dangling(max_capacity));
-        }
+        let slots_offset = align_up(mem::size_of::<Header>(), mem::align_of::<Slot<T>>());
+        let size = slots_offset.checked_add(size).ok_or(CapacityOverflow)?;
+        let size = align_up(size, page_size());
+        let allocation = Allocation::new(size).map_err(AllocError)?;
+        let slots = allocation
+            .ptr()
+            .wrapping_add(slots_offset)
+            .cast::<Slot<T>>();
+        #[allow(clippy::cast_possible_truncation)]
+        let capacity = ((size - slots_offset) / mem::size_of::<Slot<T>>()) as u32;
+        let header = slots
+            .cast::<u8>()
+            .wrapping_sub(mem::size_of::<Header>())
+            .cast::<Header>();
 
-        let allocation = Allocation::new(align_up(size, page_size())).map_err(AllocError)?;
+        allocation
+            .commit(allocation.ptr(), size)
+            .map_err(AllocError)?;
+
+        // SAFETY: `header` is a valid pointer to the `Header` we made sure to allocate space for
+        // above.
+        unsafe {
+            *ptr::addr_of_mut!((*header).free_list) = AtomicU32::new(NIL);
+            *ptr::addr_of_mut!((*header).len) = AtomicU32::new(0);
+        }
 
         Ok(Vec {
             allocation,
+            slots,
             max_capacity,
-            capacity: AtomicU32::new(0),
+            capacity: AtomicU32::new(capacity),
             reserved_len: AtomicUsize::new(0),
             marker: PhantomData,
         })
     }
 
-    pub const fn dangling(max_capacity: u32) -> Self {
-        let allocation = Allocation::dangling(mem::align_of::<Slot<T>>());
-
-        Vec {
-            allocation,
-            max_capacity,
-            capacity: AtomicU32::new(0),
-            reserved_len: AtomicUsize::new(0),
-            marker: PhantomData,
-        }
-    }
-
     #[inline]
     pub(crate) fn as_ptr(&self) -> *const Slot<T> {
-        self.allocation.ptr().cast()
+        self.slots
     }
 
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut Slot<T> {
-        self.allocation.ptr().cast()
+        self.slots
     }
 
     #[inline]
@@ -85,6 +97,22 @@ impl<T> Vec<T> {
     #[inline]
     pub fn capacity_mut(&mut self) -> u32 {
         *self.capacity.get_mut()
+    }
+
+    pub fn header(&self) -> &Header {
+        let header_size = mem::size_of::<Header>();
+
+        // SAFETY: We made sure to allocate space for the `Header` and it's right before the
+        // beginning of the slots.
+        unsafe { &*self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
+    }
+
+    pub fn header_mut(&mut self) -> &mut Header {
+        let header_size = mem::size_of::<Header>();
+
+        // SAFETY: We made sure to allocate space for the `Header` and it's right before the
+        // beginning of the slots.
+        unsafe { &mut *self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
     }
 
     pub fn push_with_tag_with(&self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
@@ -169,7 +197,8 @@ impl<T> Vec<T> {
 
         let page_capacity = u32::try_from(page_size() / mem::size_of::<Slot<T>>()).unwrap();
 
-        // We checked that `required_capacity` doesn't exceed `self.max_capacity`, so it must fit.
+        // We checked that `required_capacity` doesn't exceed `self.max_capacity`, so it must fit in
+        // a `u32`.
         #[allow(clippy::cast_possible_truncation)]
         let new_capacity = cmp::max(self.capacity() * 2, required_capacity as u32);
         let new_capacity = cmp::max(new_capacity, page_capacity);
@@ -179,7 +208,7 @@ impl<T> Vec<T> {
             &self.allocation,
             &self.capacity,
             new_capacity,
-            mem::size_of::<Slot<T>>(),
+            Layout::new::<Slot<T>>(),
         )
     }
 
@@ -265,7 +294,7 @@ fn grow(
     allocation: &Allocation,
     capacity: &AtomicU32,
     new_capacity: u32,
-    element_size: usize,
+    element_layout: Layout,
 ) -> Result<(), TryReserveError> {
     let old_capacity = capacity.load(Relaxed);
 
@@ -276,11 +305,13 @@ fn grow(
 
     let page_size = page_size();
 
-    let old_size = old_capacity as usize * element_size;
+    let slots_offset = align_up(mem::size_of::<Header>(), element_layout.align());
+    let old_size = slots_offset + old_capacity as usize * element_layout.size();
     let new_size = usize::try_from(new_capacity)
         .ok()
-        .and_then(|cap| cap.checked_mul(element_size))
+        .and_then(|cap| cap.checked_mul(element_layout.size()))
         .ok_or(CapacityOverflow)?;
+    let new_size = slots_offset.checked_add(new_size).ok_or(CapacityOverflow)?;
 
     if new_size > allocation.size() {
         return Err(CapacityOverflow.into());

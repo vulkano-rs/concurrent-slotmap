@@ -73,11 +73,10 @@ struct SlotMapInner<V> {
     /// ```
     slots: Vec<V>,
     collector: hyaline::CollectorHandle,
-    hot_data: *mut HotData,
 }
 
 #[repr(align(128))]
-struct HotData {
+struct Header {
     /// The list of slots which have already been dropped and are ready to be claimed by insert
     /// operations.
     free_list: AtomicU32,
@@ -106,19 +105,11 @@ impl<K, V> SlotMap<K, V> {
     #[must_use]
     pub fn with_key(max_capacity: u32) -> Self {
         let slots = Vec::new(max_capacity);
-        let hot_data = Box::into_raw(Box::new(HotData {
-            free_list: AtomicU32::new(NIL),
-            len: AtomicU32::new(0),
-        }));
         // SAFETY: `slots` and `hot_data` outlive any calls into the collector.
-        let collector = unsafe { hyaline::CollectorHandle::new(&slots, hot_data) };
+        let collector = unsafe { hyaline::CollectorHandle::new(&slots) };
 
         SlotMap {
-            inner: SlotMapInner {
-                slots,
-                collector,
-                hot_data,
-            },
+            inner: SlotMapInner { slots, collector },
             marker: PhantomData,
         }
     }
@@ -371,7 +362,7 @@ impl<V> SlotMapInner<V> {
 
                     slot.generation.store(new_generation, Release);
 
-                    self.hot_data().len.fetch_add(1, Relaxed);
+                    self.header().len.fetch_add(1, Relaxed);
 
                     return id;
                 }
@@ -384,7 +375,7 @@ impl<V> SlotMapInner<V> {
 
         let id = self.slots.push_with_tag_with(tag, f);
 
-        self.hot_data().len.fetch_add(1, Relaxed);
+        self.header().len.fetch_add(1, Relaxed);
 
         id
     }
@@ -392,17 +383,19 @@ impl<V> SlotMapInner<V> {
     fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
-        // SAFETY: The pointer is valid and we have exclusive access to the collection.
-        let hot_data = unsafe { &mut *self.hot_data };
+        // SAFETY: We unbind the lifetime to convince the borrow checker that we don't borrow
+        // `self.slots` mutably more than once. We don't because the header and slots are occupying
+        // disjoint memory ranges.
+        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.slots.header_mut()) };
 
-        let free_list_head = *hot_data.free_list.get_mut();
+        let free_list_head = *header.free_list.get_mut();
 
         if free_list_head != NIL {
             // SAFETY: We always push indices of existing slots into the free-lists and the slots
             // vector never shrinks, therefore the index must have staid in bounds.
             let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
 
-            *hot_data.free_list.get_mut() = *slot.next_free.get_mut();
+            *header.free_list.get_mut() = *slot.next_free.get_mut();
 
             let generation = *slot.generation.get_mut();
 
@@ -418,14 +411,14 @@ impl<V> SlotMapInner<V> {
 
             *slot.generation.get_mut() = new_generation;
 
-            *hot_data.len.get_mut() += 1;
+            *header.len.get_mut() += 1;
 
             return id;
         }
 
         let id = self.slots.push_with_tag_with_mut(tag, f);
 
-        *hot_data.len.get_mut() += 1;
+        *header.len.get_mut() += 1;
 
         id
     }
@@ -444,7 +437,7 @@ impl<V> SlotMapInner<V> {
             return None;
         }
 
-        self.hot_data().len.fetch_sub(1, Relaxed);
+        self.header().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
@@ -461,20 +454,22 @@ impl<V> SlotMapInner<V> {
     }
 
     fn remove_mut(&mut self, id: SlotId) -> Option<V> {
+        // SAFETY: We unbind the lifetime to convince the borrow checker that we don't borrow
+        // `self.slots` mutably more than once. We don't because the header and slots are occupying
+        // disjoint memory ranges.
+        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.slots.header_mut()) };
+
         let slot = self.slots.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
-
-        // SAFETY: The pointer is valid and we have exclusive access to the collection.
-        let hot_data = unsafe { &mut *self.hot_data };
 
         if generation == id.generation() {
             let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
             *slot.generation.get_mut() = new_generation;
 
-            *slot.next_free.get_mut() = *hot_data.free_list.get_mut();
-            *hot_data.free_list.get_mut() = id.index;
+            *slot.next_free.get_mut() = *header.free_list.get_mut();
+            *header.free_list.get_mut() = id.index;
 
-            *hot_data.len.get_mut() -= 1;
+            *header.len.get_mut() -= 1;
 
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
@@ -518,7 +513,7 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        self.hot_data().len.fetch_sub(1, Relaxed);
+        self.header().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
@@ -548,7 +543,7 @@ impl<V> SlotMapInner<V> {
             return None;
         }
 
-        self.hot_data().len.fetch_sub(1, Relaxed);
+        self.header().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `INVALIDATED_TAG` such that no other threads can
         // access the slot going forward.
@@ -772,16 +767,15 @@ impl<V> SlotMapInner<V> {
     }
 
     fn free_list(&self) -> &AtomicU32 {
-        &self.hot_data().free_list
+        &self.header().free_list
     }
 
     fn len(&self) -> u32 {
-        self.hot_data().len.load(Relaxed)
+        self.header().len.load(Relaxed)
     }
 
-    fn hot_data(&self) -> &HotData {
-        // SAFETY: The pointer is valid.
-        unsafe { &*self.hot_data }
+    fn header(&self) -> &Header {
+        self.slots.header()
     }
 
     #[inline(always)]
@@ -797,12 +791,13 @@ impl<V> SlotMapInner<V> {
     }
 }
 
-unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>, hot_data: &HotData) {
+unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>) {
     let mut tail = head;
     let mut tail_slot;
 
     loop {
-        // SAFETY: The caller must ensure that `head` denotes a valid list of slots.
+        // SAFETY: The caller must ensure that `head` denotes a valid list of slots in `slots` and
+        // that `slots` is a valid pointer to the allocation of `Slot<V>`s.
         tail_slot = unsafe { &*slots.add(tail as usize) };
 
         let ptr = tail_slot.value.get().cast::<V>();
@@ -819,13 +814,19 @@ unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>, hot_data: &HotData) {
         tail = next_free;
     }
 
-    let mut free_list_head = hot_data.free_list.load(Acquire);
+    let header_size = mem::size_of::<Header>();
+
+    // SAFETY: The caller must ensure that `slots` is a valid pointer to the allocation of
+    // `Slot<V>`s, and that allocation has the `Header` right before the start of the slots.
+    let header = unsafe { &*slots.cast::<u8>().sub(header_size).cast::<Header>() };
+
+    let mut free_list_head = header.free_list.load(Acquire);
     let mut backoff = Backoff::new();
 
     loop {
         tail_slot.next_free.store(free_list_head, Relaxed);
 
-        match hot_data
+        match header
             .free_list
             .compare_exchange_weak(free_list_head, head, Release, Acquire)
         {
@@ -840,7 +841,8 @@ unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>, hot_data: &HotData) {
 
 unsafe fn reclaim_invalidated<V>(mut head: u32, slots: *const Slot<V>) {
     loop {
-        // SAFETY: The caller must ensure that `head` denotes a valid list of slots.
+        // SAFETY: The caller must ensure that `head` denotes a valid list of slots in `slots` and
+        // that `slots` is a valid pointer to the allocation of `Slot<V>`s.
         let slot = unsafe { &*slots.add(head as usize) };
 
         let generation = slot.generation.load(Relaxed);
@@ -921,6 +923,10 @@ impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
 
 impl<V> Drop for SlotMapInner<V> {
     fn drop(&mut self) {
+        if !core::mem::needs_drop::<V>() {
+            return;
+        }
+
         for slot in self.slots.iter_mut() {
             if *slot.generation.get_mut() & STATE_MASK != VACANT_TAG {
                 let ptr = slot.value.get_mut().as_mut_ptr();
@@ -932,10 +938,6 @@ impl<V> Drop for SlotMapInner<V> {
                 unsafe { ptr.drop_in_place() };
             }
         }
-
-        // SAFETY: We allocated this pointer using `Box::new` and there can be no remaining
-        // references to the allocation since we are being dropped.
-        let _ = unsafe { Box::from_raw(self.hot_data) };
     }
 }
 
@@ -1932,7 +1934,7 @@ mod tests {
 
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = if cfg!(miri) { 10 } else { 1000 };
+        const CAPACITY: u32 = if cfg!(miri) { 10 } else { 2000 };
 
         let map = SlotMap::new(CAPACITY);
 

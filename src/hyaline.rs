@@ -4,7 +4,7 @@
 
 use crate::{
     slot::{Slot, Vec},
-    HotData, NIL,
+    NIL,
 };
 use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use core::{
@@ -31,24 +31,16 @@ pub(crate) struct CollectorHandle {
 }
 
 impl CollectorHandle {
-    pub(crate) unsafe fn new<V>(slots: &Vec<V>, hot_data: *const HotData) -> Self {
+    pub(crate) unsafe fn new<V>(slots: &Vec<V>) -> Self {
+        // SAFETY: Pointers have the same ABI for all sized pointees.
+        let transmute_reclaim_fp = |fp: unsafe fn(u32, *const Slot<V>)| unsafe {
+            mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(fp)
+        };
         let ptr = Box::into_raw(Box::new(Collector {
             slots: slots.as_ptr().cast(),
             retirement_lists: ThreadLocal::new(),
-            // SAFETY: References and pointers have the same ABI for all sized pointees.
-            reclaim: unsafe {
-                mem::transmute::<
-                    unsafe fn(u32, *const Slot<V>, &HotData),
-                    unsafe fn(u32, *const u8, *const HotData),
-                >(crate::reclaim)
-            },
-            // SAFETY: Same as the previous.
-            reclaim_invalidated: unsafe {
-                mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(
-                    crate::reclaim_invalidated,
-                )
-            },
-            hot_data,
+            reclaim: transmute_reclaim_fp(crate::reclaim),
+            reclaim_invalidated: transmute_reclaim_fp(crate::reclaim_invalidated),
         }));
 
         CollectorHandle { ptr }
@@ -101,11 +93,9 @@ pub(crate) struct Collector {
     /// A pointer to the allocation of `slot::Slot<V>`s.
     slots: *const u8,
     /// The reclamation function for the list of retired slots.
-    reclaim: unsafe fn(u32, *const u8, *const HotData),
+    reclaim: unsafe fn(u32, *const u8),
     /// The reclamation function for the list of retired invalidated slots.
     reclaim_invalidated: unsafe fn(u32, *const u8),
-    /// A pointer to the free-list of the parent data structure.
-    hot_data: *const HotData,
 }
 
 impl PartialEq for Collector {
@@ -311,16 +301,12 @@ impl RetirementList {
             // SAFETY:
             // * We own the batch, which means that no more references to the slots can exist.
             // * We always push indices of existing vacant slots into the list.
-            // * `collector.slots` and `collector.hot_data` are the same pointers that were used to
-            //   create the collector.
-            unsafe { (collector.reclaim)(batch.head(), collector.slots, collector.hot_data) };
+            // * `collector.slots` and is the same pointer that was used to create the collector.
+            unsafe { (collector.reclaim)(batch.head(), collector.slots) };
         }
 
         if batch.invalidated_head() != NIL {
-            // SAFETY:
-            // * We own the batch, which means that no more references to the slots can exist.
-            // * We always push indices of existing invalidated slots into the list.
-            // * `collector.slots` and is the same pointer that was used to create the collector.
+            // SAFETY: Same as the `collector.reclaim` call above.
             unsafe { (collector.reclaim_invalidated)(batch.head(), collector.slots) };
         }
     }
@@ -345,7 +331,7 @@ struct Batch {
     node_capacity: usize,
     /// The number of `nodes`.
     node_len: usize,
-    /// An inline allocation of `capacity` nodes with `len` being intialized.
+    /// An inline allocation of `node_capacity` nodes with `node_len` being intialized.
     nodes: [Node; 0],
 }
 
