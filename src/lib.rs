@@ -262,8 +262,8 @@ impl<K: Key, V> SlotMap<K, V> {
 
     #[inline]
     #[must_use]
-    pub fn get_many_mut<const N: usize>(&mut self, keys: [K; N]) -> Option<[&mut V; N]> {
-        self.inner.get_many_mut(keys.map(Key::as_id))
+    pub fn get_disjoint_mut<const N: usize>(&mut self, keys: [K; N]) -> Option<[&mut V; N]> {
+        self.inner.get_disjoint_mut(keys.map(Key::as_id))
     }
 
     #[cfg(test)]
@@ -649,8 +649,8 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline]
-    fn get_many_mut<const N: usize>(&mut self, ids: [SlotId; N]) -> Option<[&mut V; N]> {
-        fn get_many_check_valid<const N: usize>(ids: &[SlotId; N], len: u32) -> bool {
+    fn get_disjoint_mut<const N: usize>(&mut self, ids: [SlotId; N]) -> Option<[&mut V; N]> {
+        fn get_disjoint_check_valid<const N: usize>(ids: &[SlotId; N], len: u32) -> bool {
             let mut valid = true;
 
             for (i, id) in ids.iter().enumerate() {
@@ -666,16 +666,16 @@ impl<V> SlotMapInner<V> {
 
         let len = self.slots.capacity_mut();
 
-        if get_many_check_valid(&ids, len) {
+        if get_disjoint_check_valid(&ids, len) {
             // SAFETY: We checked that all indices are disjunct and in bounds of the slots vector.
-            unsafe { self.get_many_unchecked_mut(ids) }
+            unsafe { self.get_disjoint_unchecked_mut(ids) }
         } else {
             None
         }
     }
 
     #[inline]
-    unsafe fn get_many_unchecked_mut<const N: usize>(
+    unsafe fn get_disjoint_unchecked_mut<const N: usize>(
         &mut self,
         ids: [SlotId; N],
     ) -> Option<[&mut V; N]> {
@@ -1818,46 +1818,58 @@ mod tests {
     }
 
     #[test]
-    fn get_many_mut() {
+    fn get_disjoint_mut() {
         let mut map = SlotMap::new(3);
 
         let x = map.insert_mut(1);
         let y = map.insert_mut(2);
         let z = map.insert_mut(3);
 
-        assert_eq!(map.get_many_mut([x, y]), Some([&mut 1, &mut 2]));
-        assert_eq!(map.get_many_mut([y, z]), Some([&mut 2, &mut 3]));
-        assert_eq!(map.get_many_mut([z, x]), Some([&mut 3, &mut 1]));
+        assert_eq!(map.get_disjoint_mut([x, y]), Some([&mut 1, &mut 2]));
+        assert_eq!(map.get_disjoint_mut([y, z]), Some([&mut 2, &mut 3]));
+        assert_eq!(map.get_disjoint_mut([z, x]), Some([&mut 3, &mut 1]));
 
-        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
-        assert_eq!(map.get_many_mut([z, y, x]), Some([&mut 3, &mut 2, &mut 1]));
+        assert_eq!(
+            map.get_disjoint_mut([x, y, z]),
+            Some([&mut 1, &mut 2, &mut 3]),
+        );
+        assert_eq!(
+            map.get_disjoint_mut([z, y, x]),
+            Some([&mut 3, &mut 2, &mut 1]),
+        );
 
-        assert_eq!(map.get_many_mut([x, x]), None);
-        assert_eq!(map.get_many_mut([x, SlotId::new(3, OCCUPIED_TAG)]), None);
+        assert_eq!(map.get_disjoint_mut([x, x]), None);
+        assert_eq!(
+            map.get_disjoint_mut([x, SlotId::new(3, OCCUPIED_TAG)]),
+            None,
+        );
 
         map.remove_mut(y);
 
-        assert_eq!(map.get_many_mut([x, z]), Some([&mut 1, &mut 3]));
+        assert_eq!(map.get_disjoint_mut([x, z]), Some([&mut 1, &mut 3]));
 
-        assert_eq!(map.get_many_mut([y]), None);
-        assert_eq!(map.get_many_mut([x, y]), None);
-        assert_eq!(map.get_many_mut([y, z]), None);
+        assert_eq!(map.get_disjoint_mut([y]), None);
+        assert_eq!(map.get_disjoint_mut([x, y]), None);
+        assert_eq!(map.get_disjoint_mut([y, z]), None);
 
         let y = map.insert_mut(2);
 
-        assert_eq!(map.get_many_mut([x, y, z]), Some([&mut 1, &mut 2, &mut 3]));
+        assert_eq!(
+            map.get_disjoint_mut([x, y, z]),
+            Some([&mut 1, &mut 2, &mut 3]),
+        );
 
         map.remove_mut(x);
         map.remove_mut(z);
 
-        assert_eq!(map.get_many_mut([y]), Some([&mut 2]));
+        assert_eq!(map.get_disjoint_mut([y]), Some([&mut 2]));
 
-        assert_eq!(map.get_many_mut([x]), None);
-        assert_eq!(map.get_many_mut([z]), None);
+        assert_eq!(map.get_disjoint_mut([x]), None);
+        assert_eq!(map.get_disjoint_mut([z]), None);
 
         map.remove_mut(y);
 
-        assert_eq!(map.get_many_mut([]), Some([]));
+        assert_eq!(map.get_disjoint_mut([]), Some([]));
     }
 
     #[test]
