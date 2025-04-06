@@ -53,7 +53,7 @@ impl CollectorHandle {
     }
 
     #[inline]
-    pub(crate) fn pin(&self) -> Guard<'_> {
+    pub fn pin(&self) -> Guard<'_> {
         let retirement_list = self.collector().retirement_lists.get_or(|| {
             RetirementList {
                 head: AtomicPtr::new(INACTIVE),
