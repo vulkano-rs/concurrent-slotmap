@@ -236,6 +236,16 @@ impl<K: Key, V> SlotMap<K, V> {
         self.inner.remove_mut(key.as_id())
     }
 
+    /// # Safety
+    ///
+    /// `key` must refer to a currently occupied slot. That also excludes a race condition when
+    /// calling this method.
+    #[inline]
+    pub unsafe fn remove_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
+        // SAFETY: Enforced by the caller.
+        unsafe { self.inner.remove_unchecked(key.as_id(), guard) }
+    }
+
     #[cfg(test)]
     fn remove_index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove_index(index, guard)
@@ -524,6 +534,39 @@ impl<V> SlotMapInner<V> {
         } else {
             None
         }
+    }
+
+    unsafe fn remove_unchecked<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> &'a V {
+        self.check_guard(guard);
+
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(id.index) };
+
+        let generation = slot.generation.load(Acquire);
+
+        debug_assert!(generation & STATE_MASK == OCCUPIED_TAG);
+
+        let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
+
+        let res = slot
+            .generation
+            .compare_exchange(generation, new_generation, Relaxed, Relaxed);
+
+        debug_assert!(res.is_ok());
+
+        self.header().len.fetch_sub(1, Relaxed);
+
+        // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
+        // the slot going forward. The caller must ensure that a race condition doesn't occur.
+        unsafe { guard.defer_reclaim(id.index, &self.slots) };
+
+        // SAFETY:
+        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
+        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
+        //   visible here.
+        // * The caller must ensure that the slot is occupied, which means it must have been
+        //   initialized in `SlotMap::insert[_mut]`.
+        unsafe { slot.value_unchecked() }
     }
 
     #[cfg(test)]
@@ -1931,6 +1974,18 @@ mod tests {
         let x = map.insert_with_tag_mut(42, 1);
         assert_eq!(x.generation() & TAG_MASK, 1);
         assert_eq!(map.get_mut(x), Some(&mut 42));
+    }
+
+    #[test]
+    fn remove_unchecked() {
+        let map = SlotMap::new(1);
+
+        let x = map.insert(69, &map.pin());
+
+        // SAFETY: `x` refers to an occupied slot.
+        assert_eq!(unsafe { map.remove_unchecked(x, &map.pin()) }, &69);
+
+        assert_eq!(map.get(x, &map.pin()), None);
     }
 
     #[test]
