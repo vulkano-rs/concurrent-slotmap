@@ -143,7 +143,7 @@ impl<K, V> SlotMap<K, V> {
 
     #[inline]
     #[must_use]
-    pub fn collector(&self) -> &hyaline::CollectorHandle {
+    pub fn collector(&self) -> &hyaline::Collector {
         &self.inner.collector
     }
 }
@@ -156,7 +156,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
     pub fn insert<'a>(&'a self, value: V, guard: &'a hyaline::Guard<'a>) -> K {
         self.insert_with_tag(value, 0, guard)
@@ -164,7 +164,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
@@ -181,7 +181,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
     pub fn insert_with_tag_with<'a>(
@@ -225,7 +225,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
     pub fn remove<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove(key.as_id(), guard)
@@ -253,7 +253,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline(always)]
     #[must_use]
     pub fn get<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
@@ -283,7 +283,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline(always)]
     #[must_use]
     pub unsafe fn get_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
@@ -303,7 +303,7 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
     #[must_use]
     pub fn iter<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Iter<'a, K, V> {
@@ -778,7 +778,7 @@ impl<V> SlotMapInner<V> {
 
     #[inline]
     fn collector(&self) -> &hyaline::Collector {
-        self.collector.collector()
+        &self.collector
     }
 
     fn free_list(&self) -> &AtomicU32 {

@@ -9,6 +9,7 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::{self, ManuallyDrop},
+    ops::Deref,
     panic::RefUnwindSafe,
     ptr, slice,
     sync::atomic::{
@@ -54,7 +55,7 @@ impl CollectorHandle {
 
     #[inline]
     pub(crate) fn pin(&self) -> Guard<'_> {
-        let retirement_list = self.collector().retirement_lists.get_or(|| {
+        let retirement_list = self.retirement_lists.get_or(|| {
             // SAFETY: `self.ptr` is obviously valid for our lifetime.
             unsafe {
                 RetirementList {
@@ -71,19 +72,13 @@ impl CollectorHandle {
 
         retirement_list.pin()
     }
-
-    #[inline]
-    pub(crate) fn collector(&self) -> &Collector {
-        // SAFETY: The pointer is valid.
-        unsafe { &*self.ptr }
-    }
 }
 
 impl Clone for CollectorHandle {
     #[inline]
     fn clone(&self) -> Self {
         #[allow(clippy::cast_sign_loss)]
-        if self.collector().handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
+        if self.handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
             std::process::abort();
         }
 
@@ -99,10 +94,20 @@ impl fmt::Debug for CollectorHandle {
     }
 }
 
+impl Deref for CollectorHandle {
+    type Target = Collector;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The pointer is valid.
+        unsafe { &*self.ptr }
+    }
+}
+
 impl PartialEq for CollectorHandle {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.collector() == other.collector()
+        **self == **other
     }
 }
 
@@ -111,7 +116,7 @@ impl Eq for CollectorHandle {}
 impl Drop for CollectorHandle {
     #[inline]
     fn drop(&mut self) {
-        if self.collector().handle_count.fetch_sub(1, Release) == 1 {
+        if self.handle_count.fetch_sub(1, Release) == 1 {
             atomic::fence(Acquire);
 
             // SAFETY: The handle count has gone to zero, which means that no other threads can
@@ -123,11 +128,17 @@ impl Drop for CollectorHandle {
     }
 }
 
-pub(crate) struct Collector {
+pub struct Collector {
     /// Per-thread retirement lists.
     retirement_lists: ThreadLocal<RetirementList>,
     /// The number of `CollectorHandle`s that exist.
     handle_count: AtomicUsize,
+}
+
+impl fmt::Debug for Collector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Collector").finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for Collector {
@@ -569,7 +580,9 @@ pub struct Guard<'a> {
 }
 
 impl Guard<'_> {
-    pub(crate) fn collector(&self) -> &Collector {
+    #[inline]
+    #[must_use]
+    pub fn collector(&self) -> &Collector {
         self.retirement_list.collector()
     }
 
