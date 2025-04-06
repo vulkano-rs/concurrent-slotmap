@@ -160,10 +160,11 @@ impl RetirementList {
             unsafe { self.enter() };
         }
 
-        Guard {
-            retirement_list: self,
-            marker: PhantomData,
-        }
+        // SAFETY:
+        // * We incremented the `guard_count` above such that the guard's drop implementation cannot
+        //   unpin the participant while another guard still exists.
+        // * We made sure to pin the participant if it wasn't already.
+        unsafe { Guard::new(self) }
     }
 
     #[inline]
@@ -554,7 +555,14 @@ pub struct Guard<'a> {
     marker: PhantomData<*const ()>,
 }
 
-impl Guard<'_> {
+impl<'a> Guard<'a> {
+    unsafe fn new(retirement_list: &'a RetirementList) -> Self {
+        Guard {
+            retirement_list,
+            marker: PhantomData,
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn collector(&self) -> &CollectorHandle {
@@ -581,6 +589,22 @@ impl Guard<'_> {
 impl fmt::Debug for Guard<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Guard").finish_non_exhaustive()
+    }
+}
+
+impl Clone for Guard<'_> {
+    #[inline]
+    fn clone(&self) -> Self {
+        let guard_count = self.retirement_list.guard_count.get();
+        self.retirement_list
+            .guard_count
+            .set(guard_count.checked_add(1).unwrap());
+
+        // SAFETY:
+        // * We incremented the `guard_count` above, such that the guard's drop implementation
+        //   cannot unpin the participant while another guard still exists.
+        // * The participant is already pinned as this guard's existence is a proof of that.
+        unsafe { Guard::new(self.retirement_list) }
     }
 }
 
