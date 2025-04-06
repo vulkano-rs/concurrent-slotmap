@@ -9,7 +9,6 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::{self, ManuallyDrop},
-    ops::Deref,
     panic::RefUnwindSafe,
     ptr, slice,
     sync::atomic::{
@@ -55,15 +54,14 @@ impl CollectorHandle {
 
     #[inline]
     pub(crate) fn pin(&self) -> Guard<'_> {
-        let retirement_list = self.retirement_lists.get_or(|| {
-            // SAFETY: `self.ptr` is obviously valid for our lifetime.
-            unsafe {
-                RetirementList {
-                    head: AtomicPtr::new(INACTIVE),
-                    collector: self.ptr,
-                    guard_count: Cell::new(0),
-                    batch: UnsafeCell::new(LocalBatch::new()),
-                }
+        let retirement_list = self.collector().retirement_lists.get_or(|| {
+            RetirementList {
+                head: AtomicPtr::new(INACTIVE),
+                // SAFETY: The collector cannot be dropped until all handles have been dropped, at
+                // which point it is impossible to access this handle.
+                collector: ManuallyDrop::new(unsafe { ptr::read(self) }),
+                guard_count: Cell::new(0),
+                batch: UnsafeCell::new(LocalBatch::new()),
             }
         });
 
@@ -72,13 +70,19 @@ impl CollectorHandle {
 
         retirement_list.pin()
     }
+
+    #[inline]
+    fn collector(&self) -> &Collector {
+        // SAFETY: The pointer is valid.
+        unsafe { &*self.ptr }
+    }
 }
 
 impl Clone for CollectorHandle {
     #[inline]
     fn clone(&self) -> Self {
         #[allow(clippy::cast_sign_loss)]
-        if self.handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
+        if self.collector().handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
             std::process::abort();
         }
 
@@ -94,20 +98,10 @@ impl fmt::Debug for CollectorHandle {
     }
 }
 
-impl Deref for CollectorHandle {
-    type Target = Collector;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: The pointer is valid.
-        unsafe { &*self.ptr }
-    }
-}
-
 impl PartialEq for CollectorHandle {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        **self == **other
+        self.ptr == other.ptr
     }
 }
 
@@ -116,7 +110,7 @@ impl Eq for CollectorHandle {}
 impl Drop for CollectorHandle {
     #[inline]
     fn drop(&mut self) {
-        if self.handle_count.fetch_sub(1, Release) == 1 {
+        if self.collector().handle_count.fetch_sub(1, Release) == 1 {
             atomic::fence(Acquire);
 
             // SAFETY: The handle count has gone to zero, which means that no other threads can
@@ -128,27 +122,12 @@ impl Drop for CollectorHandle {
     }
 }
 
-pub struct Collector {
+struct Collector {
     /// Per-thread retirement lists.
     retirement_lists: ThreadLocal<RetirementList>,
     /// The number of `CollectorHandle`s that exist.
     handle_count: AtomicUsize,
 }
-
-impl fmt::Debug for Collector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Collector").finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for Collector {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self, other)
-    }
-}
-
-impl Eq for Collector {}
 
 /// The retirement list tracking retired batches.
 #[repr(align(128))]
@@ -156,18 +135,14 @@ pub(crate) struct RetirementList {
     /// The list of retired batches.
     head: AtomicPtr<Node>,
     /// The parent collector.
-    collector: *const Collector,
+    collector: ManuallyDrop<CollectorHandle>,
     /// The number of `Guard`s that exist.
     guard_count: Cell<usize>,
     /// The current batch being prepared.
     batch: UnsafeCell<LocalBatch>,
 }
 
-// SAFETY: It is safe to send `collector` to another thread because it points to a heap allocation.
-unsafe impl Send for RetirementList {}
-
-// SAFETY: It is safe to share `collector` between threads because it is only used to create shared
-// references. The cells are never accessed concurrently.
+// SAFETY: The cells are never accessed concurrently.
 unsafe impl Sync for RetirementList {}
 
 // While `RetirementList` does contain interior mutability, this is never exposed to the user and
@@ -257,7 +232,7 @@ impl RetirementList {
 
         let mut len = 0;
 
-        for retirement_list in &self.collector().retirement_lists {
+        for retirement_list in &self.collector.collector().retirement_lists {
             if retirement_list.head.load(Relaxed) == INACTIVE {
                 continue;
             }
@@ -360,12 +335,6 @@ impl RetirementList {
             unsafe { (node.reclaim)(node.index, node.slots) };
         }
     }
-
-    fn collector(&self) -> &Collector {
-        // SAFETY: The constructor of `RetirementList` must ensure the pointer is valid for our
-        // lifetime.
-        unsafe { &*self.collector }
-    }
 }
 
 fn transmute_reclaim_fp<V>(fp: unsafe fn(u32, *const Slot<V>)) -> unsafe fn(u32, *const u8) {
@@ -411,6 +380,12 @@ union NodeLink {
 struct LocalBatch {
     ptr: *mut Batch,
 }
+
+// SAFETY: We own the batch and access to it is synchronized using mutable references.
+unsafe impl Send for LocalBatch {}
+
+// SAFETY: We own the batch and access to it is synchronized using mutable references.
+unsafe impl Sync for LocalBatch {}
 
 impl Default for LocalBatch {
     fn default() -> Self {
@@ -582,8 +557,8 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     #[inline]
     #[must_use]
-    pub fn collector(&self) -> &Collector {
-        self.retirement_list.collector()
+    pub fn collector(&self) -> &CollectorHandle {
+        &self.retirement_list.collector
     }
 
     pub(crate) unsafe fn defer_reclaim<V>(&self, index: u32, slots: &Vec<V>) {

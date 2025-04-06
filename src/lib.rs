@@ -143,7 +143,7 @@ impl<K, V> SlotMap<K, V> {
 
     #[inline]
     #[must_use]
-    pub fn collector(&self) -> &hyaline::Collector {
+    pub fn collector(&self) -> &hyaline::CollectorHandle {
         &self.inner.collector
     }
 }
@@ -804,7 +804,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline]
-    fn collector(&self) -> &hyaline::Collector {
+    fn collector(&self) -> &hyaline::CollectorHandle {
         &self.collector
     }
 
