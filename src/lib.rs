@@ -99,17 +99,26 @@ impl<V> SlotMap<SlotId, V> {
     pub fn new(max_capacity: u32) -> Self {
         Self::with_key(max_capacity)
     }
+
+    #[must_use]
+    pub fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
+        Self::with_collector_and_key(max_capacity, collector)
+    }
 }
 
 impl<K, V> SlotMap<K, V> {
     #[must_use]
     pub fn with_key(max_capacity: u32) -> Self {
-        let slots = Vec::new(max_capacity);
-        // SAFETY: `slots` and `hot_data` outlive any calls into the collector.
-        let collector = unsafe { hyaline::CollectorHandle::new(&slots) };
+        Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new())
+    }
 
+    #[must_use]
+    pub fn with_collector_and_key(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
         SlotMap {
-            inner: SlotMapInner { slots, collector },
+            inner: SlotMapInner {
+                slots: Vec::new(max_capacity),
+                collector,
+            },
             marker: PhantomData,
         }
     }
@@ -130,6 +139,12 @@ impl<K, V> SlotMap<K, V> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn collector(&self) -> &hyaline::CollectorHandle {
+        &self.inner.collector
     }
 }
 
@@ -791,28 +806,13 @@ impl<V> SlotMapInner<V> {
     }
 }
 
-unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>) {
-    let mut tail = head;
-    let mut tail_slot;
+unsafe fn reclaim<V>(index: u32, slots: *const Slot<V>) {
+    // SAFETY: The caller must ensure that `index` is in bounds of `slots` and that `slots` is a
+    // valid pointer to the allocation of `Slot<V>`s.
+    let slot = unsafe { &*slots.add(index as usize) };
 
-    loop {
-        // SAFETY: The caller must ensure that `head` denotes a valid list of slots in `slots` and
-        // that `slots` is a valid pointer to the allocation of `Slot<V>`s.
-        tail_slot = unsafe { &*slots.add(tail as usize) };
-
-        let ptr = tail_slot.value.get().cast::<V>();
-
-        // SAFETY: The caller must ensure that we have exclusive access to the slots in the list.
-        unsafe { ptr.drop_in_place() };
-
-        let next_free = tail_slot.next_free.load(Relaxed);
-
-        if next_free == NIL {
-            break;
-        }
-
-        tail = next_free;
-    }
+    // SAFETY: The caller must ensure that we have exclusive access to the slot.
+    unsafe { slot.value.get().cast::<V>().drop_in_place() };
 
     let header_size = mem::size_of::<Header>();
 
@@ -824,11 +824,11 @@ unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>) {
     let mut backoff = Backoff::new();
 
     loop {
-        tail_slot.next_free.store(free_list_head, Relaxed);
+        slot.next_free.store(free_list_head, Relaxed);
 
         match header
             .free_list
-            .compare_exchange_weak(free_list_head, head, Release, Acquire)
+            .compare_exchange_weak(free_list_head, index, Release, Acquire)
         {
             Ok(_) => break,
             Err(new_head) => {
@@ -839,32 +839,22 @@ unsafe fn reclaim<V>(head: u32, slots: *const Slot<V>) {
     }
 }
 
-unsafe fn reclaim_invalidated<V>(mut head: u32, slots: *const Slot<V>) {
-    loop {
-        // SAFETY: The caller must ensure that `head` denotes a valid list of slots in `slots` and
-        // that `slots` is a valid pointer to the allocation of `Slot<V>`s.
-        let slot = unsafe { &*slots.add(head as usize) };
+unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
+    // SAFETY: The caller must ensure that `index` is in bounds of `slots` and that `slots` is a
+    // valid pointer to the allocation of `Slot<V>`s.
+    let slot = unsafe { &*slots.add(index as usize) };
 
-        let generation = slot.generation.load(Relaxed);
+    let generation = slot.generation.load(Relaxed);
 
-        debug_assert!(generation & STATE_MASK == INVALIDATED_TAG);
+    debug_assert!(generation & STATE_MASK == INVALIDATED_TAG);
 
-        let new_generation = (generation & !STATE_MASK) | RECLAIMED_TAG;
+    let new_generation = (generation & !STATE_MASK) | RECLAIMED_TAG;
 
-        let res = slot
-            .generation
-            .compare_exchange(generation, new_generation, Release, Relaxed);
+    let res = slot
+        .generation
+        .compare_exchange(generation, new_generation, Release, Relaxed);
 
-        debug_assert!(res.is_ok());
-
-        let next_free = slot.next_free.load(Relaxed);
-
-        if next_free == NIL {
-            break;
-        }
-
-        head = next_free;
-    }
+    debug_assert!(res.is_ok());
 }
 
 impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {

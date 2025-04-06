@@ -2,10 +2,7 @@
 //!
 //! [Hyaline-1 memory reclamation technique]: https://arxiv.org/pdf/1905.07903
 
-use crate::{
-    slot::{Slot, Vec},
-    NIL,
-};
+use crate::{slot::Vec, Slot};
 use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use core::{
     cell::{Cell, UnsafeCell},
@@ -13,7 +10,7 @@ use core::{
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     panic::RefUnwindSafe,
-    ptr,
+    ptr, slice,
     sync::atomic::{
         self, AtomicPtr, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release, SeqCst},
@@ -26,24 +23,33 @@ use thread_local::ThreadLocal;
 #[allow(clippy::useless_transmute)]
 const INACTIVE: *mut Node = unsafe { mem::transmute(usize::MAX) };
 
-pub(crate) struct CollectorHandle {
+pub struct CollectorHandle {
     ptr: *mut Collector,
 }
 
+// SAFETY: `Collector` is `Send + Sync` and its lifetime is enforced with reference counting.
+unsafe impl Send for CollectorHandle {}
+
+// SAFETY: `Collector` is `Send + Sync` and its lifetime is enforced with reference counting.
+unsafe impl Sync for CollectorHandle {}
+
+impl Default for CollectorHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CollectorHandle {
-    pub(crate) unsafe fn new<V>(slots: &Vec<V>) -> Self {
-        // SAFETY: Pointers have the same ABI for all sized pointees.
-        let transmute_reclaim_fp = |fp: unsafe fn(u32, *const Slot<V>)| unsafe {
-            mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(fp)
-        };
+    #[must_use]
+    pub fn new() -> Self {
         let ptr = Box::into_raw(Box::new(Collector {
-            slots: slots.as_ptr().cast(),
             retirement_lists: ThreadLocal::new(),
-            reclaim: transmute_reclaim_fp(crate::reclaim),
-            reclaim_invalidated: transmute_reclaim_fp(crate::reclaim_invalidated),
+            handle_count: AtomicUsize::new(1),
         }));
 
-        CollectorHandle { ptr }
+        // SAFETY: We made sure that initialize the `handle_count` to `1` such that the handle's
+        // drop implementation cannot drop the `Collector` while another handle still exists.
+        unsafe { CollectorHandle { ptr } }
     }
 
     #[inline]
@@ -73,29 +79,55 @@ impl CollectorHandle {
     }
 }
 
+impl Clone for CollectorHandle {
+    #[inline]
+    fn clone(&self) -> Self {
+        #[allow(clippy::cast_sign_loss)]
+        if self.collector().handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
+            std::process::abort();
+        }
+
+        // SAFETY: We incremented the `handle_count` above such that the handle's drop
+        // implementation cannot drop the `Collector` while another handle still exists.
+        unsafe { CollectorHandle { ptr: self.ptr } }
+    }
+}
+
 impl fmt::Debug for CollectorHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CollectorHandle").finish_non_exhaustive()
     }
 }
 
+impl PartialEq for CollectorHandle {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.collector() == other.collector()
+    }
+}
+
+impl Eq for CollectorHandle {}
+
 impl Drop for CollectorHandle {
+    #[inline]
     fn drop(&mut self) {
-        // SAFETY: We allocated this pointer using `Box::new` and there can be no remaining
-        // references to the allocation since we are being dropped.
-        let _ = unsafe { Box::from_raw(self.ptr) };
+        if self.collector().handle_count.fetch_sub(1, Release) == 1 {
+            atomic::fence(Acquire);
+
+            // SAFETY: The handle count has gone to zero, which means that no other threads can
+            // register a new handle. The `Acquire` fence above ensures that the drop is
+            // synchronized with the above decrement, such that no access to the `Collector` can be
+            // ordered after the drop.
+            let _ = unsafe { Box::from_raw(self.ptr) };
+        }
     }
 }
 
 pub(crate) struct Collector {
     /// Per-thread retirement lists.
     retirement_lists: ThreadLocal<RetirementList>,
-    /// A pointer to the allocation of `slot::Slot<V>`s.
-    slots: *const u8,
-    /// The reclamation function for the list of retired slots.
-    reclaim: unsafe fn(u32, *const u8),
-    /// The reclamation function for the list of retired invalidated slots.
-    reclaim_invalidated: unsafe fn(u32, *const u8),
+    /// The number of `CollectorHandle`s that exist.
+    handle_count: AtomicUsize,
 }
 
 impl PartialEq for Collector {
@@ -159,13 +191,12 @@ impl RetirementList {
         // SAFETY: The caller must ensure that this method isn't called concurrently.
         let batch = unsafe { &mut *self.batch.get() };
 
-        // SAFETY: The caller must ensure that `index` is valid.
-        let slot = unsafe { slots.get_unchecked(index) };
+        let slots = slots.as_ptr().cast();
+        let reclaim = transmute_reclaim_fp(crate::reclaim::<V>);
 
-        slot.next_free.store(batch.head(), Relaxed);
-
-        // SAFETY: `index` is valid and the caller must ensure that it is not reachable anymore.
-        unsafe { batch.set_head(index) };
+        // SAFETY: The caller must ensure that `index` is valid and that it is not reachable
+        // anymore.
+        unsafe { batch.push(index, slots, reclaim) };
     }
 
     #[inline]
@@ -173,13 +204,12 @@ impl RetirementList {
         // SAFETY: The caller must ensure that this method isn't called concurrently.
         let batch = unsafe { &mut *self.batch.get() };
 
-        // SAFETY: The caller must ensure that `index` is valid.
-        let slot = unsafe { slots.get_unchecked(index) };
+        let slots = slots.as_ptr().cast();
+        let reclaim = transmute_reclaim_fp(crate::reclaim_invalidated::<V>);
 
-        slot.next_free.store(batch.invalidated_head(), Relaxed);
-
-        // SAFETY: `index` is valid and the caller must ensure that it is not reachable anymore.
-        unsafe { batch.set_invalidated_head(index) };
+        // SAFETY: The caller must ensure that `index` is valid and that it is not reachable
+        // anymore.
+        unsafe { batch.push(index, slots, reclaim) };
     }
 
     #[inline]
@@ -209,16 +239,32 @@ impl RetirementList {
 
         atomic::fence(SeqCst);
 
+        let retired_len = batch.len();
+
+        // SAFETY: `batch.len()` is the number of retired slots in the batch.
+        unsafe { batch.set_retired_len(retired_len) };
+
+        let mut len = 0;
+
         for retirement_list in &self.collector().retirement_lists {
             if retirement_list.head.load(Relaxed) == INACTIVE {
                 continue;
             }
 
-            batch.push_node(retirement_list);
+            if len >= retired_len {
+                // SAFETY: This node is never getting retired since it is ouside of `retired_len`.
+                unsafe { batch.push(0, ptr::null(), |_, _| {}) };
+            }
+
+            // SAFETY: We made sure that the index is in bounds above.
+            let node = unsafe { batch.as_mut_slice().get_unchecked_mut(len) };
+
+            node.link.retirement_list = &retirement_list.head;
+
+            len += 1;
         }
 
-        let nodes = batch.node_ptr();
-        let mut len = batch.node_len();
+        let nodes = batch.as_mut_ptr();
         let batch = batch.into_raw();
 
         atomic::fence(Acquire);
@@ -293,21 +339,14 @@ impl RetirementList {
         atomic::fence(Acquire);
 
         // SAFETY: The caller must ensure that we own the batch.
-        let batch = unsafe { LocalBatch::from_raw(batch) };
+        let mut batch = unsafe { LocalBatch::from_raw(batch) };
 
-        let collector = self.collector();
-
-        if batch.head() != NIL {
+        for node in batch.retired_as_mut_slice() {
             // SAFETY:
             // * We own the batch, which means that no more references to the slots can exist.
             // * We always push indices of existing vacant slots into the list.
-            // * `collector.slots` and is the same pointer that was used to create the collector.
-            unsafe { (collector.reclaim)(batch.head(), collector.slots) };
-        }
-
-        if batch.invalidated_head() != NIL {
-            // SAFETY: Same as the `collector.reclaim` call above.
-            unsafe { (collector.reclaim_invalidated)(batch.head(), collector.slots) };
+            // * `node.slots` is the same pointer that was used when pushing the node.
+            unsafe { (node.reclaim)(node.index, node.slots) };
         }
     }
 
@@ -318,20 +357,23 @@ impl RetirementList {
     }
 }
 
+fn transmute_reclaim_fp<V>(fp: unsafe fn(u32, *const Slot<V>)) -> unsafe fn(u32, *const u8) {
+    // SAFETY: Pointers have the same ABI for all sized pointees.
+    unsafe { mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(fp) }
+}
+
 /// A batch of retired slots.
 #[repr(C)]
 struct Batch {
     /// The number of threads that can still access the slots in this batch.
     ref_count: AtomicUsize,
-    /// The list of retired slots.
-    head: u32,
-    /// The list of retired invalidated slots.
-    invalidated_head: u32,
     /// The capacity of `nodes`.
-    node_capacity: usize,
+    capacity: usize,
     /// The number of `nodes`.
-    node_len: usize,
-    /// An inline allocation of `node_capacity` nodes with `node_len` being intialized.
+    len: usize,
+    /// The number of `nodes` that should be retired.
+    retired_len: usize,
+    /// An inline allocation of `capacity` nodes with `len` being intialized.
     nodes: [Node; 0],
 }
 
@@ -340,6 +382,12 @@ struct Node {
     link: NodeLink,
     /// The batch that this node is a part of.
     batch: *mut Batch,
+    /// The index of the retired slot.
+    index: u32,
+    /// A pointer to the allocation of `slot::Slot<V>`s.
+    slots: *const u8,
+    /// The reclamation function for the retired slot.
+    reclaim: unsafe fn(u32, *const u8),
 }
 
 union NodeLink {
@@ -375,10 +423,9 @@ impl LocalBatch {
         // SAFETY: We successfully allocated the batch.
         unsafe {
             *ptr::addr_of_mut!((*ptr).ref_count) = AtomicUsize::new(0);
-            *ptr::addr_of_mut!((*ptr).head) = NIL;
-            *ptr::addr_of_mut!((*ptr).invalidated_head) = NIL;
-            *ptr::addr_of_mut!((*ptr).node_capacity) = Self::MIN_CAP;
-            *ptr::addr_of_mut!((*ptr).node_len) = 0;
+            *ptr::addr_of_mut!((*ptr).capacity) = Self::MIN_CAP;
+            *ptr::addr_of_mut!((*ptr).len) = 0;
+            *ptr::addr_of_mut!((*ptr).retired_len) = 0;
         }
 
         LocalBatch { ptr }
@@ -395,77 +442,75 @@ impl LocalBatch {
     }
 
     #[inline]
-    fn head(&self) -> u32 {
+    fn capacity(&self) -> usize {
         // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).head }
+        unsafe { (*self.ptr).capacity }
     }
 
     #[inline]
-    fn invalidated_head(&self) -> u32 {
+    fn len(&self) -> usize {
         // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).invalidated_head }
+        unsafe { (*self.ptr).len }
+    }
+
+    #[inline]
+    fn retired_len(&self) -> usize {
+        // SAFETY: The pointer is valid.
+        unsafe { (*self.ptr).retired_len }
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        self.head() == NIL && self.invalidated_head() == NIL
+        self.len() == 0
     }
 
     #[inline]
-    unsafe fn set_head(&self, head: u32) {
-        // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).head = head };
-    }
-
-    #[inline]
-    unsafe fn set_invalidated_head(&self, head: u32) {
-        // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).invalidated_head = head };
-    }
-
-    #[inline]
-    fn node_capacity(&self) -> usize {
-        // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).node_capacity }
-    }
-
-    #[inline]
-    fn node_len(&self) -> usize {
-        // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).node_len }
-    }
-
-    #[inline]
-    fn node_ptr(&mut self) -> *mut Node {
+    fn as_mut_ptr(&mut self) -> *mut Node {
         // SAFETY: The pointer is valid.
         unsafe { ptr::addr_of_mut!((*self.ptr).nodes) }.cast()
     }
 
-    #[inline]
-    fn push_node(&mut self, retirement_list: &RetirementList) {
-        let len = self.node_len();
+    fn as_mut_slice(&mut self) -> &mut [Node] {
+        // SAFETY: The pointer is valid and the caller of `LocalBatch::set_len` must ensure that the
+        // length is the correct number of nodes that are initialized.
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
 
-        if len == self.node_capacity() {
+    #[inline]
+    fn retired_as_mut_slice(&mut self) -> &mut [Node] {
+        // SAFETY: The pointer is valid and the caller of `LocalBatch::set_retired_len` must ensure
+        // that the length is the correct number of nodes that should be retired.
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.retired_len()) }
+    }
+
+    #[inline]
+    unsafe fn push(&mut self, index: u32, slots: *const u8, reclaim: unsafe fn(u32, *const u8)) {
+        let len = self.len();
+
+        if len == self.capacity() {
             self.grow_one();
         }
 
         let node = Node {
             link: NodeLink {
-                retirement_list: &retirement_list.head,
+                retirement_list: ptr::null(),
             },
             batch: ptr::null_mut(),
+            index,
+            slots,
+            reclaim,
         };
 
         // SAFETY: We made sure that the index is in bounds above.
-        unsafe { self.node_ptr().add(len).write(node) };
+        unsafe { self.as_mut_ptr().add(len).write(node) };
 
         // SAFETY: We wrote the new element above.
-        unsafe { self.set_node_len(len + 1) };
+        unsafe { self.set_len(len + 1) };
     }
 
     #[inline(never)]
     fn grow_one(&mut self) {
-        let capacity = self.node_capacity();
+        let capacity = self.capacity();
         let new_capacity = capacity * 2;
         let layout = layout_for_capacity(capacity);
         let new_layout = layout_for_capacity(new_capacity);
@@ -484,19 +529,25 @@ impl LocalBatch {
         self.ptr = new_ptr.cast();
 
         // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).node_capacity = new_capacity };
+        unsafe { (*self.ptr).capacity = new_capacity };
     }
 
     #[inline]
-    unsafe fn set_node_len(&mut self, len: usize) {
+    unsafe fn set_len(&mut self, len: usize) {
         // SAFETY: The pointer is valid.
-        unsafe { (*self.ptr).node_len = len };
+        unsafe { (*self.ptr).len = len };
+    }
+
+    #[inline]
+    unsafe fn set_retired_len(&mut self, len: usize) {
+        // SAFETY: The pointer is valid.
+        unsafe { (*self.ptr).retired_len = len };
     }
 }
 
 impl Drop for LocalBatch {
     fn drop(&mut self) {
-        let layout = layout_for_capacity(self.node_capacity());
+        let layout = layout_for_capacity(self.capacity());
 
         // SAFETY:
         // * `self.ptr` was allocated using the global allocator.
