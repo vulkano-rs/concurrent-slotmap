@@ -1036,6 +1036,8 @@ impl SlotId {
 
     pub const TAG_MASK: u32 = TAG_MASK;
 
+    pub const STATE_BITS: u32 = STATE_BITS;
+
     pub const STATE_MASK: u32 = STATE_MASK;
 
     pub const OCCUPIED_TAG: u32 = OCCUPIED_TAG;
