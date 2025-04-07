@@ -355,7 +355,8 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
 
 impl<V> SlotMapInner<V> {
     fn pin(&self) -> hyaline::Guard<'_> {
-        self.collector.pin()
+        // SAFETY: The guard's lifetime is bound to the collection.
+        unsafe { self.collector.pin() }
     }
 
     fn insert_with_tag_with<'a>(

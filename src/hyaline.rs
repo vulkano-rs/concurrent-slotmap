@@ -52,8 +52,14 @@ impl CollectorHandle {
         unsafe { CollectorHandle { ptr } }
     }
 
+    /// # Safety
+    ///
+    /// The returned `Guard` must not outlive any collection that uses this collector. It would
+    /// result in the `Guard`'s drop implementation attempting to free slots from the already freed
+    /// collection, resulting in a Use-After-Free. You must ensure that the `Guard` has its
+    /// lifetime bound to the collections it protects.
     #[inline]
-    pub fn pin(&self) -> Guard<'_> {
+    pub unsafe fn pin(&self) -> Guard<'_> {
         let retirement_list = self.collector().retirement_lists.get_or(|| {
             RetirementList {
                 head: AtomicPtr::new(INACTIVE),
