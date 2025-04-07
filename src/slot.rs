@@ -368,6 +368,11 @@ impl<V> Slot<V> {
         self.generation.load(Acquire)
     }
 
+    #[inline]
+    pub fn value_ptr(&self) -> *mut V {
+        self.value.get().cast()
+    }
+
     /// # Safety
     ///
     /// The value must be initialized. You can use [`generation`] to determine the state of the
