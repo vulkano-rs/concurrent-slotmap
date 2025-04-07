@@ -17,7 +17,7 @@ use TryReserveErrorKind::{AllocError, CapacityOverflow};
 
 pub(crate) struct Vec<T> {
     allocation: virtual_buffer::Allocation,
-    slots: *mut Slot<T>,
+    slots: *mut u8,
     max_capacity: u32,
     capacity: AtomicU32,
     reserved_len: AtomicUsize,
@@ -47,14 +47,10 @@ impl<T> Vec<T> {
         let size = slots_offset.checked_add(size).ok_or(CapacityOverflow)?;
         let size = align_up(size, page_size());
         let allocation = Allocation::new(size).map_err(AllocError)?;
-        let slots = allocation
-            .ptr()
-            .wrapping_add(slots_offset)
-            .cast::<Slot<T>>();
+        let slots = allocation.ptr().wrapping_add(slots_offset);
         #[allow(clippy::cast_possible_truncation)]
         let capacity = ((size - slots_offset) / mem::size_of::<Slot<T>>()) as u32;
         let header = slots
-            .cast::<u8>()
             .wrapping_sub(mem::size_of::<Header>())
             .cast::<Header>();
 
@@ -81,12 +77,12 @@ impl<T> Vec<T> {
 
     #[inline]
     pub(crate) fn as_ptr(&self) -> *const Slot<T> {
-        self.slots
+        self.slots.cast()
     }
 
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut Slot<T> {
-        self.slots
+        self.slots.cast()
     }
 
     #[inline]
