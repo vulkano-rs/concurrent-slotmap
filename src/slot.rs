@@ -350,16 +350,30 @@ fn handle_alloc_error(err: Error) -> ! {
     panic!("allocation failed: {err}");
 }
 
-pub(crate) struct Slot<V> {
-    pub generation: AtomicU32,
-    pub next_free: AtomicU32,
-    pub value: UnsafeCell<MaybeUninit<V>>,
+pub struct Slot<V> {
+    pub(crate) generation: AtomicU32,
+    pub(crate) next_free: AtomicU32,
+    pub(crate) value: UnsafeCell<MaybeUninit<V>>,
 }
 
 impl<V: UnwindSafe> UnwindSafe for Slot<V> {}
 impl<V: RefUnwindSafe> RefUnwindSafe for Slot<V> {}
 
+// SAFETY: We only ever hand out references to a slot in the presence of a `hyaline::Guard`.
+unsafe impl<V: Sync> Sync for Slot<V> {}
+
 impl<V> Slot<V> {
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Acquire)
+    }
+
+    /// # Safety
+    ///
+    /// The value must be initialized. You can use [`generation`] to determine the state of the
+    /// slot.
+    ///
+    /// [`generation`]: Self::generation
     #[inline(always)]
     pub unsafe fn value_unchecked(&self) -> &V {
         // SAFETY: The caller must ensure that access to the cell's inner value is synchronized.
@@ -369,10 +383,22 @@ impl<V> Slot<V> {
         unsafe { value.assume_init_ref() }
     }
 
+    /// # Safety
+    ///
+    /// The value must be initialized. You can use [`generation`] to determine the state of the
+    /// slot.
+    ///
+    /// [`generation`]: Self::generation
     #[inline(always)]
     pub unsafe fn value_unchecked_mut(&mut self) -> &mut V {
         // SAFETY: The caller must ensure that the slot has been initialized.
         unsafe { self.value.get_mut().assume_init_mut() }
+    }
+}
+
+impl<V> fmt::Debug for Slot<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Slot").finish_non_exhaustive()
     }
 }
 

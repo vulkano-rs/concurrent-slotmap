@@ -18,7 +18,8 @@ use core::{
         Ordering::{Acquire, Relaxed, Release},
     },
 };
-use slot::{Slot, Vec};
+pub use slot::Slot;
+use slot::Vec;
 
 pub mod hyaline;
 mod slot;
@@ -145,6 +146,18 @@ impl<K, V> SlotMap<K, V> {
     #[must_use]
     pub fn collector(&self) -> &hyaline::CollectorHandle {
         &self.inner.collector
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
+    #[inline]
+    pub fn slots<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Slots<'a, V> {
+        self.inner.check_guard(guard);
+
+        Slots {
+            slots: self.inner.slots.iter(),
+        }
     }
 }
 
@@ -1212,14 +1225,6 @@ pub struct Iter<'a, K, V> {
     marker: PhantomData<fn(K) -> K>,
 }
 
-// SAFETY: `Iter` semantically holds a reference to all values, and references are safe to send to
-// another thread as long as the value is `Sync`. The key is a phantom parameter.
-unsafe impl<K, V: Sync> Send for Iter<'_, K, V> {}
-
-// SAFETY: `Iter` semantically holds a reference to all values, and references are safe to share
-// among threads as long as the value is `Sync`. The key is a phantom parameter.
-unsafe impl<K, V: Sync> Sync for Iter<'_, K, V> {}
-
 impl<K, V: fmt::Debug> fmt::Debug for Iter<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iter").finish_non_exhaustive()
@@ -1298,15 +1303,6 @@ pub struct IterMut<'a, K, V> {
     marker: PhantomData<fn(K) -> K>,
 }
 
-// SAFETY: `IterMut` semantically holds a mutable reference to all values, and mutable references
-// are safe to send to another thread as long as the value is `Send`. The key is a phantom
-// parameter.
-unsafe impl<K, V: Send> Send for IterMut<'_, K, V> {}
-
-// SAFETY: `IterMut` semantically holds a mutable reference to all values, and mutable references
-// are safe to share among threads as long as the value is `Sync`. The key is a phantom parameter.
-unsafe impl<K, V: Sync> Sync for IterMut<'_, K, V> {}
-
 impl<K, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IterMut").finish_non_exhaustive()
@@ -1371,6 +1367,39 @@ impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
 }
 
 impl<K: Key, V> FusedIterator for IterMut<'_, K, V> {}
+
+pub struct Slots<'a, V> {
+    slots: slice::Iter<'a, Slot<V>>,
+}
+
+impl<V: fmt::Debug> fmt::Debug for Slots<'_, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Slots").finish_non_exhaustive()
+    }
+}
+
+impl<'a, V> Iterator for Slots<'a, V> {
+    type Item = &'a Slot<V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.slots.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.slots.size_hint()
+    }
+}
+
+impl<V> DoubleEndedIterator for Slots<'_, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.slots.next_back()
+    }
+}
+
+impl<V> FusedIterator for Slots<'_, V> {}
 
 const fn is_occupied(generation: u32) -> bool {
     generation & STATE_MASK == OCCUPIED_TAG
