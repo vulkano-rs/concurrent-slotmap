@@ -612,7 +612,6 @@ impl<V> SlotMapInner<V> {
 
         let slot = self.slots.get(index)?;
         let mut generation = slot.generation.load(Relaxed);
-        let mut backoff = Backoff::new();
 
         loop {
             if !is_occupied(generation) {
@@ -628,10 +627,7 @@ impl<V> SlotMapInner<V> {
                 Relaxed,
             ) {
                 Ok(_) => break,
-                Err(new_generation) => {
-                    generation = new_generation;
-                    backoff.spin();
-                }
+                Err(new_generation) => generation = new_generation,
             }
         }
 
