@@ -152,6 +152,11 @@ impl<K, V> SlotMap<K, V> {
         &self.inner.collector
     }
 
+    #[inline]
+    pub fn pin(&self) -> hyaline::Guard<'_> {
+        self.inner.pin()
+    }
+
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
@@ -167,11 +172,6 @@ impl<K, V> SlotMap<K, V> {
 }
 
 impl<K: Key, V> SlotMap<K, V> {
-    #[inline]
-    pub fn pin(&self) -> hyaline::Guard<'_> {
-        self.inner.pin()
-    }
-
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
