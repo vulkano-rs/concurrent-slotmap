@@ -70,7 +70,7 @@ impl<T> Vec<T> {
             allocation,
             slots,
             max_capacity,
-            capacity: AtomicU32::new(capacity),
+            capacity: AtomicU32::new(cmp::min(capacity, max_capacity)),
             reserved_len: AtomicUsize::new(0),
             marker: PhantomData,
         })
