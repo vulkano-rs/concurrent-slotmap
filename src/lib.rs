@@ -97,11 +97,13 @@ unsafe impl<K, V: Send + Sync> Sync for SlotMap<K, V> {}
 
 impl<V> SlotMap<SlotId, V> {
     #[must_use]
+    #[track_caller]
     pub fn new(max_capacity: u32) -> Self {
         Self::with_key(max_capacity)
     }
 
     #[must_use]
+    #[track_caller]
     pub fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
         Self::with_collector_and_key(max_capacity, collector)
     }
@@ -109,11 +111,13 @@ impl<V> SlotMap<SlotId, V> {
 
 impl<K, V> SlotMap<K, V> {
     #[must_use]
+    #[track_caller]
     pub fn with_key(max_capacity: u32) -> Self {
         Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new())
     }
 
     #[must_use]
+    #[track_caller]
     pub fn with_collector_and_key(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
         SlotMap {
             inner: SlotMapInner {
@@ -152,6 +156,7 @@ impl<K, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
+    #[track_caller]
     pub fn slots<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Slots<'a, V> {
         self.inner.check_guard(guard);
 
@@ -171,6 +176,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
+    #[track_caller]
     pub fn insert<'a>(&'a self, value: V, guard: &'a hyaline::Guard<'a>) -> K {
         self.insert_with_tag(value, 0, guard)
     }
@@ -180,6 +186,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
+    #[track_caller]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
         K::from_id(self.inner.insert_with_tag_with(tag, guard, |_| value))
     }
@@ -188,6 +195,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
     #[inline]
+    #[track_caller]
     pub fn insert_with<'a>(&'a self, guard: &'a hyaline::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
         self.insert_with_tag_with(0, guard, f)
     }
@@ -197,6 +205,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
     #[inline]
+    #[track_caller]
     pub fn insert_with_tag_with<'a>(
         &'a self,
         tag: u32,
@@ -217,6 +226,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `tag` has more than the low 8 bits set.
     #[inline]
+    #[track_caller]
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
         K::from_id(self.inner.insert_with_tag_with_mut(tag, |_| value))
     }
@@ -230,6 +240,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `tag` has more than the low 8 bits set.
     #[inline]
+    #[track_caller]
     pub fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(K) -> V) -> K {
         let f = |id| f(K::from_id(id));
 
@@ -240,6 +251,7 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
+    #[track_caller]
     pub fn remove<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove(key.as_id(), guard)
     }
@@ -254,6 +266,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// `key` must refer to a currently occupied slot. That also excludes a race condition when
     /// calling this method.
     #[inline]
+    #[track_caller]
     pub unsafe fn remove_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
         // SAFETY: Enforced by the caller.
         unsafe { self.inner.remove_unchecked(key.as_id(), guard) }
@@ -265,6 +278,7 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 
     #[inline]
+    #[track_caller]
     pub fn invalidate<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.invalidate(key.as_id(), guard)
     }
@@ -279,6 +293,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline(always)]
     #[must_use]
+    #[track_caller]
     pub fn get<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.get(key.as_id(), guard)
     }
@@ -309,6 +324,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline(always)]
     #[must_use]
+    #[track_caller]
     pub unsafe fn get_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
         // SAFETY: Enforced by the caller.
         unsafe { self.inner.get_unchecked(key.as_id(), guard) }
@@ -329,6 +345,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn iter<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Iter<'a, K, V> {
         self.inner.check_guard(guard);
 
@@ -353,6 +370,7 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
+    #[track_caller]
     pub fn revive_or_insert_with<'a>(
         &'a self,
         guard: &'a hyaline::Guard<'a>,
@@ -372,6 +390,7 @@ impl<V> SlotMapInner<V> {
         unsafe { self.collector.pin() }
     }
 
+    #[track_caller]
     fn insert_with_tag_with<'a>(
         &'a self,
         tag: u32,
@@ -398,6 +417,7 @@ impl<V> SlotMapInner<V> {
         id
     }
 
+    #[track_caller]
     fn allocate_slot<'a>(
         &'a self,
         tag: u32,
@@ -446,6 +466,7 @@ impl<V> SlotMapInner<V> {
         }
     }
 
+    #[track_caller]
     fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
@@ -489,6 +510,7 @@ impl<V> SlotMapInner<V> {
         id
     }
 
+    #[track_caller]
     fn remove<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
@@ -550,6 +572,7 @@ impl<V> SlotMapInner<V> {
         }
     }
 
+    #[track_caller]
     unsafe fn remove_unchecked<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> &'a V {
         self.check_guard(guard);
 
@@ -628,6 +651,7 @@ impl<V> SlotMapInner<V> {
         Some(unsafe { slot.value_unchecked() })
     }
 
+    #[track_caller]
     fn invalidate<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
@@ -710,6 +734,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline(always)]
+    #[track_caller]
     fn get<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
@@ -838,6 +863,7 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline(always)]
+    #[track_caller]
     unsafe fn get_unchecked<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> &'a V {
         self.check_guard(guard);
 
@@ -883,8 +909,10 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline(always)]
+    #[track_caller]
     fn check_guard(&self, guard: &hyaline::Guard<'_>) {
         #[inline(never)]
+        #[track_caller]
         fn collector_mismatch() -> ! {
             panic!("the given guard does not belong to this collection");
         }
@@ -896,6 +924,7 @@ impl<V> SlotMapInner<V> {
 }
 
 impl<V> SlotMapInner<MaybeUninit<V>> {
+    #[track_caller]
     fn revive_or_insert_with<'a>(
         &'a self,
         guard: &'a hyaline::Guard<'a>,
@@ -1121,6 +1150,7 @@ impl SlotId {
 
     #[inline(always)]
     #[must_use]
+    #[track_caller]
     pub const fn new(index: u32, generation: u32) -> Self {
         assert!(is_occupied(generation));
 

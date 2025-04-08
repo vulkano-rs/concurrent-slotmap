@@ -25,6 +25,7 @@ pub(crate) struct Vec<T> {
 }
 
 impl<T> Vec<T> {
+    #[track_caller]
     pub fn new(max_capacity: u32) -> Self {
         handle_reserve(Self::try_new(max_capacity))
     }
@@ -111,6 +112,7 @@ impl<T> Vec<T> {
         unsafe { &mut *self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
     }
 
+    #[track_caller]
     pub fn push_with_tag_with(&self, tag: u32, f: impl FnOnce(SlotId) -> T) -> (SlotId, &Slot<T>) {
         // This cannot overflow because our capacity can never exceed `isize::MAX` bytes, and
         // because `self.reserve_for_push()` resets `self.reserved_len` back to `self.max_capacity`
@@ -142,6 +144,7 @@ impl<T> Vec<T> {
         (id, slot)
     }
 
+    #[track_caller]
     pub fn push_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> T) -> SlotId {
         let index = *self.reserved_len.get_mut();
 
@@ -173,6 +176,7 @@ impl<T> Vec<T> {
     }
 
     #[inline(never)]
+    #[track_caller]
     fn reserve_for_push(&self, len: usize) {
         handle_reserve(self.grow_amortized(len, 1));
     }
@@ -330,6 +334,7 @@ fn grow(
 }
 
 #[inline]
+#[track_caller]
 fn handle_reserve<T>(res: Result<T, TryReserveError>) -> T {
     match res.map_err(|e| e.kind) {
         Ok(x) => x,
@@ -339,6 +344,7 @@ fn handle_reserve<T>(res: Result<T, TryReserveError>) -> T {
 }
 
 #[inline(never)]
+#[track_caller]
 fn capacity_overflow() -> ! {
     panic!("capacity overflow");
 }
@@ -346,6 +352,7 @@ fn capacity_overflow() -> ! {
 // Dear Clippy, `Error` is 4 bytes.
 #[allow(clippy::needless_pass_by_value)]
 #[cold]
+#[track_caller]
 fn handle_alloc_error(err: Error) -> ! {
     panic!("allocation failed: {err}");
 }
