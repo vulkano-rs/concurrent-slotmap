@@ -14,7 +14,7 @@ use core::{
     num::NonZeroU32,
     slice,
     sync::atomic::{
-        AtomicU32,
+        self, AtomicU32,
         Ordering::{Acquire, Relaxed, Release},
     },
 };
@@ -270,7 +270,7 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 
     #[inline]
-    pub fn remove_invalidated(&self, key: K) -> Option<V> {
+    pub fn remove_invalidated(&self, key: K) -> Option<()> {
         self.inner.remove_invalidated(key.as_id())
     }
 
@@ -658,48 +658,53 @@ impl<V> SlotMapInner<V> {
         Some(unsafe { slot.value_unchecked() })
     }
 
-    fn remove_invalidated(&self, id: SlotId) -> Option<V> {
+    fn remove_invalidated(&self, id: SlotId) -> Option<()> {
         let slot = self.slots.get(id.index)?;
-
-        let old_generation = (id.generation() & !STATE_MASK) | RECLAIMED_TAG;
+        let mut generation = slot.generation.load(Relaxed);
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
-        if slot
-            .generation
-            .compare_exchange(old_generation, new_generation, Acquire, Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
-        //   slot must have been `RECLAIMED_TAG`, which means it must have been reclaimed in
-        //   `reclaim_invalidated`, which means it must have been invalidated in
-        //   `SlotMap::invalidate`, which means it must have been initialized in
-        //   `SlotMap::insert[_mut]`.
-        // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
-        //   slot will fail.
-        let value = unsafe { slot.value.get().cast::<V>().read() };
-
-        let mut free_list_head = self.free_list().load(Acquire);
-        let mut backoff = Backoff::new();
-
         loop {
-            slot.next_free.store(free_list_head, Relaxed);
+            if generation & !STATE_MASK != id.generation() & !STATE_MASK {
+                break None;
+            }
 
-            match self
-                .free_list()
-                .compare_exchange_weak(free_list_head, id.index, Release, Acquire)
-            {
-                Ok(_) => break Some(value),
-                Err(new_head) => {
-                    free_list_head = new_head;
-                    backoff.spin();
+            if generation & STATE_MASK == RECLAIMED_TAG {
+                match slot.generation.compare_exchange_weak(
+                    generation,
+                    new_generation,
+                    Acquire,
+                    Relaxed,
+                ) {
+                    Ok(_) => {
+                        // SAFETY:
+                        // * The `Acquire` ordering when loading the slot's generation synchronizes
+                        //   with the `Release` ordering in `SlotMap::insert`, making sure that the
+                        //   newly written value is visible here.
+                        // * The `compare_exchange_weak` above succeeded, which means that the
+                        //   previous state tag of the slot must have been `RECLAIMED_TAG`, which
+                        //   means it must have been reclaimed in `reclaim_invalidated`, which means
+                        //   it must have been invalidated in `SlotMap::invalidate`, which means it
+                        //   must have been initialized in `SlotMap::insert[_mut]`.
+                        // * We set the slot's state tag to `VACANT_TAG` such that future attempts
+                        //   to access the slot will fail.
+                        unsafe { reclaim(id.index, self.slots.as_ptr()) };
+
+                        break Some(());
+                    }
+                    Err(new_generation) => generation = new_generation,
                 }
+            } else if generation & STATE_MASK == INVALIDATED_TAG {
+                match slot.generation.compare_exchange_weak(
+                    generation,
+                    new_generation,
+                    Relaxed,
+                    Relaxed,
+                ) {
+                    Ok(_) => break Some(()),
+                    Err(new_generation) => generation = new_generation,
+                }
+            } else {
+                break None;
             }
         }
     }
@@ -949,17 +954,32 @@ unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
     // valid pointer to the allocation of `Slot<V>`s.
     let slot = unsafe { &*slots.add(index as usize) };
 
-    let generation = slot.generation.load(Relaxed);
+    let mut generation = slot.generation.load(Relaxed);
 
-    debug_assert!(generation & STATE_MASK == INVALIDATED_TAG);
+    while generation & STATE_MASK == INVALIDATED_TAG {
+        let new_generation = (generation & !STATE_MASK) | RECLAIMED_TAG;
 
-    let new_generation = (generation & !STATE_MASK) | RECLAIMED_TAG;
+        match slot
+            .generation
+            .compare_exchange_weak(generation, new_generation, Relaxed, Relaxed)
+        {
+            Ok(_) => return,
+            Err(new_generation) => generation = new_generation,
+        }
+    }
 
-    let res = slot
-        .generation
-        .compare_exchange(generation, new_generation, Release, Relaxed);
+    debug_assert!(generation & STATE_MASK == VACANT_TAG);
 
-    debug_assert!(res.is_ok());
+    atomic::fence(Acquire);
+
+    // SAFETY:
+    // * The `Acquire` fence after loading the slot's generation synchronizes with the `Release`
+    //   ordering in `SlotMap::insert`, making sure that the newly written value is visible here.
+    // * The previous state tag of the slot must have been `VACANT_TAG`, which means it must have
+    //   been removed in `SlotMap::remove_invalidated`, which means it must have been invalidated in
+    //   `SlotMap::invalidate`, which means it must have been initialized in
+    //   `SlotMap::insert[_mut]`.
+    unsafe { reclaim(index, slots) };
 }
 
 impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
@@ -2016,6 +2036,34 @@ mod tests {
         assert_eq!(unsafe { map.remove_unchecked(x, &map.pin()) }, &69);
 
         assert_eq!(map.get(x, &map.pin()), None);
+    }
+
+    #[test]
+    fn invalidate() {
+        let map = SlotMap::new(1);
+
+        let x = map.insert(69, &map.pin());
+
+        assert_eq!(map.invalidate(x, &map.pin()), Some(&69));
+        assert_eq!(map.invalidate(x, &map.pin()), None);
+        assert_eq!(map.get(x, &map.pin()), None);
+        assert_eq!(map.remove(x, &map.pin()), None);
+        assert_eq!(map.remove_invalidated(x), Some(()));
+        assert_eq!(map.remove_invalidated(x), None);
+        assert_eq!(map.get(x, &map.pin()), None);
+        assert_eq!(map.remove(x, &map.pin()), None);
+
+        let guard = &map.pin();
+        let y = map.insert(42, guard);
+
+        assert_eq!(map.invalidate(y, guard), Some(&42));
+        assert_eq!(map.invalidate(y, guard), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.remove(y, guard), None);
+        assert_eq!(map.remove_invalidated(y), Some(()));
+        assert_eq!(map.remove_invalidated(y), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.remove(y, guard), None);
     }
 
     #[test]
