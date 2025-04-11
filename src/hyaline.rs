@@ -59,6 +59,7 @@ impl CollectorHandle {
     /// collection, resulting in a Use-After-Free. You must ensure that the `Guard` has its
     /// lifetime bound to the collections it protects.
     #[inline]
+    #[must_use]
     pub unsafe fn pin(&self) -> Guard<'_> {
         let retirement_list = self.collector().retirement_lists.get_or(|| {
             RetirementList {
@@ -621,8 +622,10 @@ impl Drop for Guard<'_> {
         self.retirement_list.guard_count.set(guard_count - 1);
 
         if guard_count == 1 {
-            // SAFETY: We are dropping the last guard, so there cannot be any more references to any
-            // retired slots.
+            // SAFETY:
+            // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
+            // * We are dropping the last guard, so there cannot be any more references to any
+            //   retired slots.
             unsafe { self.retirement_list.leave() };
         }
     }

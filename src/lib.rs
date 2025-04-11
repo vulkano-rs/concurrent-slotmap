@@ -102,10 +102,16 @@ impl<V> SlotMap<SlotId, V> {
         Self::with_key(max_capacity)
     }
 
+    /// # Safety
+    ///
+    /// Please see the safety documentation of [`with_collector_and_key`].
+    ///
+    /// [`with_collector_and_key`]: Self::with_collector_and_key
     #[must_use]
     #[track_caller]
-    pub fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
-        Self::with_collector_and_key(max_capacity, collector)
+    pub unsafe fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
+        // SAFETY: Enforced by the caller.
+        unsafe { Self::with_collector_and_key(max_capacity, collector) }
     }
 }
 
@@ -113,12 +119,42 @@ impl<K, V> SlotMap<K, V> {
     #[must_use]
     #[track_caller]
     pub fn with_key(max_capacity: u32) -> Self {
-        Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new())
+        // SAFETY: It's not possible to obtain a `hyaline::Guard` that isn't bound to the collection
+        // without using either the unsafe `hyaline::CollectorHandle::pin` or the unsafe
+        // `SlotMap::with_collector[_and_key]` followed by `SlotMap::pin`.
+        unsafe { Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new()) }
     }
 
+    /// # Safety
+    ///
+    /// The given `collector` must not be used to create any `Guard` that outlives the collection.
+    /// It would result in the `Guard`'s drop implementation attempting to free slots from the
+    /// already freed collection, resulting in a Use-After-Free. You must ensure that the `Guard`
+    /// has its lifetime bound to the collections it protects.
+    ///
+    /// Note that it is not enough for [`CollectorHandle::pin`] to be unsafe because
+    /// [`SlotMap::pin`] is safe:
+    ///
+    /// ```no_run
+    /// # use concurrent_slotmap::{hyaline::CollectorHandle, SlotMap};
+    /// #
+    /// let collector = CollectorHandle::new();
+    /// let map1 = unsafe { SlotMap::<_, i32>::with_collector(1, collector.clone()) };
+    /// let guard = &map1.pin();
+    /// let map2 = unsafe { SlotMap::<_, i32>::with_collector(1, collector) };
+    ///
+    /// map2.remove(map2.insert(69, guard), guard);
+    ///
+    /// // undefined behavior! ⚠️
+    /// ```
+    ///
+    /// [`CollectorHandle::pin`]: hyaline::CollectorHandle::pin
     #[must_use]
     #[track_caller]
-    pub fn with_collector_and_key(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
+    pub unsafe fn with_collector_and_key(
+        max_capacity: u32,
+        collector: hyaline::CollectorHandle,
+    ) -> Self {
         SlotMap {
             inner: SlotMapInner {
                 slots: Vec::new(max_capacity),
@@ -153,6 +189,7 @@ impl<K, V> SlotMap<K, V> {
     }
 
     #[inline]
+    #[must_use]
     pub fn pin(&self) -> hyaline::Guard<'_> {
         self.inner.pin()
     }
@@ -386,8 +423,7 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
 
 impl<V> SlotMapInner<V> {
     fn pin(&self) -> hyaline::Guard<'_> {
-        // SAFETY: The guard's lifetime is bound to the collection.
-        unsafe { self.collector.pin() }
+        self.collector.pin()
     }
 
     #[track_caller]
