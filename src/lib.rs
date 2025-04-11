@@ -325,6 +325,16 @@ impl<K: Key, V> SlotMap<K, V> {
         self.inner.remove_invalidated(key.as_id())
     }
 
+    /// # Safety
+    ///
+    /// `key` must refer to a currently invalidated slot. That also excludes a race condition when
+    /// calling this method.
+    #[inline]
+    pub unsafe fn remove_invalidated_unchecked(&self, key: K) {
+        // SAFETY: Enforced by the caller.
+        unsafe { self.inner.remove_invalidated_unchecked(key.as_id()) };
+    }
+
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
@@ -768,6 +778,44 @@ impl<V> SlotMapInner<V> {
             } else {
                 break None;
             }
+        }
+    }
+
+    unsafe fn remove_invalidated_unchecked(&self, id: SlotId) {
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.slots.get_unchecked(id.index) };
+
+        let generation = slot.generation.load(Relaxed);
+
+        debug_assert!(
+            generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
+        );
+
+        let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
+
+        let res = slot
+            .generation
+            .compare_exchange(generation, new_generation, Relaxed, Relaxed);
+
+        debug_assert!(res.is_ok());
+
+        self.header().len.fetch_sub(1, Relaxed);
+
+        if generation & STATE_MASK == RECLAIMED_TAG {
+            atomic::fence(Acquire);
+
+            // SAFETY:
+            // * The `Acquire` fence after loading the slot's generation synchronizes with the
+            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
+            //   is visible here.
+            // * The previous state tag of the slot was `RECLAIMED_TAG`, which means it must have
+            //   been reclaimed in `reclaim_invalidated`, which means it must have been invalidated
+            //   in `SlotMap::invalidate`, which means it must have been initialized in
+            //   `SlotMap::insert[_mut]`.
+            // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
+            //   slot will fail.
+            // * The caller must ensure that a race condition doesn't occur.
+            unsafe { reclaim(id.index, self.slots.as_ptr()) };
         }
     }
 
@@ -2456,6 +2504,20 @@ mod tests {
         assert_eq!(map.remove_invalidated(y), None);
         assert_eq!(map.get(y, guard), None);
         assert_eq!(map.remove(y, guard), None);
+    }
+
+    #[test]
+    fn remove_invalidated_unchecked() {
+        let map = SlotMap::new(1);
+
+        let x = map.insert(69, &map.pin());
+
+        assert_eq!(map.invalidate(x, &map.pin()), Some(&69));
+
+        // SAFETY: `x` refers to an invalidated slot.
+        unsafe { map.remove_invalidated_unchecked(x) };
+
+        assert_eq!(map.get(x, &map.pin()), None);
     }
 
     #[test]
