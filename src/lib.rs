@@ -1261,7 +1261,7 @@ impl Eq for SlotId {}
 impl Hash for SlotId {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_u64().hash(state)
+        self.as_u64().hash(state);
     }
 }
 
@@ -1620,6 +1620,140 @@ mod tests {
     }
 
     #[test]
+    fn basic_usage_invalidated1() {
+        let map = SlotMap::new(10);
+        let guard = &map.pin();
+
+        let x = map.insert(69, guard);
+        let y = map.insert(42, guard);
+
+        assert_eq!(map.get(x, guard), Some(&69));
+        assert_eq!(map.get(y, guard), Some(&42));
+
+        map.invalidate(x, guard);
+        map.remove_invalidated(x);
+
+        let x2 = map.insert(12, guard);
+
+        assert_eq!(map.get(x2, guard), Some(&12));
+        assert_eq!(map.get(x, guard), None);
+
+        map.invalidate(y, guard);
+        map.invalidate(x2, guard);
+
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(x2, guard), None);
+
+        map.remove_invalidated(y);
+        map.remove_invalidated(x2);
+
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(x2, guard), None);
+    }
+
+    #[test]
+    fn basic_usage_invalidated2() {
+        let map = SlotMap::new(10);
+        let guard = &map.pin();
+
+        let x = map.insert(1, guard);
+        let y = map.insert(2, guard);
+        let z = map.insert(3, guard);
+
+        assert_eq!(map.get(x, guard), Some(&1));
+        assert_eq!(map.get(y, guard), Some(&2));
+        assert_eq!(map.get(z, guard), Some(&3));
+
+        map.invalidate(y, guard);
+        map.remove_invalidated(y);
+
+        let y2 = map.insert(20, guard);
+
+        assert_eq!(map.get(y2, guard), Some(&20));
+        assert_eq!(map.get(y, guard), None);
+
+        map.invalidate(x, guard);
+        map.invalidate(z, guard);
+        map.remove_invalidated(x);
+        map.remove_invalidated(z);
+
+        let x2 = map.insert(10, guard);
+
+        assert_eq!(map.get(x2, guard), Some(&10));
+        assert_eq!(map.get(x, guard), None);
+
+        let z2 = map.insert(30, guard);
+
+        assert_eq!(map.get(z2, guard), Some(&30));
+        assert_eq!(map.get(x, guard), None);
+
+        map.invalidate(x2, guard);
+
+        assert_eq!(map.get(x2, guard), None);
+
+        map.remove_invalidated(x2);
+
+        assert_eq!(map.get(x2, guard), None);
+
+        map.invalidate(y2, guard);
+        map.invalidate(z2, guard);
+
+        assert_eq!(map.get(y2, guard), None);
+        assert_eq!(map.get(z2, guard), None);
+
+        map.remove_invalidated(y2);
+        map.remove_invalidated(z2);
+
+        assert_eq!(map.get(y2, guard), None);
+        assert_eq!(map.get(z2, guard), None);
+    }
+
+    #[test]
+    fn basic_usage_invalidated3() {
+        let map = SlotMap::new(10);
+        let guard = &map.pin();
+
+        let x = map.insert(1, guard);
+        let y = map.insert(2, guard);
+
+        assert_eq!(map.get(x, guard), Some(&1));
+        assert_eq!(map.get(y, guard), Some(&2));
+
+        let z = map.insert(3, guard);
+
+        assert_eq!(map.get(z, guard), Some(&3));
+
+        map.invalidate(x, guard);
+        map.invalidate(z, guard);
+        map.remove_invalidated(x);
+        map.remove_invalidated(z);
+
+        let z2 = map.insert(30, guard);
+        let x2 = map.insert(10, guard);
+
+        assert_eq!(map.get(x2, guard), Some(&10));
+        assert_eq!(map.get(z2, guard), Some(&30));
+        assert_eq!(map.get(x, guard), None);
+        assert_eq!(map.get(z, guard), None);
+
+        map.invalidate(x2, guard);
+        map.invalidate(y, guard);
+        map.invalidate(z2, guard);
+
+        assert_eq!(map.get(x2, guard), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(z2, guard), None);
+
+        map.remove_invalidated(x2);
+        map.remove_invalidated(y);
+        map.remove_invalidated(z2);
+
+        assert_eq!(map.get(x2, guard), None);
+        assert_eq!(map.get(y, guard), None);
+        assert_eq!(map.get(z2, guard), None);
+    }
+
+    #[test]
     fn basic_usage_mut1() {
         let mut map = SlotMap::new(10);
 
@@ -1923,6 +2057,196 @@ mod tests {
         assert_eq!(*iter.next().unwrap().1, 1);
         assert_eq!(*iter.next().unwrap().1, 3);
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn reusing_slots1() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+        let y = map.insert(0, &map.pin());
+
+        map.remove(y, &map.pin());
+
+        let y2 = map.insert(0, &map.pin());
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove(x, &map.pin());
+
+        let x2 = map.insert(0, &map.pin());
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+
+        map.remove(y2, &map.pin());
+        map.remove(x2, &map.pin());
+    }
+
+    #[test]
+    fn reusing_slots2() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+
+        map.remove(x, &map.pin());
+
+        let x2 = map.insert(0, &map.pin());
+        assert_eq!(x.index, x2.index);
+        assert_ne!(x.generation, x2.generation);
+
+        let y = map.insert(0, &map.pin());
+        let z = map.insert(0, &map.pin());
+
+        map.remove(y, &map.pin());
+        map.remove(x2, &map.pin());
+
+        let x3 = map.insert(0, &map.pin());
+        let y2 = map.insert(0, &map.pin());
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove(x3, &map.pin());
+        map.remove(y2, &map.pin());
+        map.remove(z, &map.pin());
+    }
+
+    #[test]
+    fn reusing_slots3() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+        let y = map.insert(0, &map.pin());
+
+        map.remove(x, &map.pin());
+        map.remove(y, &map.pin());
+
+        let y2 = map.insert(0, &map.pin());
+        let x2 = map.insert(0, &map.pin());
+        let z = map.insert(0, &map.pin());
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove(x2, &map.pin());
+        map.remove(z, &map.pin());
+        map.remove(y2, &map.pin());
+
+        let y3 = map.insert(0, &map.pin());
+        let z2 = map.insert(0, &map.pin());
+        let x3 = map.insert(0, &map.pin());
+        assert_eq!(y3.index, y2.index);
+        assert_ne!(y3.generation, y2.generation);
+        assert_eq!(z2.index, z.index);
+        assert_ne!(z2.generation, z.generation);
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+
+        map.remove(x3, &map.pin());
+        map.remove(y3, &map.pin());
+        map.remove(z2, &map.pin());
+    }
+
+    #[test]
+    fn reusing_slots_invalidated1() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+        let y = map.insert(0, &map.pin());
+
+        map.invalidate(y, &map.pin());
+        map.remove_invalidated(y);
+
+        let y2 = map.insert(0, &map.pin());
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.invalidate(x, &map.pin());
+        map.remove_invalidated(x);
+
+        let x2 = map.insert(0, &map.pin());
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+
+        map.invalidate(y2, &map.pin());
+        map.invalidate(x2, &map.pin());
+        map.remove_invalidated(y2);
+        map.remove_invalidated(x2);
+    }
+
+    #[test]
+    fn reusing_slots_invalidated2() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+
+        map.invalidate(x, &map.pin());
+        map.remove_invalidated(x);
+
+        let x2 = map.insert(0, &map.pin());
+        assert_eq!(x.index, x2.index);
+        assert_ne!(x.generation, x2.generation);
+
+        let y = map.insert(0, &map.pin());
+        let z = map.insert(0, &map.pin());
+
+        map.invalidate(y, &map.pin());
+        map.invalidate(x2, &map.pin());
+        map.remove_invalidated(y);
+        map.remove_invalidated(x2);
+
+        let x3 = map.insert(0, &map.pin());
+        let y2 = map.insert(0, &map.pin());
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.invalidate(x3, &map.pin());
+        map.invalidate(y2, &map.pin());
+        map.invalidate(z, &map.pin());
+        map.remove_invalidated(x3);
+        map.remove_invalidated(y2);
+        map.remove_invalidated(z);
+    }
+
+    #[test]
+    fn reusing_slots_invalidated3() {
+        let map = SlotMap::new(10);
+
+        let x = map.insert(0, &map.pin());
+        let y = map.insert(0, &map.pin());
+
+        map.remove(x, &map.pin());
+        map.remove(y, &map.pin());
+
+        let y2 = map.insert(0, &map.pin());
+        let x2 = map.insert(0, &map.pin());
+        let z = map.insert(0, &map.pin());
+        assert_eq!(x2.index, x.index);
+        assert_ne!(x2.generation, x.generation);
+        assert_eq!(y2.index, y.index);
+        assert_ne!(y2.generation, y.generation);
+
+        map.remove(x2, &map.pin());
+        map.remove(z, &map.pin());
+        map.remove(y2, &map.pin());
+
+        let y3 = map.insert(0, &map.pin());
+        let z2 = map.insert(0, &map.pin());
+        let x3 = map.insert(0, &map.pin());
+        assert_eq!(y3.index, y2.index);
+        assert_ne!(y3.generation, y2.generation);
+        assert_eq!(z2.index, z.index);
+        assert_ne!(z2.generation, z.generation);
+        assert_eq!(x3.index, x2.index);
+        assert_ne!(x3.generation, x2.generation);
+
+        map.remove(x3, &map.pin());
+        map.remove(y3, &map.pin());
+        map.remove(z2, &map.pin());
     }
 
     #[test]
