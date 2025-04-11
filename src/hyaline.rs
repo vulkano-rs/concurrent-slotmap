@@ -61,7 +61,11 @@ impl CollectorHandle {
     #[inline]
     #[must_use]
     pub unsafe fn pin(&self) -> Guard<'_> {
+        let mut is_fresh_entry = false;
+
         let retirement_list = self.collector().retirement_lists.get_or(|| {
+            is_fresh_entry = true;
+
             RetirementList {
                 head: AtomicPtr::new(INACTIVE),
                 // SAFETY: The collector cannot be dropped until all handles have been dropped, at
@@ -72,8 +76,9 @@ impl CollectorHandle {
             }
         });
 
-        // FIXME:
-        atomic::fence(SeqCst);
+        if is_fresh_entry {
+            atomic::fence(SeqCst);
+        }
 
         retirement_list.pin()
     }
