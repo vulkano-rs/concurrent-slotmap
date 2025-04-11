@@ -733,6 +733,8 @@ impl<V> SlotMapInner<V> {
                     Relaxed,
                 ) {
                     Ok(_) => {
+                        self.header().len.fetch_sub(1, Relaxed);
+
                         // SAFETY:
                         // * The `Acquire` ordering when loading the slot's generation synchronizes
                         //   with the `Release` ordering in `SlotMap::insert`, making sure that the
@@ -757,7 +759,10 @@ impl<V> SlotMapInner<V> {
                     Relaxed,
                     Relaxed,
                 ) {
-                    Ok(_) => break Some(()),
+                    Ok(_) => {
+                        self.header().len.fetch_sub(1, Relaxed);
+                        break Some(());
+                    }
                     Err(new_generation) => generation = new_generation,
                 }
             } else {
