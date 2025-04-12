@@ -630,7 +630,10 @@ impl<V> SlotMapInner<V> {
 
         let generation = slot.generation.swap(new_generation, Acquire);
 
-        debug_assert!(is_occupied(generation));
+        assert_unsafe_precondition!(
+            is_occupied(generation),
+            "`id` must refer to a currently occupied slot",
+        );
 
         self.header().len.fetch_sub(1, Relaxed);
 
@@ -783,8 +786,9 @@ impl<V> SlotMapInner<V> {
 
         let generation = slot.generation.swap(new_generation, Relaxed);
 
-        debug_assert!(
+        assert_unsafe_precondition!(
             generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
+            "`id` must refer to a currently invalidated slot",
         );
 
         self.header().len.fetch_sub(1, Relaxed);
@@ -1241,6 +1245,7 @@ impl SlotId {
     #[inline(always)]
     #[must_use]
     pub const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
+        // TODO: Replace with `assert_unsafe_precondition` when it can be made const.
         debug_assert!(is_occupied(generation));
 
         // SAFETY: The caller must ensure that the state tag of `generation` is `OCCUPIED_TAG`.
@@ -1549,6 +1554,35 @@ impl Backoff {
             self.step += 1;
         }
     }
+}
+
+macro_rules! assert_unsafe_precondition {
+    ($condition:expr, $message:expr $(,)?) => {
+        // The nesting is intentional. There is a special path in the compiler for `if false`
+        // facilitating conditional compilation without `#[cfg]` and the problems that come with it.
+        if cfg!(debug_assertions) {
+            if !$condition {
+                crate::panic_nounwind(concat!("unsafe precondition(s) validated: ", $message));
+            }
+        }
+    };
+}
+use assert_unsafe_precondition;
+
+/// Polyfill for `core::panicking::panic_nounwind`.
+#[cold]
+#[inline(never)]
+fn panic_nounwind(message: &'static str) -> ! {
+    struct UnwindGuard;
+
+    impl Drop for UnwindGuard {
+        fn drop(&mut self) {
+            panic!();
+        }
+    }
+
+    let _guard = UnwindGuard;
+    std::panic::panic_any(message);
 }
 
 #[cfg(test)]
