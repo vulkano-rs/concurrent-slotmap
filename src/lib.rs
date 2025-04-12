@@ -628,13 +628,9 @@ impl<V> SlotMapInner<V> {
 
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
-        if cfg!(debug_assertions) {
-            let generation = slot.generation.swap(new_generation, Relaxed);
+        let generation = slot.generation.swap(new_generation, Acquire);
 
-            assert!(is_occupied(generation));
-        } else {
-            slot.generation.store(new_generation, Relaxed);
-        }
+        debug_assert!(is_occupied(generation));
 
         self.header().len.fetch_sub(1, Relaxed);
 
