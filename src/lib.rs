@@ -626,17 +626,15 @@ impl<V> SlotMapInner<V> {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(id.index) };
 
-        let generation = slot.generation.load(Acquire);
+        let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
-        debug_assert!(generation & STATE_MASK == OCCUPIED_TAG);
+        if cfg!(debug_assertions) {
+            let generation = slot.generation.swap(new_generation, Relaxed);
 
-        let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
-
-        let res = slot
-            .generation
-            .compare_exchange(generation, new_generation, Relaxed, Relaxed);
-
-        debug_assert!(res.is_ok());
+            assert!(is_occupied(generation));
+        } else {
+            slot.generation.store(new_generation, Relaxed);
+        }
 
         self.header().len.fetch_sub(1, Relaxed);
 
@@ -785,19 +783,13 @@ impl<V> SlotMapInner<V> {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.slots.get_unchecked(id.index) };
 
-        let generation = slot.generation.load(Relaxed);
+        let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
+
+        let generation = slot.generation.swap(new_generation, Relaxed);
 
         debug_assert!(
             generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
         );
-
-        let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
-
-        let res = slot
-            .generation
-            .compare_exchange(generation, new_generation, Relaxed, Relaxed);
-
-        debug_assert!(res.is_ok());
 
         self.header().len.fetch_sub(1, Relaxed);
 
