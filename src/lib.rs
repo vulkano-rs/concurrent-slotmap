@@ -1153,13 +1153,12 @@ impl Header {
 
     #[inline]
     fn shards(&self) -> HeaderShards<'_> {
-        let current_index = SHARD_INDEX.with(Cell::get);
-        let end_index = current_index.wrapping_sub(1) & (self.shards.len() - 1);
+        let shard_index = SHARD_INDEX.with(Cell::get);
 
         HeaderShards {
             shards: &self.shards,
-            current_index,
-            end_index,
+            shard_index,
+            yielded: 0,
         }
     }
 
@@ -1180,8 +1179,8 @@ impl Header {
 
 struct HeaderShards<'a> {
     shards: &'a [HeaderShard],
-    current_index: usize,
-    end_index: usize,
+    shard_index: usize,
+    yielded: usize,
 }
 
 impl<'a> Iterator for HeaderShards<'a> {
@@ -1189,9 +1188,9 @@ impl<'a> Iterator for HeaderShards<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_index != self.end_index {
-            let current_index = self.current_index;
-            self.current_index = current_index.wrapping_add(1) & (self.shards.len() - 1);
+        if self.yielded < self.shards.len() {
+            let current_index = (self.shard_index + self.yielded) & (self.shards.len() - 1);
+            self.yielded += 1;
 
             // SAFETY: `Header::shards` ensures that `current_index` starts out in bounds of the
             // shards and we made sure that the next iteration has an index that's in bounds too.
@@ -2620,6 +2619,22 @@ mod tests {
         unsafe { MaybeUninit::assume_init(map.remove_mut(y).unwrap()) };
     }
 
+    #[test]
+    fn header_shards() {
+        let map = SlotMap::<_, i32>::new(0);
+
+        thread::scope(|s| {
+            let map = &map;
+            let shard_count = SHARD_COUNT.load(Relaxed);
+
+            for _ in 0..shard_count {
+                s.spawn(move || {
+                    assert_eq!(map.inner.header().shards().count(), shard_count);
+                });
+            }
+        });
+    }
+
     // TODO: Testing concurrent generational collections is the most massive pain in the ass. We
     // aren't testing the actual implementations but rather ones that don't take the generation into
     // account because of that.
@@ -2661,7 +2676,7 @@ mod tests {
 
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = if cfg!(miri) { 400 } else { 8000 };
+        const CAPACITY: u32 = 8_000;
 
         let map = SlotMap::new(CAPACITY);
 
