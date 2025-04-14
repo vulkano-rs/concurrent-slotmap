@@ -23,6 +23,8 @@ use thread_local::ThreadLocal;
 #[allow(clippy::useless_transmute)]
 const INACTIVE: *mut Node = unsafe { mem::transmute(usize::MAX) };
 
+const MIN_RETIRED_LEN: usize = 64;
+
 pub struct CollectorHandle {
     ptr: *mut Collector,
 }
@@ -199,41 +201,30 @@ impl RetirementList {
         // anymore, that `slots` is a valid pointer to the allocation of `Slot`s, and that `reclaim`
         // is safe to call with the `index` and `slots`.
         unsafe { batch.push(index, slots, reclaim) };
-    }
 
-    #[inline]
-    unsafe fn leave(&self) {
-        // SAFETY: The caller must ensure that this method isn't called concurrently.
-        let batch_is_empty = unsafe { (*self.batch.get()).is_empty() };
-
-        if !batch_is_empty {
-            // SAFETY: The caller must ensure that this method isn't called concurrently and that
-            // there are no more references to any retired slots.
+        if batch.len() == MIN_RETIRED_LEN {
+            // SAFETY: The caller must ensure that this method isn't called concurrently.
             unsafe { self.retire() };
-        }
-
-        let head = self.head.swap(INACTIVE, Release);
-
-        if !head.is_null() {
-            // SAFETY: The caller must ensure that this method isn't called concurrently and that
-            // there are no more references to any retired slots.
-            unsafe { self.traverse(head) };
         }
     }
 
     #[inline(never)]
     unsafe fn retire(&self) {
         // SAFETY: The caller must ensure that this method isn't called concurrently.
-        let mut batch = mem::take(unsafe { &mut *self.batch.get() });
+        let batch = unsafe { &mut *self.batch.get() };
 
-        atomic::fence(SeqCst);
+        if batch.is_empty() {
+            return;
+        }
 
+        let mut batch = mem::take(batch);
         let retired_len = batch.len();
+        let mut len = 0;
 
         // SAFETY: `batch.len()` is the number of retired slots in the batch.
         unsafe { batch.set_retired_len(retired_len) };
 
-        let mut len = 0;
+        atomic::fence(SeqCst);
 
         for retirement_list in &self.collector.collector().retirement_lists {
             if retirement_list.head.load(Relaxed) == INACTIVE {
@@ -299,6 +290,17 @@ impl RetirementList {
         }
     }
 
+    #[inline]
+    unsafe fn leave(&self) {
+        let head = self.head.swap(INACTIVE, Release);
+
+        if !head.is_null() {
+            // SAFETY: The caller must ensure that this method isn't called concurrently and that
+            // there are no more references to any retired slots.
+            unsafe { self.traverse(head) };
+        }
+    }
+
     #[cold]
     unsafe fn traverse(&self, mut head: *mut Node) {
         atomic::fence(Acquire);
@@ -340,9 +342,27 @@ impl RetirementList {
     }
 }
 
-fn transmute_reclaim_fp<V>(fp: unsafe fn(u32, *const Slot<V>)) -> unsafe fn(u32, *const u8) {
-    // SAFETY: Pointers have the same ABI for all sized pointees.
-    unsafe { mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(fp) }
+impl Drop for Collector {
+    fn drop(&mut self) {
+        atomic::fence(Acquire);
+
+        for retirement_list in &mut self.retirement_lists {
+            let batch = retirement_list.batch.get_mut();
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            for node in batch.retired_as_mut_slice() {
+                // SAFETY:
+                // * We have mutable access to the batch, which means that no more references to the
+                //   slots can exist.
+                // * We always push indices of existing vacant slots into the list.
+                // * `node.slots` is the same pointer that was used when pushing the node.
+                unsafe { (node.reclaim)(node.index, node.slots) };
+            }
+        }
+    }
 }
 
 /// A batch of retired slots.
@@ -597,6 +617,17 @@ impl<'a> Guard<'a> {
         // * The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
         unsafe { self.retirement_list.defer_reclaim(index, slots, reclaim) }
     }
+
+    #[inline]
+    pub fn flush(&self) {
+        // SAFETY: `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
+        unsafe { self.retirement_list.retire() };
+    }
+}
+
+fn transmute_reclaim_fp<V>(fp: unsafe fn(u32, *const Slot<V>)) -> unsafe fn(u32, *const u8) {
+    // SAFETY: Pointers have the same ABI for all sized pointees.
+    unsafe { mem::transmute::<unsafe fn(u32, *const Slot<V>), unsafe fn(u32, *const u8)>(fp) }
 }
 
 impl fmt::Debug for Guard<'_> {

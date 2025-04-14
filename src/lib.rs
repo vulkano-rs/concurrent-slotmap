@@ -2135,12 +2135,14 @@ mod tests {
         let y = map.insert(0, &map.pin());
 
         map.remove(y, &map.pin());
+        map.pin().flush();
 
         let y2 = map.insert(0, &map.pin());
         assert_eq!(y2.index, y.index);
         assert_ne!(y2.generation, y.generation);
 
         map.remove(x, &map.pin());
+        map.pin().flush();
 
         let x2 = map.insert(0, &map.pin());
         assert_eq!(x2.index, x.index);
@@ -2157,6 +2159,7 @@ mod tests {
         let x = map.insert(0, &map.pin());
 
         map.remove(x, &map.pin());
+        map.pin().flush();
 
         let x2 = map.insert(0, &map.pin());
         assert_eq!(x.index, x2.index);
@@ -2167,6 +2170,7 @@ mod tests {
 
         map.remove(y, &map.pin());
         map.remove(x2, &map.pin());
+        map.pin().flush();
 
         let x3 = map.insert(0, &map.pin());
         let y2 = map.insert(0, &map.pin());
@@ -2189,6 +2193,7 @@ mod tests {
 
         map.remove(x, &map.pin());
         map.remove(y, &map.pin());
+        map.pin().flush();
 
         let y2 = map.insert(0, &map.pin());
         let x2 = map.insert(0, &map.pin());
@@ -2201,6 +2206,7 @@ mod tests {
         map.remove(x2, &map.pin());
         map.remove(z, &map.pin());
         map.remove(y2, &map.pin());
+        map.pin().flush();
 
         let y3 = map.insert(0, &map.pin());
         let z2 = map.insert(0, &map.pin());
@@ -2226,6 +2232,7 @@ mod tests {
 
         map.invalidate(y, &map.pin());
         map.remove_invalidated(y);
+        map.pin().flush();
 
         let y2 = map.insert(0, &map.pin());
         assert_eq!(y2.index, y.index);
@@ -2233,6 +2240,7 @@ mod tests {
 
         map.invalidate(x, &map.pin());
         map.remove_invalidated(x);
+        map.pin().flush();
 
         let x2 = map.insert(0, &map.pin());
         assert_eq!(x2.index, x.index);
@@ -2252,6 +2260,7 @@ mod tests {
 
         map.invalidate(x, &map.pin());
         map.remove_invalidated(x);
+        map.pin().flush();
 
         let x2 = map.insert(0, &map.pin());
         assert_eq!(x.index, x2.index);
@@ -2264,6 +2273,7 @@ mod tests {
         map.invalidate(x2, &map.pin());
         map.remove_invalidated(y);
         map.remove_invalidated(x2);
+        map.pin().flush();
 
         let x3 = map.insert(0, &map.pin());
         let y2 = map.insert(0, &map.pin());
@@ -2289,6 +2299,7 @@ mod tests {
 
         map.remove(x, &map.pin());
         map.remove(y, &map.pin());
+        map.pin().flush();
 
         let y2 = map.insert(0, &map.pin());
         let x2 = map.insert(0, &map.pin());
@@ -2301,6 +2312,7 @@ mod tests {
         map.remove(x2, &map.pin());
         map.remove(z, &map.pin());
         map.remove(y2, &map.pin());
+        map.pin().flush();
 
         let y3 = map.insert(0, &map.pin());
         let z2 = map.insert(0, &map.pin());
@@ -2508,6 +2520,8 @@ mod tests {
         assert_eq!(map.get(x, &map.pin()), None);
         assert_eq!(map.remove(x, &map.pin()), None);
 
+        map.pin().flush();
+
         let guard = &map.pin();
         let y = map.insert(42, guard);
 
@@ -2541,6 +2555,7 @@ mod tests {
 
         let x = map.insert(MaybeUninit::new(Box::new(69)), &map.pin());
         map.remove(x, &map.pin());
+        map.pin().flush();
 
         let guard = map.pin();
         let (y, value) = map.revive_or_insert_with(&guard, |_| MaybeUninit::new(Box::new(42)));
@@ -2600,7 +2615,7 @@ mod tests {
 
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = if cfg!(miri) { 10 } else { 2000 };
+        const CAPACITY: u32 = if cfg!(miri) { 400 } else { 8000 };
 
         let map = SlotMap::new(CAPACITY);
 
