@@ -186,28 +186,18 @@ impl RetirementList {
     }
 
     #[inline]
-    unsafe fn defer_reclaim<V>(&self, index: u32, slots: &Vec<V>) {
+    unsafe fn defer_reclaim(
+        &self,
+        index: u32,
+        slots: *const u8,
+        reclaim: unsafe fn(u32, *const u8),
+    ) {
         // SAFETY: The caller must ensure that this method isn't called concurrently.
         let batch = unsafe { &mut *self.batch.get() };
 
-        let slots = slots.as_ptr().cast();
-        let reclaim = transmute_reclaim_fp(crate::reclaim::<V>);
-
         // SAFETY: The caller must ensure that `index` is valid and that it is not reachable
-        // anymore.
-        unsafe { batch.push(index, slots, reclaim) };
-    }
-
-    #[inline]
-    unsafe fn defer_reclaim_invalidated<V>(&self, index: u32, slots: &Vec<V>) {
-        // SAFETY: The caller must ensure that this method isn't called concurrently.
-        let batch = unsafe { &mut *self.batch.get() };
-
-        let slots = slots.as_ptr().cast();
-        let reclaim = transmute_reclaim_fp(crate::reclaim_invalidated::<V>);
-
-        // SAFETY: The caller must ensure that `index` is valid and that it is not reachable
-        // anymore.
+        // anymore, that `slots` is a valid pointer to the allocation of `Slot`s, and that `reclaim`
+        // is safe to call with the `index` and `slots`.
         unsafe { batch.push(index, slots, reclaim) };
     }
 
@@ -568,6 +558,7 @@ pub struct Guard<'a> {
 }
 
 impl<'a> Guard<'a> {
+    #[inline]
     unsafe fn new(retirement_list: &'a RetirementList) -> Self {
         Guard {
             retirement_list,
@@ -581,20 +572,30 @@ impl<'a> Guard<'a> {
         &self.retirement_list.collector
     }
 
+    #[inline]
     pub(crate) unsafe fn defer_reclaim<V>(&self, index: u32, slots: &Vec<V>) {
+        let slots = slots.as_ptr().cast();
+        let reclaim = transmute_reclaim_fp(crate::reclaim::<V>);
+
         // SAFETY:
         // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
-        // * The caller must ensure that `index` is valid.
-        // * The caller must ensure that `index` is not reachable anymore.
-        unsafe { self.retirement_list.defer_reclaim(index, slots) };
+        // * The caller must ensure that `index` is valid and that it is not reachable anymore.
+        // * `slots` is a valid pointer to the allocation of `Slot<V>`s.
+        // * The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
+        unsafe { self.retirement_list.defer_reclaim(index, slots, reclaim) };
     }
 
+    #[inline]
     pub(crate) unsafe fn defer_reclaim_invalidated<V>(&self, index: u32, slots: &Vec<V>) {
+        let slots = slots.as_ptr().cast();
+        let reclaim = transmute_reclaim_fp(crate::reclaim_invalidated::<V>);
+
         // SAFETY:
         // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
-        // * The caller must ensure that `index` is valid.
-        // * The caller must ensure that `index` is not reachable anymore.
-        unsafe { self.retirement_list.defer_reclaim_invalidated(index, slots) }
+        // * The caller must ensure that `index` is valid and that it is not reachable anymore.
+        // * `slots` is a valid pointer to the allocation of `Slot<V>`s.
+        // * The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
+        unsafe { self.retirement_list.defer_reclaim(index, slots, reclaim) }
     }
 }
 
