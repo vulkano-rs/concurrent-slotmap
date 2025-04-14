@@ -6,7 +6,7 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     panic::{RefUnwindSafe, UnwindSafe},
-    ptr, slice,
+    slice,
     sync::atomic::{
         AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release},
@@ -47,33 +47,31 @@ impl<T> Vec<T> {
         let slots_offset = align_up(mem::size_of::<Header>(), mem::align_of::<Slot<T>>());
         let size = slots_offset.checked_add(size).ok_or(CapacityOverflow)?;
         let size = align_up(size, page_size());
-        let allocation = Allocation::new(size).map_err(AllocError)?;
-        let slots = allocation.ptr().wrapping_add(slots_offset);
-        #[allow(clippy::cast_possible_truncation)]
-        let capacity = ((size - slots_offset) / mem::size_of::<Slot<T>>()) as u32;
-        let header = slots
-            .wrapping_sub(mem::size_of::<Header>())
-            .cast::<Header>();
+        let initial_size = align_up(slots_offset, page_size());
 
+        let allocation = Allocation::new(size).map_err(AllocError)?;
         allocation
-            .commit(allocation.ptr(), size)
+            .commit(allocation.ptr(), initial_size)
             .map_err(AllocError)?;
 
-        // SAFETY: `header` is a valid pointer to the `Header` we made sure to allocate space for
-        // above.
-        unsafe {
-            *ptr::addr_of_mut!((*header).free_list) = AtomicU32::new(NIL);
-            *ptr::addr_of_mut!((*header).len) = AtomicU32::new(0);
-        }
+        let slots = allocation.ptr().wrapping_add(slots_offset);
 
-        Ok(Vec {
+        #[allow(clippy::cast_possible_truncation)]
+        let capacity = ((initial_size - slots_offset) / mem::size_of::<Slot<T>>()) as u32;
+        let capacity = cmp::min(capacity, max_capacity);
+
+        let mut vec = Vec {
             allocation,
             slots,
             max_capacity,
-            capacity: AtomicU32::new(cmp::min(capacity, max_capacity)),
+            capacity: AtomicU32::new(capacity),
             reserved_len: AtomicUsize::new(0),
             marker: PhantomData,
-        })
+        };
+
+        *vec.header_mut().free_list.get_mut() = NIL;
+
+        Ok(vec)
     }
 
     #[inline]
