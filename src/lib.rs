@@ -740,8 +740,6 @@ impl<V> SlotMapInner<V> {
                     Relaxed,
                 ) {
                     Ok(_) => {
-                        self.header().len.fetch_sub(1, Relaxed);
-
                         // SAFETY:
                         // * The `Acquire` ordering when loading the slot's generation synchronizes
                         //   with the `Release` ordering in `SlotMap::insert`, making sure that the
@@ -766,10 +764,7 @@ impl<V> SlotMapInner<V> {
                     Relaxed,
                     Relaxed,
                 ) {
-                    Ok(_) => {
-                        self.header().len.fetch_sub(1, Relaxed);
-                        break Some(());
-                    }
+                    Ok(_) => break Some(()),
                     Err(new_generation) => generation = new_generation,
                 }
             } else {
@@ -790,8 +785,6 @@ impl<V> SlotMapInner<V> {
             generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
             "`id` must refer to a currently invalidated slot",
         );
-
-        self.header().len.fetch_sub(1, Relaxed);
 
         if generation & STATE_MASK == RECLAIMED_TAG {
             atomic::fence(Acquire);
