@@ -9,7 +9,7 @@ const ITERATIONS: u32 = 100_000;
 const THREADS: u32 = 10;
 
 #[bench]
-fn concurrent_slotmap(b: &mut Bencher) {
+fn get_contended_concurrent_slotmap(b: &mut Bencher) {
     b.iter(|| {
         let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
         let id = map.insert([0usize; 2], &map.pin());
@@ -27,7 +27,7 @@ fn concurrent_slotmap(b: &mut Bencher) {
 }
 
 #[bench]
-fn rwlock_slotmap(b: &mut Bencher) {
+fn get_contended_rwlock_slotmap(b: &mut Bencher) {
     b.iter(|| {
         let map = RwLock::new(slotmap::SlotMap::new());
         let id = map.write().unwrap().insert([0usize; 2]);
@@ -41,5 +41,29 @@ fn rwlock_slotmap(b: &mut Bencher) {
                 });
             }
         });
+    });
+}
+
+#[bench]
+fn get_uncontended_concurrent_slotmap(b: &mut Bencher) {
+    b.iter(|| {
+        let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
+        let id = map.insert([0usize; 2], &map.pin());
+
+        for _ in black_box(0..ITERATIONS / THREADS) {
+            black_box(map.get(black_box(id), &map.pin()));
+        }
+    });
+}
+
+#[bench]
+fn get_uncontended_rwlock_slotmap(b: &mut Bencher) {
+    b.iter(|| {
+        let map = RwLock::new(slotmap::SlotMap::new());
+        let id = map.write().unwrap().insert([0usize; 2]);
+
+        for _ in black_box(0..ITERATIONS / THREADS) {
+            black_box(map.read().unwrap().get(black_box(id)));
+        }
     });
 }

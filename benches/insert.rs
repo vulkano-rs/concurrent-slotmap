@@ -9,7 +9,7 @@ const ITERATIONS: u32 = 100_000;
 const THREADS: u32 = 10;
 
 #[bench]
-fn concurrent_slotmap(b: &mut Bencher) {
+fn insert_contended_concurrent_slotmap(b: &mut Bencher) {
     b.iter(|| {
         let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
 
@@ -28,7 +28,7 @@ fn concurrent_slotmap(b: &mut Bencher) {
 }
 
 #[bench]
-fn rwlock_slotmap(b: &mut Bencher) {
+fn insert_contended_rwlock_slotmap(b: &mut Bencher) {
     b.iter(|| {
         let map = RwLock::new(slotmap::SlotMap::new());
 
@@ -41,6 +41,32 @@ fn rwlock_slotmap(b: &mut Bencher) {
                 });
             }
         });
+
+        map
+    });
+}
+
+#[bench]
+fn insert_uncontended_concurrent_slotmap(b: &mut Bencher) {
+    b.iter(|| {
+        let map = concurrent_slotmap::SlotMap::new(ITERATIONS);
+
+        for _ in black_box(0..ITERATIONS / THREADS) {
+            map.insert(black_box([0usize; 2]), &map.pin());
+        }
+
+        map
+    });
+}
+
+#[bench]
+fn insert_uncontended_rwlock_slotmap(b: &mut Bencher) {
+    b.iter(|| {
+        let map = RwLock::new(slotmap::SlotMap::new());
+
+        for _ in black_box(0..ITERATIONS / THREADS) {
+            map.write().unwrap().insert(black_box([0usize; 2]));
+        }
 
         map
     });
