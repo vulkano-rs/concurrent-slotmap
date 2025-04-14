@@ -2,7 +2,7 @@
 //!
 //! [Hyaline-1 memory reclamation technique]: https://arxiv.org/pdf/1905.07903
 
-use crate::{slot::Vec, Slot};
+use crate::{slot::Vec, Slot, SHARD_COUNT};
 use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use core::{
     cell::{Cell, UnsafeCell},
@@ -16,6 +16,7 @@ use core::{
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
+use std::{num::NonZeroUsize, thread};
 use thread_local::ThreadLocal;
 
 // SAFETY: `usize` and `*mut Node` have the same layout.
@@ -44,6 +45,13 @@ impl Default for CollectorHandle {
 impl CollectorHandle {
     #[must_use]
     pub fn new() -> Self {
+        if SHARD_COUNT.load(Relaxed) == 0 {
+            let num_cpus = thread::available_parallelism()
+                .map(NonZeroUsize::get)
+                .unwrap_or(1);
+            SHARD_COUNT.store(num_cpus.next_power_of_two(), Relaxed);
+        }
+
         let ptr = Box::into_raw(Box::new(Collector {
             retirement_lists: ThreadLocal::new(),
             handle_count: AtomicUsize::new(1),
@@ -67,6 +75,8 @@ impl CollectorHandle {
 
         let retirement_list = self.collector().retirement_lists.get_or(|| {
             is_fresh_entry = true;
+
+            crate::set_shard_index();
 
             RetirementList {
                 head: AtomicPtr::new(INACTIVE),

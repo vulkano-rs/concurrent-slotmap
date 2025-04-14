@@ -1,4 +1,4 @@
-use crate::{Header, SlotId, NIL, OCCUPIED_TAG};
+use crate::{Header, HeaderShard, SlotId, NIL, OCCUPIED_TAG, SHARD_COUNT};
 use core::{
     alloc::Layout,
     cell::UnsafeCell,
@@ -6,7 +6,7 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     panic::{RefUnwindSafe, UnwindSafe},
-    slice,
+    ptr, slice,
     sync::atomic::{
         AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release},
@@ -31,7 +31,7 @@ impl<T> Vec<T> {
     }
 
     pub fn try_new(max_capacity: u32) -> Result<Self, TryReserveError> {
-        assert!(mem::align_of::<Header>() <= page_size());
+        assert!(mem::align_of::<HeaderShard>() <= page_size());
         assert!(mem::align_of::<Slot<T>>() <= page_size());
 
         let size = usize::try_from(max_capacity)
@@ -44,7 +44,8 @@ impl<T> Vec<T> {
             return Err(CapacityOverflow.into());
         }
 
-        let slots_offset = align_up(mem::size_of::<Header>(), mem::align_of::<Slot<T>>());
+        let header_size = SHARD_COUNT.load(Relaxed) * mem::size_of::<HeaderShard>();
+        let slots_offset = align_up(header_size, mem::align_of::<Slot<T>>());
         let size = slots_offset.checked_add(size).ok_or(CapacityOverflow)?;
         let size = align_up(size, page_size());
         let initial_size = align_up(slots_offset, page_size());
@@ -69,7 +70,9 @@ impl<T> Vec<T> {
             marker: PhantomData,
         };
 
-        *vec.header_mut().free_list.get_mut() = NIL;
+        for shard in vec.header_mut().shards_mut() {
+            *shard.free_list.get_mut() = NIL;
+        }
 
         Ok(vec)
     }
@@ -94,20 +97,16 @@ impl<T> Vec<T> {
         *self.capacity.get_mut()
     }
 
+    #[inline]
     pub fn header(&self) -> &Header {
-        let header_size = mem::size_of::<Header>();
-
-        // SAFETY: We made sure to allocate space for the `Header` and it's right before the
-        // beginning of the slots.
-        unsafe { &*self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
+        // SAFETY: `self.slots` is a valid pointer to our allocation of `Slot<V>`s.
+        unsafe { &*header_ptr_from_slots(self.slots) }
     }
 
+    #[inline]
     pub fn header_mut(&mut self) -> &mut Header {
-        let header_size = mem::size_of::<Header>();
-
-        // SAFETY: We made sure to allocate space for the `Header` and it's right before the
-        // beginning of the slots.
-        unsafe { &mut *self.slots.cast::<u8>().sub(header_size).cast::<Header>() }
+        // SAFETY: `self.slots` is a valid pointer to our allocation of `Slot<V>`s.
+        unsafe { &mut *header_ptr_from_slots(self.slots).cast_mut() }
     }
 
     #[track_caller]
@@ -287,6 +286,18 @@ impl<T> Vec<T> {
     }
 }
 
+#[inline]
+pub(crate) unsafe fn header_ptr_from_slots(slots: *const u8) -> *const Header {
+    let shard_count = SHARD_COUNT.load(Relaxed);
+    let header_size = shard_count * mem::size_of::<HeaderShard>();
+
+    // SAFETY: The caller must ensure that `slots` is a valid pointer to the allocation of
+    // `Slot<V>`s, and that allocation has the `Header` right before the start of the slots.
+    let header = unsafe { slots.sub(header_size) }.cast::<HeaderShard>();
+
+    ptr::slice_from_raw_parts(header, shard_count) as *const Header
+}
+
 #[inline(never)]
 fn grow(
     allocation: &Allocation,
@@ -303,7 +314,8 @@ fn grow(
 
     let page_size = page_size();
 
-    let slots_offset = align_up(mem::size_of::<Header>(), element_layout.align());
+    let header_size = SHARD_COUNT.load(Relaxed) * mem::size_of::<HeaderShard>();
+    let slots_offset = align_up(header_size, element_layout.align());
     let old_size = slots_offset + old_capacity as usize * element_layout.size();
     let new_size = usize::try_from(new_capacity)
         .ok()

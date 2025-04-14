@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use core::{
+    cell::Cell,
     cmp, fmt,
     hash::{Hash, Hasher},
     hint,
@@ -14,12 +15,13 @@ use core::{
     num::NonZeroU32,
     slice,
     sync::atomic::{
-        self, AtomicU32,
+        self, AtomicI32, AtomicU32, AtomicUsize,
         Ordering::{Acquire, Relaxed, Release},
     },
 };
 pub use slot::Slot;
-use slot::Vec;
+use slot::{header_ptr_from_slots, Vec};
+use std::{hash::DefaultHasher, thread};
 
 pub mod hyaline;
 mod slot;
@@ -57,6 +59,14 @@ const GENERATION_MASK: u32 = u32::MAX << (TAG_BITS + STATE_BITS);
 /// A single generation.
 const ONE_GENERATION: u32 = 1 << (TAG_BITS + STATE_BITS);
 
+/// The number of shards to use.
+static SHARD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The thread-local shard index.
+    static SHARD_INDEX: Cell<usize> = const { Cell::new(0) };
+}
+
 pub struct SlotMap<K, V> {
     inner: SlotMapInner<V>,
     marker: PhantomData<fn(K) -> K>,
@@ -76,13 +86,18 @@ struct SlotMapInner<V> {
     collector: hyaline::CollectorHandle,
 }
 
-#[repr(align(128))]
+#[repr(transparent)]
 struct Header {
+    shards: [HeaderShard],
+}
+
+#[repr(align(128))]
+struct HeaderShard {
     /// The list of slots which have already been dropped and are ready to be claimed by insert
     /// operations.
     free_list: AtomicU32,
     /// The number of occupied slots.
-    len: AtomicU32,
+    len: AtomicI32,
 }
 
 // SAFETY: `SlotMap` is an owned collection, which makes it safe to send to another thread as long
@@ -173,7 +188,7 @@ impl<K, V> SlotMap<K, V> {
     #[inline]
     #[must_use]
     pub fn len(&self) -> u32 {
-        self.inner.len()
+        self.inner.header().len()
     }
 
     #[inline]
@@ -459,7 +474,7 @@ impl<V> SlotMapInner<V> {
             self.slots.push_with_tag_with(tag, f).0
         };
 
-        self.header().len.fetch_add(1, Relaxed);
+        self.header().shard().len.fetch_add(1, Relaxed);
 
         id
     }
@@ -472,45 +487,49 @@ impl<V> SlotMapInner<V> {
     ) -> Option<(SlotId, &'a Slot<V>)> {
         self.check_guard(guard);
 
-        let mut free_list_head = self.free_list().load(Acquire);
-        let mut backoff = Backoff::new();
+        'outer: for shard in self.header().shards() {
+            let mut free_list_head = shard.free_list.load(Acquire);
+            let mut backoff = Backoff::new();
 
-        loop {
-            if free_list_head == NIL {
-                break None;
-            }
-
-            // SAFETY: We always push indices of existing slots into the free-lists and the slots
-            // vector never shrinks, therefore the index must have staid in bounds.
-            let slot = unsafe { self.slots.get_unchecked(free_list_head) };
-
-            let next_free = slot.next_free.load(Relaxed);
-
-            match self.free_list().compare_exchange_weak(
-                free_list_head,
-                next_free,
-                Release,
-                Acquire,
-            ) {
-                Ok(_) => {
-                    let generation = slot.generation.load(Relaxed);
-
-                    debug_assert!(generation & STATE_MASK == VACANT_TAG);
-
-                    let new_generation = generation | OCCUPIED_TAG | tag;
-
-                    // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into
-                    // the free-list and we replaced the tag with `OCCUPIED_TAG` above.
-                    let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
-
-                    break Some((id, slot));
+            loop {
+                if free_list_head == NIL {
+                    continue 'outer;
                 }
-                Err(new_head) => {
-                    free_list_head = new_head;
-                    backoff.spin();
+
+                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // slots vector never shrinks, therefore the index must have staid in bounds.
+                let slot = unsafe { self.slots.get_unchecked(free_list_head) };
+
+                let next_free = slot.next_free.load(Relaxed);
+
+                match shard.free_list.compare_exchange_weak(
+                    free_list_head,
+                    next_free,
+                    Release,
+                    Acquire,
+                ) {
+                    Ok(_) => {
+                        let generation = slot.generation.load(Relaxed);
+
+                        debug_assert!(generation & STATE_MASK == VACANT_TAG);
+
+                        let new_generation = generation | OCCUPIED_TAG | tag;
+
+                        // SAFETY: We always push slots with their state tag set to `VACANT_TAG`
+                        // into the free-list and we replaced the tag with `OCCUPIED_TAG` above.
+                        let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+
+                        return Some((id, slot));
+                    }
+                    Err(new_head) => {
+                        free_list_head = new_head;
+                        backoff.spin();
+                    }
                 }
             }
         }
+
+        None
     }
 
     #[track_caller]
@@ -522,37 +541,41 @@ impl<V> SlotMapInner<V> {
         // disjoint memory ranges.
         let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.slots.header_mut()) };
 
-        let free_list_head = *header.free_list.get_mut();
+        for shard in header.shards_mut() {
+            let free_list_head = *shard.free_list.get_mut();
 
-        if free_list_head != NIL {
-            // SAFETY: We always push indices of existing slots into the free-lists and the slots
-            // vector never shrinks, therefore the index must have staid in bounds.
-            let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
+            if free_list_head != NIL {
+                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // slots vector never shrinks, therefore the index must have staid in bounds.
+                let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
 
-            *header.free_list.get_mut() = *slot.next_free.get_mut();
+                *shard.free_list.get_mut() = *slot.next_free.get_mut();
 
-            let generation = *slot.generation.get_mut();
+                let generation = *slot.generation.get_mut();
 
-            debug_assert!(generation & STATE_MASK == VACANT_TAG);
+                debug_assert!(generation & STATE_MASK == VACANT_TAG);
 
-            let new_generation = generation | OCCUPIED_TAG | tag;
+                let new_generation = generation | OCCUPIED_TAG | tag;
 
-            // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into the
-            // free-list and we replaced the tag with `OCCUPIED_TAG` above.
-            let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
+                // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into the
+                // free-list and we replaced the tag with `OCCUPIED_TAG` above.
+                let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
 
-            *slot.value.get_mut() = MaybeUninit::new(f(id));
+                *slot.value.get_mut() = MaybeUninit::new(f(id));
 
-            *slot.generation.get_mut() = new_generation;
+                *slot.generation.get_mut() = new_generation;
 
-            *header.len.get_mut() += 1;
+                let len = header.shard_mut().len.get_mut();
+                *len = len.wrapping_add(1);
 
-            return id;
+                return id;
+            }
         }
 
         let id = self.slots.push_with_tag_with_mut(tag, f);
 
-        *header.len.get_mut() += 1;
+        let len = header.shard_mut().len.get_mut();
+        *len = len.wrapping_add(1);
 
         id
     }
@@ -572,7 +595,7 @@ impl<V> SlotMapInner<V> {
             return None;
         }
 
-        self.header().len.fetch_sub(1, Relaxed);
+        self.header().shard().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
@@ -601,10 +624,11 @@ impl<V> SlotMapInner<V> {
             let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
             *slot.generation.get_mut() = new_generation;
 
-            *slot.next_free.get_mut() = *header.free_list.get_mut();
-            *header.free_list.get_mut() = id.index;
+            *slot.next_free.get_mut() = *header.shard_mut().free_list.get_mut();
+            *header.shard_mut().free_list.get_mut() = id.index;
 
-            *header.len.get_mut() -= 1;
+            let len = header.shard_mut().len.get_mut();
+            *len = len.wrapping_sub(1);
 
             // SAFETY:
             // * The mutable reference makes sure that access to the slot is synchronized.
@@ -635,7 +659,7 @@ impl<V> SlotMapInner<V> {
             "`id` must refer to a currently occupied slot",
         );
 
-        self.header().len.fetch_sub(1, Relaxed);
+        self.header().shard().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward. The caller must ensure that a race condition doesn't occur.
@@ -675,7 +699,7 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        self.header().len.fetch_sub(1, Relaxed);
+        self.header().shard().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
@@ -706,7 +730,7 @@ impl<V> SlotMapInner<V> {
             return None;
         }
 
-        self.header().len.fetch_sub(1, Relaxed);
+        self.header().shard().len.fetch_sub(1, Relaxed);
 
         // SAFETY: We set the slot's state tag to `INVALIDATED_TAG` such that no other threads can
         // access the slot going forward.
@@ -967,14 +991,7 @@ impl<V> SlotMapInner<V> {
         &self.collector
     }
 
-    fn free_list(&self) -> &AtomicU32 {
-        &self.header().free_list
-    }
-
-    fn len(&self) -> u32 {
-        self.header().len.load(Relaxed)
-    }
-
+    #[inline]
     fn header(&self) -> &Header {
         self.slots.header()
     }
@@ -1009,7 +1026,7 @@ impl<V> SlotMapInner<MaybeUninit<V>> {
             self.slots.push_with_tag_with(0, f)
         };
 
-        self.header().len.fetch_add(1, Relaxed);
+        self.header().shard().len.fetch_add(1, Relaxed);
 
         // SAFETY: The value is wrapped in `MaybeUninit`.
         (id, unsafe { slot.value_unchecked() })
@@ -1024,19 +1041,19 @@ unsafe fn reclaim<V>(index: u32, slots: *const Slot<V>) {
     // SAFETY: The caller must ensure that we have exclusive access to the slot.
     unsafe { slot.value.get().cast::<V>().drop_in_place() };
 
-    let header_size = mem::size_of::<Header>();
-
     // SAFETY: The caller must ensure that `slots` is a valid pointer to the allocation of
     // `Slot<V>`s, and that allocation has the `Header` right before the start of the slots.
-    let header = unsafe { &*slots.cast::<u8>().sub(header_size).cast::<Header>() };
+    let header = unsafe { &*header_ptr_from_slots(slots.cast()) };
 
-    let mut free_list_head = header.free_list.load(Acquire);
+    let shard = header.shard();
+
+    let mut free_list_head = shard.free_list.load(Acquire);
     let mut backoff = Backoff::new();
 
     loop {
         slot.next_free.store(free_list_head, Relaxed);
 
-        match header
+        match shard
             .free_list
             .compare_exchange_weak(free_list_head, index, Release, Acquire)
         {
@@ -1084,55 +1101,7 @@ unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
 
 impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for SlotMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Slots<'a, K, V>(&'a SlotMap<K, V>);
-
-        impl<K: fmt::Debug + Key, V: fmt::Debug> fmt::Debug for Slots<'_, K, V> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let guard = &self.0.pin();
-                let mut debug = f.debug_map();
-
-                for (k, v) in self.0.iter(guard) {
-                    debug.entry(&k, v);
-                }
-
-                debug.finish()
-            }
-        }
-
-        struct List<'a, V>(&'a SlotMapInner<V>, u32);
-
-        impl<V> fmt::Debug for List<'_, V> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let mut head = self.1;
-                let mut debug = f.debug_list();
-
-                while head != NIL {
-                    debug.entry(&head);
-
-                    // SAFETY: We always push indices of existing slots into the free-lists and the
-                    // slots vector never shrinks, therefore the index must have staid in bounds.
-                    let slot = unsafe { self.0.slots.get_unchecked(head) };
-
-                    head = slot.next_free.load(Acquire);
-                }
-
-                debug.finish()
-            }
-        }
-
-        fn inner<V>(map: &SlotMapInner<V>, mut debug: fmt::DebugStruct<'_, '_>) -> fmt::Result {
-            debug
-                .field("len", &map.len())
-                .field("collector", &map.collector)
-                .field("free_list", &List(map, map.free_list().load(Acquire)));
-
-            debug.finish()
-        }
-
-        let mut debug = f.debug_struct("SlotMap");
-        debug.field("slots", &Slots(self));
-
-        inner(&self.inner, debug)
+        f.debug_struct("SlotMap").finish_non_exhaustive()
     }
 }
 
@@ -1165,6 +1134,83 @@ impl<'a, K: Key, V> IntoIterator for &'a mut SlotMap<K, V> {
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
+}
+
+impl Header {
+    #[inline]
+    fn shard(&self) -> &HeaderShard {
+        let shard_index = SHARD_INDEX.with(Cell::get);
+
+        // SAFETY: `set_shard_index` ensures that `SHARD_INDEX` is in bounds of the shards.
+        unsafe { self.shards.get_unchecked(shard_index) }
+    }
+
+    #[inline]
+    fn shard_mut(&mut self) -> &mut HeaderShard {
+        // SAFETY: There is always a non-zero number of shards.
+        unsafe { self.shards.get_unchecked_mut(0) }
+    }
+
+    #[inline]
+    fn shards(&self) -> HeaderShards<'_> {
+        let current_index = SHARD_INDEX.with(Cell::get);
+        let end_index = current_index.wrapping_sub(1) & (self.shards.len() - 1);
+
+        HeaderShards {
+            shards: &self.shards,
+            current_index,
+            end_index,
+        }
+    }
+
+    #[inline]
+    fn shards_mut(&mut self) -> slice::IterMut<'_, HeaderShard> {
+        self.shards.iter_mut()
+    }
+
+    #[inline]
+    fn len(&self) -> u32 {
+        self.shards()
+            .map(|shard| shard.len.load(Relaxed))
+            .sum::<i32>()
+            .try_into()
+            .unwrap_or(0)
+    }
+}
+
+struct HeaderShards<'a> {
+    shards: &'a [HeaderShard],
+    current_index: usize,
+    end_index: usize,
+}
+
+impl<'a> Iterator for HeaderShards<'a> {
+    type Item = &'a HeaderShard;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_index != self.end_index {
+            let current_index = self.current_index;
+            self.current_index = current_index.wrapping_add(1) & (self.shards.len() - 1);
+
+            // SAFETY: `Header::shards` ensures that `current_index` starts out in bounds of the
+            // shards and we made sure that the next iteration has an index that's in bounds too.
+            Some(unsafe { self.shards.get_unchecked(current_index) })
+        } else {
+            None
+        }
+    }
+}
+
+#[inline(never)]
+fn set_shard_index() {
+    let mut state = DefaultHasher::new();
+    thread::current().id().hash(&mut state);
+    let thread_id_hash = state.finish();
+
+    let shard_count = SHARD_COUNT.load(Relaxed);
+    let shard_index = (thread_id_hash & (shard_count as u64 - 1)) as usize;
+    SHARD_INDEX.with(|cell| cell.set(shard_index));
 }
 
 pub trait Key: Sized {
