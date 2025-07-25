@@ -18,3 +18,11 @@ virtual-buffer = "1.0"
 
 [dev-dependencies]
 slotmap = "1.0"
+
+[lints]
+rust.unused_unsafe = "allow"
+clippy.inline_always = "allow"
+rust.rust_2018_idioms = { level = "warn", priority = -1 }
+rust.missing_debug_implementations = "warn"
+rust.unsafe_op_in_unsafe_fn = "forbid"
+clippy.undocumented_unsafe_blocks = "forbid"

@@ -1,7 +1,3 @@
-#![allow(unused_unsafe, clippy::inline_always)]
-#![warn(rust_2018_idioms, missing_debug_implementations)]
-#![forbid(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
-
 extern crate alloc;
 
 use core::{
