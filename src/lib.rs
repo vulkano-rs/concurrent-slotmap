@@ -1245,10 +1245,7 @@ impl Default for SlotId {
 }
 
 impl SlotId {
-    pub const INVALID: Self = SlotId {
-        index: u32::MAX,
-        generation: NonZeroU32::MAX,
-    };
+    pub const INVALID: Self = SlotId::new(u32::MAX, OCCUPIED_TAG);
 
     pub const TAG_BITS: u32 = TAG_BITS;
 
