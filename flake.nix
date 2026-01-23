@@ -32,6 +32,31 @@
             ))
           ];
         };
+        devShells.ci = with pkgs; mkShell {
+          buildInputs = [
+            (rust-bin.stable.latest.minimal.override {
+              extensions = [ "clippy" ];
+              # Windows CI unfortunately needs to cross-compile from within WSL because Nix doesn't
+              # work on Windows.
+              targets = [ "x86_64-pc-windows-msvc" ];
+            })
+            # We use nightly rustfmt features.
+            (rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt))
+            typos
+          ];
+        };
+        devShells.ci-msrv = let
+          manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+          msrv = manifest.package.rust-version;
+        in with pkgs; mkShell {
+          buildInputs = [
+            (rust-bin.stable.${msrv}.minimal.override {
+              # Windows CI unfortunately needs to cross-compile from within WSL because Nix doesn't
+              # work on Windows.
+              targets = [ "x86_64-pc-windows-msvc" ];
+            })
+          ];
+        };
       }
     );
 }
