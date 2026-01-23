@@ -21,7 +21,7 @@ use thread_local::ThreadLocal;
 
 // SAFETY: `usize` and `*mut Node` have the same layout.
 // TODO: Replace with `ptr::without_provanance_mut` once we bump the MSRV.
-#[allow(clippy::useless_transmute)]
+#[allow(integer_to_ptr_transmutes, clippy::useless_transmute)]
 const INACTIVE: *mut Node = unsafe { mem::transmute(usize::MAX) };
 
 const MIN_RETIRED_LEN: usize = 64;
