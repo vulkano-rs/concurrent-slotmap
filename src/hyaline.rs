@@ -242,7 +242,7 @@ impl RetirementList {
             }
 
             if len >= retired_len {
-                // SAFETY: This node is never getting retired since it is ouside of `retired_len`.
+                // SAFETY: This node is never getting retired since it is outside of `retired_len`.
                 unsafe { batch.push(0, ptr::null(), |_, _| {}) };
             }
 
@@ -386,7 +386,7 @@ struct Batch {
     len: usize,
     /// The number of `nodes` that should be retired.
     retired_len: usize,
-    /// An inline allocation of `capacity` nodes with `len` being intialized.
+    /// An inline allocation of `capacity` nodes with `len` being initialized.
     nodes: [Node; 0],
 }
 

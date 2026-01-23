@@ -220,7 +220,7 @@ impl<T> Vec<T> {
         // SAFETY: We checked that the index is in bounds above.
         let ptr = unsafe { self.as_ptr().add(index as usize) };
 
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to initialize the
         // `Slot<T>` as it allows being zeroed. The `Acquire` ordering above synchronizes with the
         // `Release` ordering when setting the capacity, making sure that the reserved capacity is
         // visible here.
@@ -249,7 +249,7 @@ impl<T> Vec<T> {
         // SAFETY: We checked that the index is in bounds above.
         let ptr = unsafe { self.as_mut_ptr().add(index as usize) };
 
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to initialize the
         // `Slot<T>` as it allows being zeroed. The mutable reference ensures synchronization in
         // this case.
         Some(unsafe { &mut *ptr })
@@ -268,7 +268,7 @@ impl<T> Vec<T> {
     pub fn iter(&self) -> slice::Iter<'_, Slot<T>> {
         let capacity = self.capacity.load(Acquire) as usize;
 
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to initialize the
         // `Slot<T>` as it allows being zeroed. The `Acquire` ordering above synchronizes with the
         // `Release` ordering when setting the capacity, making sure that the reserved capacity is
         // visible here.
@@ -279,7 +279,7 @@ impl<T> Vec<T> {
     pub fn iter_mut(&mut self) -> slice::IterMut<'_, Slot<T>> {
         let capacity = self.capacity_mut() as usize;
 
-        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to intialize the
+        // SAFETY: We know that newly-allocated pages are zeroed, so we don't need to initialize the
         // `Slot<T>` as it allows being zeroed. The mutable reference ensures synchronization in
         // this case.
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), capacity) }.iter_mut()
