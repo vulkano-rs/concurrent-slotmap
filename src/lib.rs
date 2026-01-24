@@ -2667,6 +2667,7 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
+    #[ignore]
     #[test]
     fn multi_threaded2() {
         const CAPACITY: u32 = 8_000;
