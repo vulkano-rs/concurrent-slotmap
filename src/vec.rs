@@ -3,7 +3,6 @@ use core::{
     cell::Cell,
     fmt,
     hash::{Hash, Hasher},
-    num::NonZeroUsize,
     ptr, slice,
     sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering::Relaxed},
 };
@@ -20,10 +19,17 @@ thread_local! {
 
 pub(crate) fn set_shard_count() {
     if SHARD_COUNT.load(Relaxed) == 0 {
-        let num_cpus = thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1);
-        SHARD_COUNT.store(num_cpus.next_power_of_two(), Relaxed);
+        #[cfg(not(miri))]
+        let shard_count = thread::available_parallelism()
+            .map(core::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .next_power_of_two();
+
+        // More contention means more chance for a race condition to be detected.
+        #[cfg(miri)]
+        let shard_count = 1;
+
+        SHARD_COUNT.store(shard_count, Relaxed);
     }
 }
 
