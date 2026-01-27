@@ -1,7 +1,9 @@
 extern crate alloc;
 
+pub use self::vec::TryReserveError;
+use self::vec::{header_ptr_from_slots, Header, RawVec};
 use core::{
-    cell::Cell,
+    cell::UnsafeCell,
     cmp, fmt,
     hash::{Hash, Hasher},
     hint,
@@ -9,18 +11,16 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     num::NonZeroU32,
+    panic::RefUnwindSafe,
     slice,
     sync::atomic::{
-        self, AtomicI32, AtomicU32, AtomicUsize,
+        self, AtomicU32,
         Ordering::{Acquire, Relaxed, Release},
     },
 };
-pub use slot::Slot;
-use slot::{header_ptr_from_slots, Vec};
-use std::{hash::DefaultHasher, thread};
 
 pub mod hyaline;
-mod slot;
+mod vec;
 
 /// The slot index used to signify the lack thereof.
 const NIL: u32 = u32::MAX;
@@ -55,14 +55,6 @@ const GENERATION_MASK: u32 = u32::MAX << (TAG_BITS + STATE_BITS);
 /// A single generation.
 const ONE_GENERATION: u32 = 1 << (TAG_BITS + STATE_BITS);
 
-/// The number of shards to use.
-static SHARD_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// The thread-local shard index.
-    static SHARD_INDEX: Cell<usize> = const { Cell::new(0) };
-}
-
 pub struct SlotMap<K, V> {
     inner: SlotMapInner<V>,
     marker: PhantomData<fn(K) -> K>,
@@ -78,22 +70,8 @@ struct SlotMapInner<V> {
     /// };
     /// dbg!(map.get(id, guard));
     /// ```
-    slots: Vec<V>,
+    inner: RawVec<Slot<V>>,
     collector: hyaline::CollectorHandle,
-}
-
-#[repr(transparent)]
-struct Header {
-    shards: [HeaderShard],
-}
-
-#[repr(align(128))]
-struct HeaderShard {
-    /// The list of slots which have already been dropped and are ready to be claimed by insert
-    /// operations.
-    free_list: AtomicU32,
-    /// The number of occupied slots.
-    len: AtomicI32,
 }
 
 // SAFETY: `SlotMap` is an owned collection, which makes it safe to send to another thread as long
@@ -107,33 +85,16 @@ unsafe impl<K, V: Send> Send for SlotMap<K, V> {}
 unsafe impl<K, V: Send + Sync> Sync for SlotMap<K, V> {}
 
 impl<V> SlotMap<SlotId, V> {
+    /// # Panics
+    ///
+    /// - Panics if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Panics if [reserving] the allocation fails.
+    ///
+    /// [reserving]: virtual_buffer#reserving
     #[must_use]
     #[track_caller]
     pub fn new(max_capacity: u32) -> Self {
         Self::with_key(max_capacity)
-    }
-
-    /// # Safety
-    ///
-    /// Please see the safety documentation of [`with_collector_and_key`].
-    ///
-    /// [`with_collector_and_key`]: Self::with_collector_and_key
-    #[must_use]
-    #[track_caller]
-    pub unsafe fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
-        // SAFETY: Enforced by the caller.
-        unsafe { Self::with_collector_and_key(max_capacity, collector) }
-    }
-}
-
-impl<K, V> SlotMap<K, V> {
-    #[must_use]
-    #[track_caller]
-    pub fn with_key(max_capacity: u32) -> Self {
-        // SAFETY: It's not possible to obtain a `hyaline::Guard` that isn't bound to the collection
-        // without using either the unsafe `hyaline::CollectorHandle::pin` or the unsafe
-        // `SlotMap::with_collector[_and_key]` followed by `SlotMap::pin`.
-        unsafe { Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new()) }
     }
 
     /// # Safety
@@ -159,7 +120,80 @@ impl<K, V> SlotMap<K, V> {
     /// // undefined behavior! ⚠️
     /// ```
     ///
-    /// [`CollectorHandle::pin`]: hyaline::CollectorHandle::pin
+    /// # Panics
+    ///
+    /// - Panics if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Panics if [reserving] the allocation fails.
+    ///
+    /// [reserving]: virtual_buffer#reserving
+    #[must_use]
+    #[track_caller]
+    pub unsafe fn with_collector(max_capacity: u32, collector: hyaline::CollectorHandle) -> Self {
+        // SAFETY: Enforced by the caller.
+        unsafe { Self::with_collector_and_key(max_capacity, collector) }
+    }
+
+    /// # Errors
+    ///
+    /// - Returns an error if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Returns an error if [reserving] the allocation fails.
+    ///
+    /// [reserving]: virtual_buffer#reserving
+    pub fn try_new(max_capacity: u32) -> Result<Self, TryReserveError> {
+        Self::try_with_key(max_capacity)
+    }
+
+    /// # Safety
+    ///
+    /// The given `collector` must not be used to create any `Guard` that outlives the collection.
+    ///
+    /// See [`with_collector`] for more details.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Returns an error if [reserving] the allocation fails.
+    ///
+    /// [`with_collector`]: Self::with_collector
+    /// [reserving]: virtual_buffer#reserving
+    pub unsafe fn try_with_collector(
+        max_capacity: u32,
+        collector: hyaline::CollectorHandle,
+    ) -> Result<Self, TryReserveError> {
+        // SAFETY: Enforced by the caller.
+        unsafe { Self::try_with_collector_and_key(max_capacity, collector) }
+    }
+}
+
+impl<K, V> SlotMap<K, V> {
+    /// # Panics
+    ///
+    /// - Panics if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Panics if [reserving] the allocation fails.
+    ///
+    /// [reserving]: virtual_buffer#reserving
+    #[must_use]
+    #[track_caller]
+    pub fn with_key(max_capacity: u32) -> Self {
+        // SAFETY: It's not possible to obtain a `hyaline::Guard` that isn't bound to the collection
+        // without using either the unsafe `hyaline::CollectorHandle::pin` or the unsafe
+        // `SlotMap::with_collector[_and_key]` followed by `SlotMap::pin`.
+        unsafe { Self::with_collector_and_key(max_capacity, hyaline::CollectorHandle::new()) }
+    }
+
+    /// # Safety
+    ///
+    /// The given `collector` must not be used to create any `Guard` that outlives the collection.
+    ///
+    /// See [`with_collector`] for more details.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Panics if [reserving] the allocation fails.
+    ///
+    /// [`with_collector`]: Self::with_collector
+    /// [reserving]: virtual_buffer#reserving
     #[must_use]
     #[track_caller]
     pub unsafe fn with_collector_and_key(
@@ -168,23 +202,64 @@ impl<K, V> SlotMap<K, V> {
     ) -> Self {
         SlotMap {
             inner: SlotMapInner {
-                slots: Vec::new(max_capacity),
+                // SAFETY: `Slot<V>` is zeroable.
+                inner: unsafe { RawVec::new(max_capacity) },
                 collector,
             },
             marker: PhantomData,
         }
     }
 
+    /// # Errors
+    ///
+    /// - Returns an error if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Returns an error if [reserving] the allocation fails.
+    ///
+    /// [reserving]: virtual_buffer#reserving
+    pub fn try_with_key(max_capacity: u32) -> Result<Self, TryReserveError> {
+        // SAFETY: It's not possible to obtain a `hyaline::Guard` that isn't bound to the collection
+        // without using either the unsafe `hyaline::CollectorHandle::pin` or the unsafe
+        // `SlotMap::with_collector[_and_key]` followed by `SlotMap::pin`.
+        unsafe { Self::try_with_collector_and_key(max_capacity, hyaline::CollectorHandle::new()) }
+    }
+
+    /// # Safety
+    ///
+    /// The given `collector` must not be used to create any `Guard` that outlives the collection.
+    ///
+    /// See [`with_collector`] for more details.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the `max_capacity` would exceed `isize::MAX` bytes.
+    /// - Returns an error if [reserving] the allocation fails.
+    ///
+    /// [`with_collector`]: Self::with_collector
+    /// [reserving]: virtual_buffer#reserving
+    pub unsafe fn try_with_collector_and_key(
+        max_capacity: u32,
+        collector: hyaline::CollectorHandle,
+    ) -> Result<Self, TryReserveError> {
+        Ok(SlotMap {
+            inner: SlotMapInner {
+                // SAFETY: `Slot<V>` is zeroable.
+                inner: unsafe { RawVec::try_new(max_capacity) }?,
+                collector,
+            },
+            marker: PhantomData,
+        })
+    }
+
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> u32 {
-        self.inner.slots.capacity()
+        self.inner.inner.capacity()
     }
 
     #[inline]
     #[must_use]
     pub fn len(&self) -> u32 {
-        self.inner.header().len()
+        self.inner.inner.header().len()
     }
 
     #[inline]
@@ -202,7 +277,8 @@ impl<K, V> SlotMap<K, V> {
     #[inline]
     #[must_use]
     pub fn pin(&self) -> hyaline::Guard<'_> {
-        self.inner.pin()
+        // SAFETY: The guard's lifetime is bound to the collection.
+        unsafe { self.inner.collector.pin() }
     }
 
     /// # Panics
@@ -214,7 +290,7 @@ impl<K, V> SlotMap<K, V> {
         self.inner.check_guard(guard);
 
         Slots {
-            slots: self.inner.slots.iter(),
+            slots: self.inner.inner.iter(),
         }
     }
 }
@@ -223,7 +299,6 @@ impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
-    #[inline]
     #[track_caller]
     pub fn insert<'a>(&'a self, value: V, guard: &'a hyaline::Guard<'a>) -> K {
         self.insert_with_tag(value, 0, guard)
@@ -233,7 +308,6 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
-    #[inline]
     #[track_caller]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
         K::from_id(self.inner.insert_with_tag_with(tag, guard, |_| value))
@@ -242,7 +316,6 @@ impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
-    #[inline]
     #[track_caller]
     pub fn insert_with<'a>(&'a self, guard: &'a hyaline::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
         self.insert_with_tag_with(0, guard, f)
@@ -252,7 +325,6 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
-    #[inline]
     #[track_caller]
     pub fn insert_with_tag_with<'a>(
         &'a self,
@@ -265,7 +337,7 @@ impl<K: Key, V> SlotMap<K, V> {
         K::from_id(self.inner.insert_with_tag_with(tag, guard, f))
     }
 
-    #[inline]
+    #[track_caller]
     pub fn insert_mut(&mut self, value: V) -> K {
         self.insert_with_tag_mut(value, 0)
     }
@@ -273,13 +345,12 @@ impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `tag` has more than the low 8 bits set.
-    #[inline]
     #[track_caller]
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
         K::from_id(self.inner.insert_with_tag_with_mut(tag, |_| value))
     }
 
-    #[inline]
+    #[track_caller]
     pub fn insert_with_mut(&mut self, f: impl FnOnce(K) -> V) -> K {
         self.insert_with_tag_with_mut(0, f)
     }
@@ -287,7 +358,6 @@ impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `tag` has more than the low 8 bits set.
-    #[inline]
     #[track_caller]
     pub fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(K) -> V) -> K {
         let f = |id| f(K::from_id(id));
@@ -298,13 +368,11 @@ impl<K: Key, V> SlotMap<K, V> {
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
-    #[inline]
     #[track_caller]
     pub fn remove<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.remove(key.as_id(), guard)
     }
 
-    #[inline]
     pub fn remove_mut(&mut self, key: K) -> Option<V> {
         self.inner.remove_mut(key.as_id())
     }
@@ -313,7 +381,6 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// `key` must refer to a currently occupied slot. That also excludes a race condition when
     /// calling this method.
-    #[inline]
     #[track_caller]
     pub unsafe fn remove_unchecked<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> &'a V {
         // SAFETY: Enforced by the caller.
@@ -325,13 +392,11 @@ impl<K: Key, V> SlotMap<K, V> {
         self.inner.remove_index(index, guard)
     }
 
-    #[inline]
     #[track_caller]
     pub fn invalidate<'a>(&'a self, key: K, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.invalidate(key.as_id(), guard)
     }
 
-    #[inline]
     pub fn remove_invalidated(&self, key: K) -> Option<()> {
         self.inner.remove_invalidated(key.as_id())
     }
@@ -340,7 +405,6 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// `key` must refer to a currently invalidated slot. That also excludes a race condition when
     /// calling this method.
-    #[inline]
     pub unsafe fn remove_invalidated_unchecked(&self, key: K) {
         // SAFETY: Enforced by the caller.
         unsafe { self.inner.remove_invalidated_unchecked(key.as_id()) };
@@ -369,6 +433,7 @@ impl<K: Key, V> SlotMap<K, V> {
     }
 
     #[cfg(test)]
+    #[track_caller]
     fn index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.inner.index(index, guard)
     }
@@ -402,22 +467,20 @@ impl<K: Key, V> SlotMap<K, V> {
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[inline]
-    #[must_use]
     #[track_caller]
     pub fn iter<'a>(&'a self, guard: &'a hyaline::Guard<'a>) -> Iter<'a, K, V> {
         self.inner.check_guard(guard);
 
         Iter {
-            slots: self.inner.slots.iter().enumerate(),
+            slots: self.inner.inner.iter().enumerate(),
             marker: PhantomData,
         }
     }
 
     #[inline]
-    #[must_use]
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut {
-            slots: self.inner.slots.iter_mut().enumerate(),
+            slots: self.inner.inner.iter_mut().enumerate(),
             marker: PhantomData,
         }
     }
@@ -427,7 +490,6 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
     /// # Panics
     ///
     /// Panics if `guard.collector()` does not equal `self.collector()`.
-    #[inline]
     #[track_caller]
     pub fn revive_or_insert_with<'a>(
         &'a self,
@@ -443,11 +505,6 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
 }
 
 impl<V> SlotMapInner<V> {
-    fn pin(&self) -> hyaline::Guard<'_> {
-        // SAFETY: The guard's lifetime is bound to the collection.
-        unsafe { self.collector.pin() }
-    }
-
     #[track_caller]
     fn insert_with_tag_with<'a>(
         &'a self,
@@ -457,18 +514,13 @@ impl<V> SlotMapInner<V> {
     ) -> SlotId {
         assert_eq!(tag & !TAG_MASK, 0);
 
-        let id = if let Some((id, slot)) = self.allocate_slot(tag, guard) {
-            // SAFETY: The free-list always contains slots that are no longer read by any threads
-            // and we have removed the slot from the free-list such that no other threads can be
-            // writing the same slot.
-            unsafe { slot.value.get().cast::<V>().write(f(id)) };
+        let (id, slot, _) = self.allocate_slot(tag, guard);
 
-            slot.generation.store(id.generation(), Release);
+        // SAFETY: `SlotMapInner::allocate_slot` always returns a unique slot that is not shared
+        // with any other threads.
+        unsafe { slot.value.get().cast::<V>().write(f(id)) };
 
-            id
-        } else {
-            self.slots.push_with_tag_with(tag, f).0
-        };
+        slot.generation.store(id.generation(), Release);
 
         self.header().shard().len.fetch_add(1, Relaxed);
 
@@ -480,7 +532,7 @@ impl<V> SlotMapInner<V> {
         &'a self,
         tag: u32,
         guard: &'a hyaline::Guard<'a>,
-    ) -> Option<(SlotId, &'a Slot<V>)> {
+    ) -> (SlotId, &'a Slot<V>, bool) {
         self.check_guard(guard);
 
         'outer: for shard in self.header().shards() {
@@ -492,9 +544,9 @@ impl<V> SlotMapInner<V> {
                     continue 'outer;
                 }
 
-                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // SAFETY: We always push indices of existing slots into the free-lists, and the
                 // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked(free_list_head) };
+                let slot = unsafe { self.inner.get_unchecked(free_list_head) };
 
                 let next_free = slot.next_free.load(Relaxed);
 
@@ -512,10 +564,10 @@ impl<V> SlotMapInner<V> {
                         let new_generation = generation | OCCUPIED_TAG | tag;
 
                         // SAFETY: We always push slots with their state tag set to `VACANT_TAG`
-                        // into the free-list and we replaced the tag with `OCCUPIED_TAG` above.
+                        // into the free-list, and we replaced the tag with `OCCUPIED_TAG` above.
                         let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
 
-                        return Some((id, slot));
+                        return (id, slot, false);
                     }
                     Err(new_head) => {
                         free_list_head = new_head;
@@ -525,25 +577,46 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        None
+        let (index, slot) = self.inner.push();
+
+        let generation = OCCUPIED_TAG | tag;
+
+        // SAFETY: The state tag of the generation is `OCCUPIED_TAG`.
+        let id = unsafe { SlotId::new_unchecked(index, generation) };
+
+        (id, slot, true)
     }
 
     #[track_caller]
     fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
+        let (id, slot) = self.allocate_slot_mut(tag);
+
+        slot.value.get_mut().write(f(id));
+
+        *slot.generation.get_mut() = id.generation();
+
+        let len = self.header_mut().shard_mut().len.get_mut();
+        *len = len.wrapping_add(1);
+
+        id
+    }
+
+    #[track_caller]
+    fn allocate_slot_mut(&mut self, tag: u32) -> (SlotId, &mut Slot<V>) {
         assert_eq!(tag & !TAG_MASK, 0);
 
         // SAFETY: We unbind the lifetime to convince the borrow checker that we don't borrow
-        // `self.slots` mutably more than once. We don't because the header and slots are occupying
+        // `self.inner` mutably more than once. We don't because the header and slots are occupying
         // disjoint memory ranges.
-        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.slots.header_mut()) };
+        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.header_mut()) };
 
         for shard in header.shards_mut() {
             let free_list_head = *shard.free_list.get_mut();
 
             if free_list_head != NIL {
-                // SAFETY: We always push indices of existing slots into the free-lists and the
+                // SAFETY: We always push indices of existing slots into the free-lists, and the
                 // slots vector never shrinks, therefore the index must have staid in bounds.
-                let slot = unsafe { self.slots.get_unchecked_mut(free_list_head) };
+                let slot = unsafe { self.inner.get_unchecked_mut(free_list_head) };
 
                 *shard.free_list.get_mut() = *slot.next_free.get_mut();
 
@@ -554,33 +627,28 @@ impl<V> SlotMapInner<V> {
                 let new_generation = generation | OCCUPIED_TAG | tag;
 
                 // SAFETY: We always push slots with their state tag set to `VACANT_TAG` into the
-                // free-list and we replaced the tag with `OCCUPIED_TAG` above.
+                // free-list, and we replaced the tag with `OCCUPIED_TAG` above.
                 let id = unsafe { SlotId::new_unchecked(free_list_head, new_generation) };
 
-                *slot.value.get_mut() = MaybeUninit::new(f(id));
-
-                *slot.generation.get_mut() = new_generation;
-
-                let len = header.shard_mut().len.get_mut();
-                *len = len.wrapping_add(1);
-
-                return id;
+                return (id, slot);
             }
         }
 
-        let id = self.slots.push_with_tag_with_mut(tag, f);
+        let (index, slot) = self.inner.push_mut();
 
-        let len = header.shard_mut().len.get_mut();
-        *len = len.wrapping_add(1);
+        let generation = OCCUPIED_TAG | tag;
 
-        id
+        // SAFETY: The state tag of the generation is `OCCUPIED_TAG`.
+        let id = unsafe { SlotId::new_unchecked(index, generation) };
+
+        (id, slot)
     }
 
     #[track_caller]
     fn remove<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(id.index)?;
+        let slot = self.inner.get(id.index)?;
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
         if slot
@@ -595,7 +663,7 @@ impl<V> SlotMapInner<V> {
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
-        unsafe { guard.defer_reclaim(id.index, &self.slots) };
+        unsafe { guard.defer_reclaim(id.index, &self.inner) };
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -609,11 +677,11 @@ impl<V> SlotMapInner<V> {
 
     fn remove_mut(&mut self, id: SlotId) -> Option<V> {
         // SAFETY: We unbind the lifetime to convince the borrow checker that we don't borrow
-        // `self.slots` mutably more than once. We don't because the header and slots are occupying
+        // `self.inner` mutably more than once. We don't because the header and slots are occupying
         // disjoint memory ranges.
-        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.slots.header_mut()) };
+        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.header_mut()) };
 
-        let slot = self.slots.get_mut(id.index)?;
+        let slot = self.inner.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
@@ -644,7 +712,7 @@ impl<V> SlotMapInner<V> {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index) };
+        let slot = unsafe { self.inner.get_unchecked(id.index) };
 
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
@@ -659,7 +727,7 @@ impl<V> SlotMapInner<V> {
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward. The caller must ensure that a race condition doesn't occur.
-        unsafe { guard.defer_reclaim(id.index, &self.slots) };
+        unsafe { guard.defer_reclaim(id.index, &self.inner) };
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -671,10 +739,11 @@ impl<V> SlotMapInner<V> {
     }
 
     #[cfg(test)]
+    #[track_caller]
     fn remove_index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(index)?;
+        let slot = self.inner.get(index)?;
         let mut generation = slot.generation.load(Relaxed);
 
         loop {
@@ -699,7 +768,7 @@ impl<V> SlotMapInner<V> {
 
         // SAFETY: We set the slot's state tag to `VACANT_TAG` such that no other threads can access
         // the slot going forward.
-        unsafe { guard.defer_reclaim(index, &self.slots) };
+        unsafe { guard.defer_reclaim(index, &self.inner) };
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -715,7 +784,7 @@ impl<V> SlotMapInner<V> {
     fn invalidate<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(id.index)?;
+        let slot = self.inner.get(id.index)?;
         let new_generation = (id.generation() & !STATE_MASK) | INVALIDATED_TAG;
 
         if slot
@@ -730,7 +799,7 @@ impl<V> SlotMapInner<V> {
 
         // SAFETY: We set the slot's state tag to `INVALIDATED_TAG` such that no other threads can
         // access the slot going forward.
-        unsafe { guard.defer_reclaim_invalidated(id.index, &self.slots) };
+        unsafe { guard.defer_reclaim_invalidated(id.index, &self.inner) };
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -743,7 +812,7 @@ impl<V> SlotMapInner<V> {
     }
 
     fn remove_invalidated(&self, id: SlotId) -> Option<()> {
-        let slot = self.slots.get(id.index)?;
+        let slot = self.inner.get(id.index)?;
         let mut generation = slot.generation.load(Relaxed);
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
@@ -771,7 +840,7 @@ impl<V> SlotMapInner<V> {
                         //   must have been initialized in `SlotMap::insert[_mut]`.
                         // * We set the slot's state tag to `VACANT_TAG` such that future attempts
                         //   to access the slot will fail.
-                        unsafe { reclaim(id.index, self.slots.as_ptr()) };
+                        unsafe { reclaim(id.index, self.inner.as_ptr()) };
 
                         break Some(());
                     }
@@ -795,7 +864,7 @@ impl<V> SlotMapInner<V> {
 
     unsafe fn remove_invalidated_unchecked(&self, id: SlotId) {
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index) };
+        let slot = unsafe { self.inner.get_unchecked(id.index) };
 
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
@@ -820,7 +889,7 @@ impl<V> SlotMapInner<V> {
             // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
             //   slot will fail.
             // * The caller must ensure that a race condition doesn't occur.
-            unsafe { reclaim(id.index, self.slots.as_ptr()) };
+            unsafe { reclaim(id.index, self.inner.as_ptr()) };
         }
     }
 
@@ -829,7 +898,7 @@ impl<V> SlotMapInner<V> {
     fn get<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(id.index)?;
+        let slot = self.inner.get(id.index)?;
         let generation = slot.generation.load(Acquire);
 
         if generation == id.generation() {
@@ -848,7 +917,7 @@ impl<V> SlotMapInner<V> {
 
     #[inline(always)]
     fn get_mut(&mut self, id: SlotId) -> Option<&mut V> {
-        let slot = self.slots.get_mut(id.index)?;
+        let slot = self.inner.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
@@ -879,7 +948,7 @@ impl<V> SlotMapInner<V> {
             valid
         }
 
-        let len = self.slots.capacity_mut();
+        let len = self.inner.capacity_mut();
 
         if get_disjoint_check_valid(&ids, len) {
             // SAFETY: We checked that all indices are disjunct and in bounds of the slots vector.
@@ -896,6 +965,7 @@ impl<V> SlotMapInner<V> {
     ) -> Option<[&mut V; N]> {
         let mut refs = MaybeUninit::<[&mut V; N]>::uninit();
         let refs_ptr = refs.as_mut_ptr().cast::<&mut V>();
+        let slots = self.inner.as_mut_ptr();
 
         for i in 0..N {
             // SAFETY: `i` is in bounds of the array.
@@ -905,12 +975,7 @@ impl<V> SlotMapInner<V> {
             // * The caller must ensure that `ids` contains only IDs whose indices are in bounds of
             //   the slots vector.
             // * The caller must ensure that `ids` contains only IDs with disjunct indices.
-            let slot = unsafe { self.slots.get_unchecked_mut(id.index) };
-
-            // SAFETY: We unbind the lifetime to convince the borrow checker that we don't
-            // repeatedly borrow from `self.slots`. We don't for the same reasons as above.
-            // `Vec::get_unchecked_mut` also only borrows the one element and not the whole `Vec`.
-            let slot = unsafe { mem::transmute::<&mut Slot<V>, &mut Slot<V>>(slot) };
+            let slot = unsafe { &mut *slots.add(id.index as usize) };
 
             let generation = *slot.generation.get_mut();
 
@@ -934,10 +999,11 @@ impl<V> SlotMapInner<V> {
     }
 
     #[cfg(test)]
+    #[track_caller]
     fn index<'a>(&'a self, index: u32, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
 
-        let slot = self.slots.get(index)?;
+        let slot = self.inner.get(index)?;
         let generation = slot.generation.load(Acquire);
 
         if is_occupied(generation) {
@@ -959,7 +1025,7 @@ impl<V> SlotMapInner<V> {
         self.check_guard(guard);
 
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked(id.index) };
+        let slot = unsafe { self.inner.get_unchecked(id.index) };
 
         let _generation = slot.generation.load(Acquire);
 
@@ -974,7 +1040,7 @@ impl<V> SlotMapInner<V> {
     #[inline(always)]
     unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut V {
         // SAFETY: The caller must ensure that the index is in bounds.
-        let slot = unsafe { self.slots.get_unchecked_mut(id.index) };
+        let slot = unsafe { self.inner.get_unchecked_mut(id.index) };
 
         // SAFETY:
         // * The mutable reference makes sure that access to the slot is synchronized.
@@ -983,25 +1049,26 @@ impl<V> SlotMapInner<V> {
     }
 
     #[inline]
-    fn collector(&self) -> &hyaline::CollectorHandle {
-        &self.collector
+    fn header(&self) -> &Header {
+        self.inner.header()
     }
 
     #[inline]
-    fn header(&self) -> &Header {
-        self.slots.header()
+    fn header_mut(&mut self) -> &mut Header {
+        self.inner.header_mut()
     }
 
     #[inline(always)]
     #[track_caller]
     fn check_guard(&self, guard: &hyaline::Guard<'_>) {
+        #[cold]
         #[inline(never)]
         #[track_caller]
         fn collector_mismatch() -> ! {
             panic!("the given guard does not belong to this collection");
         }
 
-        if guard.collector() != self.collector() {
+        if guard.collector() != &self.collector {
             collector_mismatch();
         }
     }
@@ -1014,13 +1081,15 @@ impl<V> SlotMapInner<MaybeUninit<V>> {
         guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(SlotId) -> MaybeUninit<V>,
     ) -> (SlotId, &'a MaybeUninit<V>) {
-        let (id, slot) = if let Some((id, slot)) = self.allocate_slot(0, guard) {
-            slot.generation.store(id.generation(), Release);
+        let (id, slot, is_fresh_slot) = self.allocate_slot(0, guard);
 
-            (id, slot)
-        } else {
-            self.slots.push_with_tag_with(0, f)
-        };
+        if is_fresh_slot {
+            // SAFETY: `SlotMapInner::allocate_slot` always returns a unique slot that is not
+            // shared with any other threads.
+            unsafe { slot.value.get().cast::<MaybeUninit<V>>().write(f(id)) };
+        }
+
+        slot.generation.store(id.generation(), Release);
 
         self.header().shard().len.fetch_add(1, Relaxed);
 
@@ -1107,7 +1176,7 @@ impl<V> Drop for SlotMapInner<V> {
             return;
         }
 
-        for slot in self.slots.iter_mut() {
+        for slot in self.inner.iter_mut() {
             if *slot.generation.get_mut() & STATE_MASK != VACANT_TAG {
                 let ptr = slot.value.get_mut().as_mut_ptr();
 
@@ -1132,82 +1201,6 @@ impl<'a, K: Key, V> IntoIterator for &'a mut SlotMap<K, V> {
     }
 }
 
-impl Header {
-    #[inline]
-    fn shard(&self) -> &HeaderShard {
-        let shard_index = SHARD_INDEX.with(Cell::get);
-
-        // SAFETY: `set_shard_index` ensures that `SHARD_INDEX` is in bounds of the shards.
-        unsafe { self.shards.get_unchecked(shard_index) }
-    }
-
-    #[inline]
-    fn shard_mut(&mut self) -> &mut HeaderShard {
-        // SAFETY: There is always a non-zero number of shards.
-        unsafe { self.shards.get_unchecked_mut(0) }
-    }
-
-    #[inline]
-    fn shards(&self) -> HeaderShards<'_> {
-        let shard_index = SHARD_INDEX.with(Cell::get);
-
-        HeaderShards {
-            shards: &self.shards,
-            shard_index,
-            yielded: 0,
-        }
-    }
-
-    #[inline]
-    fn shards_mut(&mut self) -> slice::IterMut<'_, HeaderShard> {
-        self.shards.iter_mut()
-    }
-
-    #[inline]
-    fn len(&self) -> u32 {
-        self.shards()
-            .map(|shard| shard.len.load(Relaxed))
-            .sum::<i32>()
-            .try_into()
-            .unwrap_or(0)
-    }
-}
-
-struct HeaderShards<'a> {
-    shards: &'a [HeaderShard],
-    shard_index: usize,
-    yielded: usize,
-}
-
-impl<'a> Iterator for HeaderShards<'a> {
-    type Item = &'a HeaderShard;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.yielded < self.shards.len() {
-            let current_index = (self.shard_index + self.yielded) & (self.shards.len() - 1);
-            self.yielded += 1;
-
-            // SAFETY: `Header::shards` ensures that `current_index` starts out in bounds of the
-            // shards and we made sure that the next iteration has an index that's in bounds too.
-            Some(unsafe { self.shards.get_unchecked(current_index) })
-        } else {
-            None
-        }
-    }
-}
-
-#[inline(never)]
-fn set_shard_index() {
-    let mut state = DefaultHasher::new();
-    thread::current().id().hash(&mut state);
-    let thread_id_hash = state.finish();
-
-    let shard_count = SHARD_COUNT.load(Relaxed);
-    let shard_index = (thread_id_hash & (shard_count as u64 - 1)) as usize;
-    SHARD_INDEX.with(|cell| cell.set(shard_index));
-}
-
 pub trait Key: Sized {
     fn from_id(id: SlotId) -> Self;
 
@@ -1216,12 +1209,12 @@ pub trait Key: Sized {
 }
 
 impl Key for SlotId {
-    #[inline(always)]
+    #[inline]
     fn from_id(id: SlotId) -> Self {
         id
     }
 
-    #[inline(always)]
+    #[inline]
     fn as_id(self) -> SlotId {
         self
     }
@@ -1257,7 +1250,14 @@ impl SlotId {
 
     pub const OCCUPIED_TAG: u32 = OCCUPIED_TAG;
 
-    #[inline(always)]
+    /// # Panics
+    ///
+    /// Panics if `generation`, when masked out with [`STATE_MASK`], doesn't equal
+    /// [`OCCUPIED_TAG`].
+    ///
+    /// [`STATE_MASK`]: Self::STATE_MASK
+    /// [`OCCUPIED_TAG`]: Self::OCCUPIED_TAG
+    #[inline]
     #[must_use]
     #[track_caller]
     pub const fn new(index: u32, generation: u32) -> Self {
@@ -1273,11 +1273,14 @@ impl SlotId {
     ///
     /// [`STATE_MASK`]: Self::STATE_MASK
     /// [`OCCUPIED_TAG`]: Self::OCCUPIED_TAG
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub const unsafe fn new_unchecked(index: u32, generation: u32) -> Self {
-        // TODO: Replace with `assert_unsafe_precondition` when it can be made const.
-        debug_assert!(is_occupied(generation));
+        assert_unsafe_precondition!(
+            is_occupied(generation),
+            "`SlotId::new_unchecked` requires that `generation`, when masked out with \
+            `STATE_MASK`, equals `OCCUPIED_TAG`",
+        );
 
         // SAFETY: The caller must ensure that the state tag of `generation` is `OCCUPIED_TAG`.
         let generation = unsafe { NonZeroU32::new_unchecked(generation) };
@@ -1285,19 +1288,19 @@ impl SlotId {
         SlotId { index, generation }
     }
 
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub const fn index(self) -> u32 {
         self.index
     }
 
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub const fn generation(self) -> u32 {
         self.generation.get()
     }
 
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub const fn tag(self) -> u32 {
         self.generation.get() & TAG_MASK
@@ -1367,17 +1370,76 @@ macro_rules! declare_key {
         $vis struct $name($crate::SlotId);
 
         impl $crate::Key for $name {
-            #[inline(always)]
+            #[inline]
             fn from_id(id: $crate::SlotId) -> Self {
                 $name(id)
             }
 
-            #[inline(always)]
+            #[inline]
             fn as_id(self) -> $crate::SlotId {
                 self.0
             }
         }
     };
+}
+
+pub struct Slot<V> {
+    generation: AtomicU32,
+    next_free: AtomicU32,
+    value: UnsafeCell<MaybeUninit<V>>,
+}
+
+// SAFETY: Access to `Slot::value` is synchronized using `Slot::generation`, and by the fact that
+// we only hand out references to `Slot`s in the presence of a `hyaline::Guard`.
+unsafe impl<V: Sync> Sync for Slot<V> {}
+
+// While `Slot` does contain interior mutability, this is never exposed to the user and no
+// invariants can be broken.
+impl<V: RefUnwindSafe> RefUnwindSafe for Slot<V> {}
+
+impl<V> Slot<V> {
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Acquire)
+    }
+
+    #[inline]
+    pub fn value_ptr(&self) -> *mut V {
+        self.value.get().cast()
+    }
+
+    /// # Safety
+    ///
+    /// The value must be initialized. You can use [`generation`] to determine the state of the
+    /// slot.
+    ///
+    /// [`generation`]: Self::generation
+    #[inline(always)]
+    pub unsafe fn value_unchecked(&self) -> &V {
+        // SAFETY: The caller must ensure that access to the cell's inner value is synchronized.
+        let value = unsafe { &*self.value.get() };
+
+        // SAFETY: The caller must ensure that the slot has been initialized.
+        unsafe { value.assume_init_ref() }
+    }
+
+    /// # Safety
+    ///
+    /// The value must be initialized. You can use [`generation`] to determine the state of the
+    /// slot.
+    ///
+    /// [`generation`]: Self::generation
+    #[inline(always)]
+    pub unsafe fn value_unchecked_mut(&mut self) -> &mut V {
+        // SAFETY: The caller must ensure that the slot has been initialized.
+        unsafe { self.value.get_mut().assume_init_mut() }
+    }
+}
+
+impl<V> fmt::Debug for Slot<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Slot").finish_non_exhaustive()
+    }
 }
 
 pub struct Iter<'a, K, V> {
@@ -1589,7 +1651,7 @@ impl Backoff {
 
 macro_rules! assert_unsafe_precondition {
     ($condition:expr, $message:expr $(,)?) => {
-        // The nesting is intentional. There is a special path in the compiler for `if false`
+        // The nesting is intentional. There is a special path in the compiler for `if false`,
         // facilitating conditional compilation without `#[cfg]` and the problems that come with it.
         if cfg!(debug_assertions) {
             if !$condition {
@@ -1603,17 +1665,18 @@ use assert_unsafe_precondition;
 /// Polyfill for `core::panicking::panic_nounwind`.
 #[cold]
 #[inline(never)]
-fn panic_nounwind(message: &'static str) -> ! {
-    struct UnwindGuard;
-
-    impl Drop for UnwindGuard {
-        fn drop(&mut self) {
-            panic!();
-        }
+const fn panic_nounwind(message: &'static str) -> ! {
+    // This is an `extern "C"` function because these are guaranteed to abort instead of unwinding
+    // as of Rust 1.81.0. They also get the `nounwind` LLVM attribute, so this approach optimizes
+    // better than the alternatives. We wrap it in a Rust function for the better calling
+    // convention for DST references and to make it clearer that this is not actually used from C.
+    #[allow(improper_ctypes_definitions)]
+    #[inline]
+    const extern "C" fn inner(message: &'static str) -> ! {
+        panic!("{}", message);
     }
 
-    let _guard = UnwindGuard;
-    std::panic::panic_any(message);
+    inner(message)
 }
 
 #[cfg(test)]
@@ -2618,7 +2681,7 @@ mod tests {
 
         thread::scope(|s| {
             let map = &map;
-            let shard_count = SHARD_COUNT.load(Relaxed);
+            let shard_count = crate::vec::shard_count();
 
             for _ in 0..shard_count {
                 s.spawn(move || {
@@ -2632,7 +2695,7 @@ mod tests {
     // aren't testing the actual implementations but rather ones that don't take the generation into
     // account because of that.
 
-    const ITERATIONS: u32 = if cfg!(miri) { 1_000 } else { 1_000_000 };
+    const ITERATIONS: u32 = if cfg!(miri) { 128 } else { 1024 * 1024 };
 
     #[test]
     fn multi_threaded1() {
@@ -2667,49 +2730,40 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
-    #[ignore]
     #[test]
     fn multi_threaded2() {
-        const CAPACITY: u32 = 8_000;
+        const THREADS: u32 = 4;
 
-        let map = SlotMap::new(CAPACITY);
+        let map = SlotMap::new(ITERATIONS / 4);
 
         thread::scope(|s| {
             let insert_remover = || {
-                for _ in 0..ITERATIONS / 6 {
+                for _ in 0..ITERATIONS / THREADS / 4 {
                     let x = map.insert(0, &map.pin());
                     let y = map.insert(0, &map.pin());
                     map.remove(y, &map.pin());
                     let z = map.insert(0, &map.pin());
                     map.remove(x, &map.pin());
                     map.remove(z, &map.pin());
-                }
-            };
-            let iterator = || {
-                for _ in 0..ITERATIONS / CAPACITY * 2 {
-                    for index in 0..CAPACITY {
-                        if let Some(value) = map.index(index, &map.pin()) {
-                            let _ = *value;
-                        }
-                    }
+                    let w = map.insert(0, &map.pin());
+                    map.remove(w, &map.pin());
                 }
             };
 
-            s.spawn(iterator);
-            s.spawn(iterator);
-            s.spawn(iterator);
-            s.spawn(insert_remover);
+            for _ in 0..THREADS {
+                s.spawn(insert_remover);
+            }
         });
     }
 
     #[test]
     fn multi_threaded3() {
-        let map = SlotMap::new(ITERATIONS / 10);
+        let map = SlotMap::new(ITERATIONS / 8);
 
         thread::scope(|s| {
             let inserter = || {
                 for i in 0..ITERATIONS {
-                    if i % 10 == 0 {
+                    if i % 8 == 0 {
                         map.insert(0, &map.pin());
                     } else {
                         thread::yield_now();

@@ -2,9 +2,10 @@
 //!
 //! [Hyaline-1 memory reclamation technique]: https://arxiv.org/pdf/1905.07903
 
-use crate::{slot::Vec, Slot, SHARD_COUNT};
-use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
+use crate::{vec::RawVec, Slot};
+use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc};
 use core::{
+    alloc::Layout,
     cell::{Cell, UnsafeCell},
     fmt,
     marker::PhantomData,
@@ -16,13 +17,13 @@ use core::{
         Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
 };
-use std::{num::NonZeroUsize, thread};
 use thread_local::ThreadLocal;
 
-// SAFETY: `usize` and `*mut Node` have the same layout.
-// TODO: Replace with `ptr::without_provanance_mut` once we bump the MSRV.
-#[allow(integer_to_ptr_transmutes, clippy::useless_transmute)]
-const INACTIVE: *mut Node = unsafe { mem::transmute(usize::MAX) };
+// TODO: Replace with a const once we bump the MSRV.
+#[inline]
+fn inactive() -> *mut Node {
+    ptr::without_provenance_mut(usize::MAX)
+}
 
 const MIN_RETIRED_LEN: usize = 64;
 
@@ -30,10 +31,10 @@ pub struct CollectorHandle {
     ptr: *mut Collector,
 }
 
-// SAFETY: `Collector` is `Send + Sync` and its lifetime is enforced with reference counting.
+// SAFETY: `Collector` is `Send + Sync`, and its lifetime is enforced with reference counting.
 unsafe impl Send for CollectorHandle {}
 
-// SAFETY: `Collector` is `Send + Sync` and its lifetime is enforced with reference counting.
+// SAFETY: `Collector` is `Send + Sync`, and its lifetime is enforced with reference counting.
 unsafe impl Sync for CollectorHandle {}
 
 impl Default for CollectorHandle {
@@ -45,12 +46,7 @@ impl Default for CollectorHandle {
 impl CollectorHandle {
     #[must_use]
     pub fn new() -> Self {
-        if SHARD_COUNT.load(Relaxed) == 0 {
-            let num_cpus = thread::available_parallelism()
-                .map(NonZeroUsize::get)
-                .unwrap_or(1);
-            SHARD_COUNT.store(num_cpus.next_power_of_two(), Relaxed);
-        }
+        crate::vec::set_shard_count();
 
         let ptr = Box::into_raw(Box::new(Collector {
             retirement_lists: ThreadLocal::new(),
@@ -76,10 +72,10 @@ impl CollectorHandle {
         let retirement_list = self.collector().retirement_lists.get_or(|| {
             is_fresh_entry = true;
 
-            crate::set_shard_index();
+            crate::vec::set_shard_index();
 
             RetirementList {
-                head: AtomicPtr::new(INACTIVE),
+                head: AtomicPtr::new(inactive()),
                 // SAFETY: The collector cannot be dropped until all handles have been dropped, at
                 // which point it is impossible to access this handle.
                 collector: ManuallyDrop::new(unsafe { ptr::read(self) }),
@@ -208,8 +204,8 @@ impl RetirementList {
         let batch = unsafe { &mut *self.batch.get() };
 
         // SAFETY: The caller must ensure that `index` is valid and that it is not reachable
-        // anymore, that `slots` is a valid pointer to the allocation of `Slot`s, and that `reclaim`
-        // is safe to call with the `index` and `slots`.
+        // anymore, that `slots` is a valid pointer to the allocation of `Slot<V>`s, and that
+        // `reclaim` is safe to call with the `index` and `slots`.
         unsafe { batch.push(index, slots, reclaim) };
 
         if batch.len() == MIN_RETIRED_LEN {
@@ -237,7 +233,7 @@ impl RetirementList {
         atomic::fence(SeqCst);
 
         for retirement_list in &self.collector.collector().retirement_lists {
-            if retirement_list.head.load(Relaxed) == INACTIVE {
+            if retirement_list.head.load(Relaxed) == inactive() {
                 continue;
             }
 
@@ -277,7 +273,7 @@ impl RetirementList {
             let mut head = list.load(Relaxed);
 
             loop {
-                if head == INACTIVE {
+                if head == inactive() {
                     atomic::fence(Acquire);
                     len -= 1;
                     continue 'outer;
@@ -296,23 +292,24 @@ impl RetirementList {
         // SAFETY: The pointer is valid.
         if unsafe { (*batch).ref_count.fetch_add(len, Release) }.wrapping_add(len) == 0 {
             // SAFETY: We had the last reference.
-            unsafe { self.reclaim(batch) };
+            unsafe { Self::reclaim(batch) };
         }
     }
 
     #[inline]
     unsafe fn leave(&self) {
-        let head = self.head.swap(INACTIVE, Release);
+        let head = self.head.swap(inactive(), Release);
 
         if !head.is_null() {
             // SAFETY: The caller must ensure that this method isn't called concurrently and that
             // there are no more references to any retired slots.
-            unsafe { self.traverse(head) };
+            unsafe { Self::traverse(head) };
         }
     }
 
     #[cold]
-    unsafe fn traverse(&self, mut head: *mut Node) {
+    #[inline(never)]
+    unsafe fn traverse(mut head: *mut Node) {
         atomic::fence(Acquire);
 
         while !head.is_null() {
@@ -329,14 +326,14 @@ impl RetirementList {
 
             if ref_count == 0 {
                 // SAFETY: We had the last reference.
-                unsafe { self.reclaim(batch) };
+                unsafe { Self::reclaim(batch) };
             }
 
             head = next;
         }
     }
 
-    unsafe fn reclaim(&self, batch: *mut Batch) {
+    unsafe fn reclaim(batch: *mut Batch) {
         atomic::fence(Acquire);
 
         // SAFETY: The caller must ensure that we own the batch.
@@ -397,7 +394,7 @@ struct Node {
     batch: *mut Batch,
     /// The index of the retired slot.
     index: u32,
-    /// A pointer to the allocation of `slot::Slot<V>`s.
+    /// A pointer to the allocation of `Slot<V>`s.
     slots: *const u8,
     /// The reclamation function for the retired slot.
     reclaim: unsafe fn(u32, *const u8),
@@ -414,10 +411,10 @@ struct LocalBatch {
     ptr: *mut Batch,
 }
 
-// SAFETY: We own the batch and access to it is synchronized using mutable references.
+// SAFETY: We own the batch, and access to it is synchronized using mutable references.
 unsafe impl Send for LocalBatch {}
 
-// SAFETY: We own the batch and access to it is synchronized using mutable references.
+// SAFETY: We own the batch, and access to it is synchronized using mutable references.
 unsafe impl Sync for LocalBatch {}
 
 impl Default for LocalBatch {
@@ -439,13 +436,16 @@ impl LocalBatch {
             handle_alloc_error(layout);
         }
 
+        let initial_batch = Batch {
+            ref_count: AtomicUsize::new(0),
+            capacity: Self::MIN_CAP,
+            len: 0,
+            retired_len: 0,
+            nodes: [],
+        };
+
         // SAFETY: We successfully allocated the batch.
-        unsafe {
-            *ptr::addr_of_mut!((*ptr).ref_count) = AtomicUsize::new(0);
-            *ptr::addr_of_mut!((*ptr).capacity) = Self::MIN_CAP;
-            *ptr::addr_of_mut!((*ptr).len) = 0;
-            *ptr::addr_of_mut!((*ptr).retired_len) = 0;
-        }
+        unsafe { ptr.write(initial_batch) };
 
         LocalBatch { ptr }
     }
@@ -486,19 +486,19 @@ impl LocalBatch {
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut Node {
         // SAFETY: The pointer is valid.
-        unsafe { ptr::addr_of_mut!((*self.ptr).nodes) }.cast()
+        unsafe { &raw mut (*self.ptr).nodes }.cast()
     }
 
     fn as_mut_slice(&mut self) -> &mut [Node] {
-        // SAFETY: The pointer is valid and the caller of `LocalBatch::set_len` must ensure that the
-        // length is the correct number of nodes that are initialized.
+        // SAFETY: The pointer is valid, and the caller of `LocalBatch::set_len` must ensure that
+        // the length is the correct number of nodes that are initialized.
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
     }
 
     #[inline]
     fn retired_as_mut_slice(&mut self) -> &mut [Node] {
-        // SAFETY: The pointer is valid and the caller of `LocalBatch::set_retired_len` must ensure
-        // that the length is the correct number of nodes that should be retired.
+        // SAFETY: The pointer is valid, and the caller of `LocalBatch::set_retired_len` must
+        // ensure that the length is the correct number of nodes that should be retired.
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.retired_len()) }
     }
 
@@ -603,7 +603,7 @@ impl<'a> Guard<'a> {
     }
 
     #[inline]
-    pub(crate) unsafe fn defer_reclaim<V>(&self, index: u32, slots: &Vec<V>) {
+    pub(crate) unsafe fn defer_reclaim<V>(&self, index: u32, slots: &RawVec<Slot<V>>) {
         let slots = slots.as_ptr().cast();
         let reclaim = transmute_reclaim_fp(crate::reclaim::<V>);
 
@@ -616,7 +616,7 @@ impl<'a> Guard<'a> {
     }
 
     #[inline]
-    pub(crate) unsafe fn defer_reclaim_invalidated<V>(&self, index: u32, slots: &Vec<V>) {
+    pub(crate) unsafe fn defer_reclaim_invalidated<V>(&self, index: u32, slots: &RawVec<Slot<V>>) {
         let slots = slots.as_ptr().cast();
         let reclaim = transmute_reclaim_fp(crate::reclaim_invalidated::<V>);
 

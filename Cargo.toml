@@ -14,15 +14,18 @@ categories = ["concurrency", "data-structures", "memory-management", "caching"]
 
 [dependencies]
 thread_local = "1.0"
-virtual-buffer = "1.0"
+virtual-buffer = { git = "https://github.com/vulkano-rs/virtual-buffer", rev = "de5b76416944652e017f106f6aaa7aae1d003936" }
 
 [dev-dependencies]
 slotmap = "1.0"
 
 [lints]
-rust.unused_unsafe = "allow"
-clippy.inline_always = "allow"
 rust.rust_2018_idioms = { level = "warn", priority = -1 }
 rust.missing_debug_implementations = "warn"
 rust.unsafe_op_in_unsafe_fn = "forbid"
+rust.unused_unsafe = "allow"
+clippy.pedantic = { level = "warn", priority = -1 }
+clippy.borrow_as_ptr = "allow"
+clippy.cast_ptr_alignment = "allow"
+clippy.inline_always = "allow"
 clippy.undocumented_unsafe_blocks = "forbid"
