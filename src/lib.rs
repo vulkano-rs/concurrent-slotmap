@@ -14,7 +14,7 @@ use core::{
     panic::RefUnwindSafe,
     slice,
     sync::atomic::{
-        self, AtomicU32,
+        AtomicU32,
         Ordering::{Acquire, Relaxed, Release},
     },
 };
@@ -868,7 +868,7 @@ impl<V> SlotMapInner<V> {
 
         let new_generation = (id.generation() & GENERATION_MASK).wrapping_add(ONE_GENERATION);
 
-        let generation = slot.generation.swap(new_generation, Relaxed);
+        let generation = slot.generation.swap(new_generation, Acquire);
 
         assert_unsafe_precondition!(
             generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
@@ -876,8 +876,6 @@ impl<V> SlotMapInner<V> {
         );
 
         if generation & STATE_MASK == RECLAIMED_TAG {
-            atomic::fence(Acquire);
-
             // SAFETY:
             // * The `Acquire` fence after loading the slot's generation synchronizes with the
             //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
@@ -1143,7 +1141,7 @@ unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
 
         match slot
             .generation
-            .compare_exchange_weak(generation, new_generation, Relaxed, Relaxed)
+            .compare_exchange_weak(generation, new_generation, Acquire, Relaxed)
         {
             Ok(_) => return,
             Err(new_generation) => generation = new_generation,
@@ -1152,10 +1150,8 @@ unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
 
     debug_assert!(generation & STATE_MASK == VACANT_TAG);
 
-    atomic::fence(Acquire);
-
     // SAFETY:
-    // * The `Acquire` fence after loading the slot's generation synchronizes with the `Release`
+    // * The `Acquire` ordering when loading the slot's generation synchronizes with the `Release`
     //   ordering in `SlotMap::insert`, making sure that the newly written value is visible here.
     // * The previous state tag of the slot must have been `VACANT_TAG`, which means it must have
     //   been removed in `SlotMap::remove_invalidated`, which means it must have been invalidated in
