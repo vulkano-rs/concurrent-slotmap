@@ -25,7 +25,8 @@ fn inactive() -> *mut Node {
     ptr::without_provenance_mut(usize::MAX)
 }
 
-const MIN_RETIRED_LEN: usize = 64;
+// More contention means more chance for a race condition to be detected.
+const MIN_RETIRED_LEN: usize = if cfg!(miri) { 4 } else { 64 };
 
 pub struct CollectorHandle {
     ptr: *mut Collector,
