@@ -1025,7 +1025,12 @@ impl<V> SlotMapInner<V> {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.inner.get_unchecked(id.index) };
 
-        let _generation = slot.generation.load(Acquire);
+        let generation = slot.generation.load(Acquire);
+
+        assert_unsafe_precondition!(
+            is_occupied(generation),
+            "`SlotMap::get_unchecked` requires that `id` refers to a currently occupied slot",
+        );
 
         // SAFETY:
         // * The `Acquire` ordering when loading the slot's generation synchronizes with the
@@ -1039,6 +1044,11 @@ impl<V> SlotMapInner<V> {
     unsafe fn get_unchecked_mut(&mut self, id: SlotId) -> &mut V {
         // SAFETY: The caller must ensure that the index is in bounds.
         let slot = unsafe { self.inner.get_unchecked_mut(id.index) };
+
+        assert_unsafe_precondition!(
+            is_occupied(*slot.generation.get_mut()),
+            "`SlotMap::get_unchecked_mut` requires that `id` refers to a currently occupied slot",
+        );
 
         // SAFETY:
         // * The mutable reference makes sure that access to the slot is synchronized.
