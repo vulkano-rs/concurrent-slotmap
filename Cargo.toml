@@ -19,13 +19,17 @@ virtual-buffer = { git = "https://github.com/vulkano-rs/virtual-buffer", rev = "
 [dev-dependencies]
 slotmap = "1.0"
 
-[lints]
-rust.rust_2018_idioms = { level = "warn", priority = -1 }
-rust.missing_debug_implementations = "warn"
-rust.unsafe_op_in_unsafe_fn = "forbid"
-rust.unused_unsafe = "allow"
-clippy.pedantic = { level = "warn", priority = -1 }
-clippy.borrow_as_ptr = "allow"
-clippy.cast_ptr_alignment = "allow"
-clippy.inline_always = "allow"
-clippy.undocumented_unsafe_blocks = "forbid"
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+# TODO: Replace `cfg(concurrent_slotmap_sanitize)` with `cfg(sanitize = "thread")` once stable.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(concurrent_slotmap_sanitize)"] }
+unsafe_op_in_unsafe_fn = "forbid"
+unused_unsafe = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+borrow_as_ptr = "allow"
+cast_ptr_alignment = "allow"
+inline_always = "allow"
+undocumented_unsafe_blocks = "forbid"

@@ -20,7 +20,7 @@ thread_local! {
 
 pub(crate) fn set_shard_count() {
     if SHARD_COUNT.load(Relaxed) == 0 {
-        let shard_count = if cfg!(miri) {
+        let shard_count = if cfg!(any(miri, concurrent_slotmap_sanitize)) {
             // More contention means more chance for a race condition to be detected.
             1
         } else {

@@ -25,8 +25,12 @@ fn inactive() -> *mut Node {
     ptr::without_provenance_mut(usize::MAX)
 }
 
-// More contention means more chance for a race condition to be detected.
-const MIN_RETIRED_LEN: usize = if cfg!(miri) { 4 } else { 64 };
+const MIN_RETIRED_LEN: usize = if cfg!(any(miri, concurrent_slotmap_sanitize)) {
+    // More contention means more chance for a race condition to be detected.
+    4
+} else {
+    64
+};
 
 pub struct CollectorHandle {
     ptr: *mut Collector,
@@ -132,7 +136,7 @@ impl Drop for CollectorHandle {
     #[inline]
     fn drop(&mut self) {
         if self.collector().handle_count.fetch_sub(1, Release) == 1 {
-            atomic::fence(Acquire);
+            acquire!(self.collector().handle_count);
 
             // SAFETY: The handle count has gone to zero, which means that no other threads can
             // register a new handle. The `Acquire` fence above ensures that the drop is
@@ -234,7 +238,14 @@ impl RetirementList {
         atomic::fence(SeqCst);
 
         for retirement_list in &self.collector.collector().retirement_lists {
-            if retirement_list.head.load(Relaxed) == inactive() {
+            // HACK: ThreadSanitizer doesn't support acquire fences.
+            let order = if cfg!(concurrent_slotmap_sanitize) {
+                Acquire
+            } else {
+                Relaxed
+            };
+
+            if retirement_list.head.load(order) == inactive() {
                 continue;
             }
 
@@ -254,7 +265,9 @@ impl RetirementList {
         let nodes = batch.as_mut_ptr();
         let batch = batch.into_raw();
 
-        atomic::fence(Acquire);
+        if !cfg!(concurrent_slotmap_sanitize) {
+            atomic::fence(Acquire);
+        }
 
         #[allow(clippy::mut_range_bound)]
         'outer: for node_index in 0..len {
@@ -275,7 +288,7 @@ impl RetirementList {
 
             loop {
                 if head == inactive() {
-                    atomic::fence(Acquire);
+                    acquire!(list);
                     len -= 1;
                     continue 'outer;
                 }
@@ -291,8 +304,16 @@ impl RetirementList {
         }
 
         // SAFETY: The pointer is valid.
-        if unsafe { (*batch).ref_count.fetch_add(len, Release) }.wrapping_add(len) == 0 {
-            // SAFETY: We had the last reference.
+        let ref_count = unsafe { &(*batch).ref_count }.fetch_add(len, Release);
+
+        if ref_count.wrapping_add(len) == 0 {
+            // SAFETY: The pointer is valid.
+            acquire!(unsafe { &(*batch).ref_count });
+
+            // SAFETY: The reference count has gone to zero, which means that no other threads can
+            // be accessing any of the nodes in the batch. The `Acquire` fence above synchronizes
+            // with the `Release` reference count in/decrement, making sure that no access to
+            // `batch` can be ordered after the reclaim.
             unsafe { Self::reclaim(batch) };
         }
     }
@@ -302,8 +323,12 @@ impl RetirementList {
         let head = self.head.swap(inactive(), Release);
 
         if !head.is_null() {
+            acquire!(self.head);
+
             // SAFETY: The caller must ensure that this method isn't called concurrently and that
-            // there are no more references to any retired slots.
+            // there are no more references to any retired slots. The `Acquire` fence above
+            // synchronizes with the `Release` ordering in `RetirementList::retire`, making sure
+            // that the new nodes are visible here.
             unsafe { Self::traverse(head) };
         }
     }
@@ -311,8 +336,6 @@ impl RetirementList {
     #[cold]
     #[inline(never)]
     unsafe fn traverse(mut head: *mut Node) {
-        atomic::fence(Acquire);
-
         while !head.is_null() {
             // SAFETY: We always push valid pointers into the list.
             let batch = unsafe { (*head).batch };
@@ -321,12 +344,17 @@ impl RetirementList {
             // that the `next` union variant is initialized.
             let next = unsafe { (*head).link.next };
 
-            // SAFETY: The caller must ensure that there are no more references to any retired
-            // slots.
-            let ref_count = unsafe { (*batch).ref_count.fetch_sub(1, Release) }.wrapping_sub(1);
+            // SAFETY: Nodes in the list always contain a valid batch.
+            let ref_count = unsafe { &(*batch).ref_count }.fetch_sub(1, Release);
 
-            if ref_count == 0 {
-                // SAFETY: We had the last reference.
+            if ref_count.wrapping_sub(1) == 0 {
+                // SAFETY: Nodes in the list always contain a valid batch.
+                acquire!(unsafe { &(*batch).ref_count });
+
+                // SAFETY: The reference count has gone to zero, which means that no other threads
+                // can be accessing any of the nodes in the batch. The `Acquire` fence above
+                // synchronizes with the `Release` reference count in/decrement, making sure that
+                // no access to `batch` can be ordered after the reclaim.
                 unsafe { Self::reclaim(batch) };
             }
 
@@ -335,8 +363,6 @@ impl RetirementList {
     }
 
     unsafe fn reclaim(batch: *mut Batch) {
-        atomic::fence(Acquire);
-
         // SAFETY: The caller must ensure that we own the batch.
         let mut batch = unsafe { LocalBatch::from_raw(batch) };
 
@@ -352,8 +378,6 @@ impl RetirementList {
 
 impl Drop for Collector {
     fn drop(&mut self) {
-        atomic::fence(Acquire);
-
         for retirement_list in &mut self.retirement_lists {
             let batch = retirement_list.batch.get_mut();
 
@@ -678,3 +702,15 @@ impl Drop for Guard<'_> {
         }
     }
 }
+
+// HACK: ThreadSanitizer doesn't support acquire fences.
+macro_rules! acquire {
+    ($atomic:expr) => {
+        if cfg!(concurrent_slotmap_sanitize) {
+            $atomic.load(Acquire);
+        } else {
+            atomic::fence(Acquire);
+        }
+    };
+}
+use acquire;

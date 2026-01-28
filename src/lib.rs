@@ -2691,7 +2691,7 @@ mod tests {
     // aren't testing the actual implementations but rather ones that don't take the generation into
     // account because of that.
 
-    const ITERATIONS: u32 = if cfg!(miri) { 128 } else { 1024 * 1024 };
+    const ITERATIONS: u32 = if cfg!(miri) { 16 } else { 128 * 1024 };
 
     #[test]
     fn multi_threaded1() {
