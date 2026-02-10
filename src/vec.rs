@@ -75,13 +75,13 @@ pub(crate) struct HeaderShard {
 impl<T> RawVec<T> {
     #[track_caller]
     pub unsafe fn new(max_capacity: u32) -> Self {
-        let max_capacity = usize::try_from(max_capacity).unwrap();
+        let mut builder = vec::RawVec::builder(usize::try_from(max_capacity).unwrap());
         let shard_count = SHARD_COUNT.load(Relaxed);
-        let header_layout = Layout::array::<HeaderShard>(shard_count).unwrap();
+        builder.header(Layout::array::<HeaderShard>(shard_count).unwrap());
 
         let mut vec = RawVec {
             // SAFETY: `Slot<V>` is zeroable.
-            inner: unsafe { vec::RawVec::with_header(max_capacity, header_layout) },
+            inner: unsafe { builder.build() },
         };
 
         vec.header_mut().init();
@@ -90,14 +90,13 @@ impl<T> RawVec<T> {
     }
 
     pub unsafe fn try_new(max_capacity: u32) -> Result<Self, TryReserveError> {
-        let max_capacity = usize::try_from(max_capacity).unwrap();
+        let mut builder = vec::RawVec::builder(usize::try_from(max_capacity).unwrap());
         let shard_count = SHARD_COUNT.load(Relaxed);
-        let header_layout = Layout::array::<HeaderShard>(shard_count).unwrap();
+        builder.header(Layout::array::<HeaderShard>(shard_count).unwrap());
 
         let mut vec = RawVec {
             // SAFETY: `Slot<V>` is zeroable.
-            inner: unsafe { vec::RawVec::try_with_header(max_capacity, header_layout) }
-                .map_err(TryReserveError)?,
+            inner: unsafe { builder.try_build() }.map_err(TryReserveError)?,
         };
 
         vec.header_mut().init();
