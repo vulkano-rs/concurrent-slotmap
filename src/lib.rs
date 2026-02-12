@@ -2708,7 +2708,7 @@ mod tests {
     fn multi_threaded2() {
         const THREADS: u32 = 4;
 
-        let map = SlotMap::new(ITERATIONS / 4);
+        let map = SlotMap::new(ITERATIONS);
 
         thread::scope(|s| {
             let insert_remover = || {
