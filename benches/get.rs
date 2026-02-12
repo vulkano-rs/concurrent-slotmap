@@ -3,7 +3,7 @@
 extern crate test;
 
 use std::{sync::RwLock, thread};
-use test::{black_box, Bencher};
+use test::{Bencher, black_box};
 
 const ITERATIONS: u32 = 100_000;
 const THREADS: u32 = 10;

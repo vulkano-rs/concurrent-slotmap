@@ -1,7 +1,7 @@
 extern crate alloc;
 
 pub use self::vec::TryReserveError;
-use self::vec::{header_ptr_from_slots, Header, RawVec};
+use self::vec::{Header, RawVec, header_ptr_from_slots};
 use core::{
     cell::UnsafeCell,
     cmp, fmt,
@@ -2574,8 +2574,11 @@ mod tests {
 
         let x = map.insert(69, &map.pin());
 
-        // SAFETY: `x` refers to an occupied slot.
-        assert_eq!(unsafe { map.remove_unchecked(x, &map.pin()) }, &69);
+        {
+            let guard = &map.pin();
+            // SAFETY: `x` refers to an occupied slot.
+            assert_eq!(unsafe { map.remove_unchecked(x, guard) }, &69);
+        }
 
         assert_eq!(map.get(x, &map.pin()), None);
     }

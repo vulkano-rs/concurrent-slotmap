@@ -2,7 +2,7 @@
 name = "concurrent-slotmap"
 version = "0.2.0-alpha.1"
 authors = ["marc0246 <40955683+marc0246@users.noreply.github.com>"]
-edition = "2021"
+edition = "2024"
 rust-version = "1.87.0"
 description = "A lock-free concurrent slotmap"
 documentation = "https://docs.rs/concurrent-slotmap"

@@ -2,7 +2,7 @@
 //!
 //! [Hyaline-1 memory reclamation technique]: https://arxiv.org/pdf/1905.07903
 
-use crate::{vec::RawVec, Slot};
+use crate::{Slot, vec::RawVec};
 use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc};
 use core::{
     alloc::Layout,
