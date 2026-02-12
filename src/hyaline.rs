@@ -58,8 +58,8 @@ impl CollectorHandle {
             handle_count: AtomicUsize::new(1),
         }));
 
-        // SAFETY: We made sure that initialize the `handle_count` to `1` such that the handle's
-        // drop implementation cannot drop the `Collector` while another handle still exists.
+        // SAFETY: We made sure to initialize the `handle_count` to `1` such that the handle's drop
+        // implementation cannot drop the `Collector` while another handle still exists.
         unsafe { CollectorHandle { ptr } }
     }
 
@@ -140,7 +140,7 @@ impl Drop for CollectorHandle {
 
             // SAFETY: The handle count has gone to zero, which means that no other threads can
             // register a new handle. The `Acquire` fence above ensures that the drop is
-            // synchronized with the above decrement, such that no access to the `Collector` can be
+            // synchronized with the above decrement such that no access to the `Collector` can be
             // ordered after the drop.
             let _ = unsafe { Box::from_raw(self.ptr) };
         }
@@ -186,9 +186,9 @@ impl RetirementList {
         }
 
         // SAFETY:
-        // * We incremented the `guard_count` above such that the guard's drop implementation cannot
+        // - We incremented the `guard_count` above such that the guard's drop implementation cannot
         //   unpin the participant while another guard still exists.
-        // * We made sure to pin the participant if it wasn't already.
+        // - We made sure to pin the participant if it wasn't already.
         unsafe { Guard::new(self) }
     }
 
@@ -278,9 +278,9 @@ impl RetirementList {
             unsafe { (*node).batch = batch };
 
             // SAFETY:
-            // * The `node` pointer is valid.
-            // * We pushed the `retirement_list` union variant into the batch above.
-            // * The `retirement_list` pointer must have staid valid because `ThreadLocal` entries
+            // - The `node` pointer is valid.
+            // - We pushed the `retirement_list` union variant into the batch above.
+            // - The `retirement_list` pointer must have staid valid because `ThreadLocal` entries
             //   are never deinitialized.
             let list = unsafe { &*(*node).link.retirement_list };
 
@@ -368,9 +368,9 @@ impl RetirementList {
 
         for node in batch.retired_as_mut_slice() {
             // SAFETY:
-            // * We own the batch, which means that no more references to the slots can exist.
-            // * We always push indices of existing vacant slots into the list.
-            // * `node.slots` is the same pointer that was used when pushing the node.
+            // - We own the batch, which means that no more references to the slots can exist.
+            // - We always push indices of existing vacant slots into the list.
+            // - `node.slots` is the same pointer that was used when pushing the node.
             unsafe { (node.reclaim)(node.index, node.slots) };
         }
     }
@@ -387,10 +387,10 @@ impl Drop for Collector {
 
             for node in batch.retired_as_mut_slice() {
                 // SAFETY:
-                // * We have mutable access to the batch, which means that no more references to the
+                // - We have mutable access to the batch, which means that no more references to the
                 //   slots can exist.
-                // * We always push indices of existing vacant slots into the list.
-                // * `node.slots` is the same pointer that was used when pushing the node.
+                // - We always push indices of existing vacant slots into the list.
+                // - `node.slots` is the same pointer that was used when pushing the node.
                 unsafe { (node.reclaim)(node.index, node.slots) };
             }
         }
@@ -560,9 +560,9 @@ impl LocalBatch {
         let new_layout = layout_for_capacity(new_capacity);
 
         // SAFETY:
-        // * `self.ptr` was allocated via the global allocator.
-        // * `layout` is the current layout.
-        // * `new_layout.size()`, when rounded up to the nearest multiple of `new_layout.align()`,
+        // - `self.ptr` was allocated via the global allocator.
+        // - `layout` is the current layout.
+        // - `new_layout.size()`, when rounded up to the nearest multiple of `new_layout.align()`,
         //   cannot overflow `isize` since we used `Layout` for the layout calculation.
         let new_ptr = unsafe { realloc(self.ptr.cast(), layout, new_layout.size()) };
 
@@ -594,8 +594,8 @@ impl Drop for LocalBatch {
         let layout = layout_for_capacity(self.capacity());
 
         // SAFETY:
-        // * `self.ptr` was allocated using the global allocator.
-        // * `layout` is the layout of the allocation.
+        // - `self.ptr` was allocated using the global allocator.
+        // - `layout` is the layout of the allocation.
         unsafe { dealloc(self.ptr.cast(), layout) };
     }
 }
@@ -633,10 +633,10 @@ impl<'a> Guard<'a> {
         let reclaim = transmute_reclaim_fp(crate::reclaim::<V>);
 
         // SAFETY:
-        // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
-        // * The caller must ensure that `index` is valid and that it is not reachable anymore.
-        // * `slots` is a valid pointer to the allocation of `Slot<V>`s.
-        // * The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
+        // - `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
+        // - The caller must ensure that `index` is valid and that it is not reachable anymore.
+        // - `slots` is a valid pointer to the allocation of `Slot<V>`s.
+        // - The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
         unsafe { self.retirement_list.defer_reclaim(index, slots, reclaim) };
     }
 
@@ -646,10 +646,10 @@ impl<'a> Guard<'a> {
         let reclaim = transmute_reclaim_fp(crate::reclaim_invalidated::<V>);
 
         // SAFETY:
-        // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
-        // * The caller must ensure that `index` is valid and that it is not reachable anymore.
-        // * `slots` is a valid pointer to the allocation of `Slot<V>`s.
-        // * The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
+        // - `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
+        // - The caller must ensure that `index` is valid and that it is not reachable anymore.
+        // - `slots` is a valid pointer to the allocation of `Slot<V>`s.
+        // - The caller must ensure that `reclaim` is safe to call with the `index` and `slots`.
         unsafe { self.retirement_list.defer_reclaim(index, slots, reclaim) }
     }
 
@@ -680,9 +680,9 @@ impl Clone for Guard<'_> {
             .set(guard_count.checked_add(1).unwrap());
 
         // SAFETY:
-        // * We incremented the `guard_count` above, such that the guard's drop implementation
-        //   cannot unpin the participant while another guard still exists.
-        // * The participant is already pinned as this guard's existence is a proof of that.
+        // - We incremented the `guard_count` above such that the guard's drop implementation cannot
+        //   unpin the participant while another guard still exists.
+        // - The participant is already pinned as this guard's existence is a proof of that.
         unsafe { Guard::new(self.retirement_list) }
     }
 }
@@ -695,8 +695,8 @@ impl Drop for Guard<'_> {
 
         if guard_count == 1 {
             // SAFETY:
-            // * `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
-            // * We are dropping the last guard, so there cannot be any more references to any
+            // - `Guard` is `!Send + !Sync`, so this cannot be called concurrently.
+            // - We are dropping the last guard, so there cannot be any more references to any
             //   retired slots.
             unsafe { self.retirement_list.leave() };
         }

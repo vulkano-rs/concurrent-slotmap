@@ -47,9 +47,11 @@ pub(crate) fn set_shard_index() {
 
     let shard_count = SHARD_COUNT.load(Relaxed);
 
+    let shard_index = thread_id_hash & (shard_count as u64 - 1);
+
     // The index can never exceed `shard_count - 1`, which is bounded by the available parallelism.
     #[allow(clippy::cast_possible_truncation)]
-    let shard_index = (thread_id_hash & (shard_count as u64 - 1)) as usize;
+    let shard_index = shard_index as usize;
 
     SHARD_INDEX.set(shard_index);
 }
@@ -80,7 +82,7 @@ impl<T> RawVec<T> {
         builder.header(Layout::array::<HeaderShard>(shard_count).unwrap());
 
         let mut vec = RawVec {
-            // SAFETY: `Slot<V>` is zeroable.
+            // SAFETY: Enforced by the caller.
             inner: unsafe { builder.build() },
         };
 
@@ -95,7 +97,7 @@ impl<T> RawVec<T> {
         builder.header(Layout::array::<HeaderShard>(shard_count).unwrap());
 
         let mut vec = RawVec {
-            // SAFETY: `Slot<V>` is zeroable.
+            // SAFETY: Enforced by the caller.
             inner: unsafe { builder.try_build() }.map_err(TryReserveError)?,
         };
 

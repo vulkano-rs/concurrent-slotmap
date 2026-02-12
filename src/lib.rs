@@ -665,13 +665,11 @@ impl<V> SlotMapInner<V> {
         // the slot going forward.
         unsafe { guard.defer_reclaim(id.index, &self.inner) };
 
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
-        //   slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
-        //   `SlotMap::insert[_mut]`.
+        // SAFETY: The `compare_exchange` above succeeded, which means that the previous state tag
+        // of the slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
+        // `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's generation
+        // synchronizes with the `Release` ordering in `SlotMap::insert`, making sure that the newly
+        // written value is visible here.
         Some(unsafe { slot.value_unchecked() })
     }
 
@@ -695,11 +693,11 @@ impl<V> SlotMapInner<V> {
             *len = len.wrapping_sub(1);
 
             // SAFETY:
-            // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which means that the
+            // - The mutable reference makes sure that access to the slot is synchronized.
+            // - We checked that `id.generation` matches the slot's generation, which means that the
             //   previous state tag of the slot must have been `OCCUPIED_TAG`, which means it must
             //   have been initialized in `SlotMap::insert[_mut]`.
-            // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
+            // - We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
             //   slot will fail.
             Some(unsafe { slot.value.get().cast::<V>().read() })
         } else {
@@ -729,12 +727,10 @@ impl<V> SlotMapInner<V> {
         // the slot going forward. The caller must ensure that a race condition doesn't occur.
         unsafe { guard.defer_reclaim(id.index, &self.inner) };
 
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The caller must ensure that the slot is occupied, which means it must have been
-        //   initialized in `SlotMap::insert[_mut]`.
+        // SAFETY: The caller must ensure that the slot is occupied, which means it must have been
+        // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's
+        // generation synchronizes with the `Release` ordering in `SlotMap::insert`, making sure
+        // that the newly written value is visible here.
         unsafe { slot.value_unchecked() }
     }
 
@@ -770,13 +766,11 @@ impl<V> SlotMapInner<V> {
         // the slot going forward.
         unsafe { guard.defer_reclaim(index, &self.inner) };
 
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The `compare_exchange_weak` above succeeded, which means that the previous state tag of
-        //   the slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
-        //   `SlotMap::insert[_mut]`.
+        // SAFETY: The `compare_exchange_weak` above succeeded, which means that the previous state
+        // tag of the slot must have been `OCCUPIED_TAG`, which means it must have been initialized
+        // in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's generation
+        // synchronizes with the `Release` ordering in `SlotMap::insert`, making sure that the newly
+        // written value is visible here.
         Some(unsafe { slot.value_unchecked() })
     }
 
@@ -801,13 +795,11 @@ impl<V> SlotMapInner<V> {
         // access the slot going forward.
         unsafe { guard.defer_reclaim_invalidated(id.index, &self.inner) };
 
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The `compare_exchange` above succeeded, which means that the previous state tag of the
-        //   slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
-        //   `SlotMap::insert[_mut]`.
+        // SAFETY: The `compare_exchange` above succeeded, which means that the previous state tag
+        // of the slot must have been `OCCUPIED_TAG`, which means it must have been initialized in
+        // `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's generation
+        // synchronizes with the `Release` ordering in `SlotMap::insert`, making sure that the newly
+        // written value is visible here.
         Some(unsafe { slot.value_unchecked() })
     }
 
@@ -829,17 +821,15 @@ impl<V> SlotMapInner<V> {
                     Relaxed,
                 ) {
                     Ok(_) => {
-                        // SAFETY:
-                        // * The `Acquire` ordering when loading the slot's generation synchronizes
-                        //   with the `Release` ordering in `SlotMap::insert`, making sure that the
-                        //   newly written value is visible here.
-                        // * The `compare_exchange_weak` above succeeded, which means that the
-                        //   previous state tag of the slot must have been `RECLAIMED_TAG`, which
-                        //   means it must have been reclaimed in `reclaim_invalidated`, which means
-                        //   it must have been invalidated in `SlotMap::invalidate`, which means it
-                        //   must have been initialized in `SlotMap::insert[_mut]`.
-                        // * We set the slot's state tag to `VACANT_TAG` such that future attempts
-                        //   to access the slot will fail.
+                        // SAFETY: The `compare_exchange_weak` above succeeded, which means that the
+                        // previous state tag of the slot must have been `RECLAIMED_TAG`, which
+                        // means it must have been reclaimed in `reclaim_invalidated`, which means
+                        // it must have been invalidated in `SlotMap::invalidate`, which means it
+                        // must have been initialized in `SlotMap::insert[_mut]`. The `Acquire`
+                        // ordering when loading the slot's generation synchronizes with the
+                        // `Release` ordering in `SlotMap::insert`, making sure that the newly
+                        // written value is visible here. We set the slot's state tag to
+                        // `VACANT_TAG` such that future attempts to access the slot will fail.
                         unsafe { reclaim(id.index, self.inner.as_ptr()) };
 
                         break Some(());
@@ -876,17 +866,14 @@ impl<V> SlotMapInner<V> {
         );
 
         if generation & STATE_MASK == RECLAIMED_TAG {
-            // SAFETY:
-            // * The `Acquire` fence after loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * The previous state tag of the slot was `RECLAIMED_TAG`, which means it must have
-            //   been reclaimed in `reclaim_invalidated`, which means it must have been invalidated
-            //   in `SlotMap::invalidate`, which means it must have been initialized in
-            //   `SlotMap::insert[_mut]`.
-            // * We set the slot's state tag to `VACANT_TAG` such that future attempts to access the
-            //   slot will fail.
-            // * The caller must ensure that a race condition doesn't occur.
+            // SAFETY: The previous state tag of the slot was `RECLAIMED_TAG`, which means it must
+            // have been reclaimed in `reclaim_invalidated`, which means it must have been
+            // invalidated in `SlotMap::invalidate`, which means it must have been initialized in
+            // `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's generation
+            // synchronizes with the `Release` ordering in `SlotMap::insert`, making sure that the
+            // newly written value is visible here. We set the slot's state tag to `VACANT_TAG` such
+            // that future attempts to access the slot will fail. The caller must ensure that a race
+            // condition doesn't occur.
             unsafe { reclaim(id.index, self.inner.as_ptr()) };
         }
     }
@@ -900,13 +887,11 @@ impl<V> SlotMapInner<V> {
         let generation = slot.generation.load(Acquire);
 
         if generation == id.generation() {
-            // SAFETY:
-            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * We checked that `id.generation` matches the slot's generation, which means that the
-            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
+            // SAFETY: We checked that `id.generation` matches the slot's generation, which means
+            // that the state tag of the slot must have been `OCCUPIED_TAG`, which means it must
+            // have been initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading
+            // the slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
+            // making sure that the newly written value is visible here.
             Some(unsafe { slot.value_unchecked() })
         } else {
             None
@@ -919,11 +904,9 @@ impl<V> SlotMapInner<V> {
         let generation = *slot.generation.get_mut();
 
         if generation == id.generation() {
-            // SAFETY:
-            // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which means that the
-            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
+            // SAFETY: We checked that `id.generation` matches the slot's generation, which means
+            // that the state tag of the slot must have been `OCCUPIED_TAG`, which means it must
+            // have been initialized in `SlotMap::insert[_mut]`.
             Some(unsafe { slot.value_unchecked_mut() })
         } else {
             None
@@ -970,9 +953,9 @@ impl<V> SlotMapInner<V> {
             let id = unsafe { ids.get_unchecked(i) };
 
             // SAFETY:
-            // * The caller must ensure that `ids` contains only IDs whose indices are in bounds of
+            // - The caller must ensure that `ids` contains only IDs whose indices are in bounds of
             //   the slots vector.
-            // * The caller must ensure that `ids` contains only IDs with disjunct indices.
+            // - The caller must ensure that `ids` contains only IDs with disjunct indices.
             let slot = unsafe { &mut *slots.add(id.index as usize) };
 
             let generation = *slot.generation.get_mut();
@@ -981,11 +964,9 @@ impl<V> SlotMapInner<V> {
                 return None;
             }
 
-            // SAFETY:
-            // * The mutable reference makes sure that access to the slot is synchronized.
-            // * We checked that `id.generation` matches the slot's generation, which means that the
-            //   state tag of the slot must have been `OCCUPIED_TAG`, which means it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
+            // SAFETY: We checked that `id.generation` matches the slot's generation, which means
+            // that the state tag of the slot must have been `OCCUPIED_TAG`, which means it must
+            // have been initialized in `SlotMap::insert[_mut]`.
             let value = unsafe { slot.value_unchecked_mut() };
 
             // SAFETY: `i` is in bounds of the array.
@@ -1005,12 +986,10 @@ impl<V> SlotMapInner<V> {
         let generation = slot.generation.load(Acquire);
 
         if is_occupied(generation) {
-            // SAFETY:
-            // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-            //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value
-            //   is visible here.
-            // * We checked that the slot is occupied, which means that it must have been
-            //   initialized in `SlotMap::insert[_mut]`.
+            // SAFETY: We checked that the slot is occupied, which means that it must have been
+            // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
+            // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
+            // making sure that the newly written value is visible here.
             Some(unsafe { slot.value_unchecked() })
         } else {
             None
@@ -1032,11 +1011,9 @@ impl<V> SlotMapInner<V> {
             "`SlotMap::get_unchecked` requires that `id` refers to a currently occupied slot",
         );
 
-        // SAFETY:
-        // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-        //   `Release` ordering in `SlotMap::insert`, making sure that the newly written value is
-        //   visible here.
-        // * The caller must ensure that the slot is initialized.
+        // SAFETY: The caller must ensure that the slot is initialized. The `Acquire` ordering when
+        // loading the slot's generation synchronizes with the `Release` ordering in
+        // `SlotMap::insert`, making sure that the newly written value is visible here.
         unsafe { slot.value_unchecked() }
     }
 
@@ -1050,9 +1027,7 @@ impl<V> SlotMapInner<V> {
             "`SlotMap::get_unchecked_mut` requires that `id` refers to a currently occupied slot",
         );
 
-        // SAFETY:
-        // * The mutable reference makes sure that access to the slot is synchronized.
-        // * The caller must ensure that the slot is initialized.
+        // SAFETY: The caller must ensure that the slot is initialized.
         unsafe { slot.value_unchecked_mut() }
     }
 
@@ -1160,13 +1135,12 @@ unsafe fn reclaim_invalidated<V>(index: u32, slots: *const Slot<V>) {
 
     debug_assert!(generation & STATE_MASK == VACANT_TAG);
 
-    // SAFETY:
-    // * The `Acquire` ordering when loading the slot's generation synchronizes with the `Release`
-    //   ordering in `SlotMap::insert`, making sure that the newly written value is visible here.
-    // * The previous state tag of the slot must have been `VACANT_TAG`, which means it must have
-    //   been removed in `SlotMap::remove_invalidated`, which means it must have been invalidated in
-    //   `SlotMap::invalidate`, which means it must have been initialized in
-    //   `SlotMap::insert[_mut]`.
+    // SAFETY: The previous state tag of the slot must have been `VACANT_TAG`, which means it must
+    // have been removed in `SlotMap::remove_invalidated`, which means it must have been invalidated
+    // in `SlotMap::invalidate`, which means it must have been initialized in
+    // `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the slot's generation
+    // synchronizes with the `Release` ordering in `SlotMap::insert`, making sure that the newly
+    // written value is visible here.
     unsafe { reclaim(index, slots) };
 }
 
@@ -1186,10 +1160,8 @@ impl<V> Drop for SlotMapInner<V> {
             if *slot.generation.get_mut() & STATE_MASK != VACANT_TAG {
                 let ptr = slot.value.get_mut().as_mut_ptr();
 
-                // SAFETY:
-                // * The mutable reference makes sure that access to the slot is synchronized.
-                // * We checked that the slot is not vacant, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
+                // SAFETY: We checked that the slot is not vacant, which means that it must have
+                // been initialized in `SlotMap::insert[_mut]`.
                 unsafe { ptr.drop_in_place() };
             }
         }
@@ -1395,7 +1367,7 @@ pub struct Slot<V> {
     value: UnsafeCell<MaybeUninit<V>>,
 }
 
-// SAFETY: Access to `Slot::value` is synchronized using `Slot::generation`, and by the fact that
+// SAFETY: Access to `Slot::value` is synchronized using `Slot::generation` and by the fact that
 // we only hand out references to `Slot`s in the presence of a `hyaline::Guard`.
 unsafe impl<V: Sync> Sync for Slot<V> {}
 
@@ -1476,12 +1448,10 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
                 // SAFETY: We checked that the occupied bit is set.
                 let id = unsafe { SlotId::new_unchecked(index, generation) };
 
-                // SAFETY:
-                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
-                //   value is visible here.
-                // * We checked that the slot is occupied, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
+                // SAFETY: We checked that the slot is occupied, which means that it must have been
+                // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
+                // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
+                // making sure that the newly written value is visible here.
                 let r = unsafe { slot.value_unchecked() };
 
                 break Some((K::from_id(id), r));
@@ -1510,12 +1480,10 @@ impl<K: Key, V> DoubleEndedIterator for Iter<'_, K, V> {
                 // SAFETY: We checked that the occupied bit is set.
                 let id = unsafe { SlotId::new_unchecked(index, generation) };
 
-                // SAFETY:
-                // * The `Acquire` ordering when loading the slot's generation synchronizes with the
-                //   `Release` ordering in `SlotMap::insert`, making sure that the newly written
-                //   value is visible here.
-                // * We checked that the slot is occupied, which means that it must have been
-                //   initialized in `SlotMap::insert[_mut]`.
+                // SAFETY: We checked that the slot is occupied, which means that it must have been
+                // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
+                // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
+                // making sure that the newly written value is visible here.
                 let r = unsafe { slot.value_unchecked() };
 
                 break Some((K::from_id(id), r));
