@@ -718,7 +718,7 @@ impl<V> SlotMapInner<V> {
 
         assert_unsafe_precondition!(
             is_occupied(generation),
-            "`id` must refer to a currently occupied slot",
+            "`SlotMap::remove_unchecked` requires that `id` refers to a currently occupied slot",
         );
 
         self.header().shard().len.fetch_sub(1, Relaxed);
@@ -862,7 +862,8 @@ impl<V> SlotMapInner<V> {
 
         assert_unsafe_precondition!(
             generation & STATE_MASK == RECLAIMED_TAG || generation & STATE_MASK == INVALIDATED_TAG,
-            "`id` must refer to a currently invalidated slot",
+            "`SlotMap::remove_invalidated_unchecked` requires that `id` refers to a currently \
+            invalidated slot",
         );
 
         if generation & STATE_MASK == RECLAIMED_TAG {
@@ -1629,7 +1630,7 @@ macro_rules! assert_unsafe_precondition {
         // facilitating conditional compilation without `#[cfg]` and the problems that come with it.
         if cfg!(debug_assertions) {
             if !$condition {
-                crate::panic_nounwind(concat!("unsafe precondition(s) validated: ", $message));
+                crate::panic_nounwind(concat!("unsafe precondition(s) violated: ", $message));
             }
         }
     };
