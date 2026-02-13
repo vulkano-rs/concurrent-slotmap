@@ -1477,9 +1477,9 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
                 // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
                 // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
                 // making sure that the newly written value is visible here.
-                let r = unsafe { slot.value_unchecked() };
+                let value = unsafe { slot.value_unchecked() };
 
-                break Some((K::from_id(id), r));
+                break Some((K::from_id(id), value));
             }
         }
     }
@@ -1509,9 +1509,9 @@ impl<K: Key, V> DoubleEndedIterator for Iter<'_, K, V> {
                 // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
                 // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
                 // making sure that the newly written value is visible here.
-                let r = unsafe { slot.value_unchecked() };
+                let value = unsafe { slot.value_unchecked() };
 
-                break Some((K::from_id(id), r));
+                break Some((K::from_id(id), value));
             }
         }
     }
@@ -1549,9 +1549,9 @@ impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
 
                 // SAFETY: We checked that the slot is occupied, which means that it must have been
                 // initialized in `SlotMap::insert[_mut]`.
-                let r = unsafe { slot.value_unchecked_mut() };
+                let value = unsafe { slot.value_unchecked_mut() };
 
-                break Some((K::from_id(id), r));
+                break Some((K::from_id(id), value));
             }
         }
     }
@@ -1579,9 +1579,9 @@ impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
 
                 // SAFETY: We checked that the slot is occupied, which means that it must have been
                 // initialized in `SlotMap::insert[_mut]`.
-                let r = unsafe { slot.value_unchecked_mut() };
+                let value = unsafe { slot.value_unchecked_mut() };
 
-                break Some((K::from_id(id), r));
+                break Some((K::from_id(id), value));
             }
         }
     }
