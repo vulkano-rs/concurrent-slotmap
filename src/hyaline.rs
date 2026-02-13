@@ -106,7 +106,6 @@ impl CollectorHandle {
 impl Clone for CollectorHandle {
     #[inline]
     fn clone(&self) -> Self {
-        #[allow(clippy::cast_sign_loss)]
         if self.collector().handle_count.fetch_add(1, Relaxed) > isize::MAX as usize {
             std::process::abort();
         }
@@ -269,7 +268,7 @@ impl RetirementList {
             atomic::fence(Acquire);
         }
 
-        #[allow(clippy::mut_range_bound)]
+        #[expect(clippy::mut_range_bound)]
         'outer: for node_index in 0..len {
             // SAFETY: The pointer is valid and the index is in bounds.
             let node = unsafe { nodes.add(node_index) };

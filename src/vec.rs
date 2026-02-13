@@ -50,7 +50,7 @@ pub(crate) fn set_shard_index() {
     let shard_index = thread_id_hash & (shard_count as u64 - 1);
 
     // The index can never exceed `shard_count - 1`, which is bounded by the available parallelism.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let shard_index = shard_index as usize;
 
     SHARD_INDEX.set(shard_index);
@@ -129,14 +129,14 @@ impl<T> RawVec<T> {
     }
 
     // Our capacity can never exceed `u32::MAX`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     #[inline]
     pub fn capacity(&self) -> u32 {
         self.inner.capacity() as u32
     }
 
     // Our capacity can never exceed `u32::MAX`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     #[inline]
     pub fn capacity_mut(&mut self) -> u32 {
         self.inner.as_mut_capacity().len() as u32
@@ -148,7 +148,7 @@ impl<T> RawVec<T> {
         let (index, slot) = self.inner.push();
 
         // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let index = index as u32;
 
         (index, slot)
@@ -160,7 +160,7 @@ impl<T> RawVec<T> {
         let (index, slot) = self.inner.push_mut();
 
         // Our capacity can never exceed `u32::MAX`.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let index = index as u32;
 
         (index, slot)

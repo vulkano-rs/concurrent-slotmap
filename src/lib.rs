@@ -1183,7 +1183,7 @@ impl<'a, K: Key, V> IntoIterator for &'a mut SlotMap<K, V> {
 pub trait Key: Sized {
     fn from_id(id: SlotId) -> Self;
 
-    #[allow(clippy::wrong_self_convention)]
+    #[expect(clippy::wrong_self_convention)]
     fn as_id(self) -> SlotId;
 }
 
@@ -1467,7 +1467,7 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
 
             if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let index = index as u32;
 
                 // SAFETY: We checked that the occupied bit is set.
@@ -1499,7 +1499,7 @@ impl<K: Key, V> DoubleEndedIterator for Iter<'_, K, V> {
 
             if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let index = index as u32;
 
                 // SAFETY: We checked that the occupied bit is set.
@@ -1541,7 +1541,7 @@ impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
 
             if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let index = index as u32;
 
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
@@ -1571,7 +1571,7 @@ impl<K: Key, V> DoubleEndedIterator for IterMut<'_, K, V> {
 
             if is_occupied(generation) {
                 // Our capacity can never exceed `u32::MAX`.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let index = index as u32;
 
                 // SAFETY: We checked that the `OCCUPIED_BIT` is set.
@@ -1669,7 +1669,7 @@ const fn panic_nounwind(message: &'static str) -> ! {
     // as of Rust 1.81.0. They also get the `nounwind` LLVM attribute, so this approach optimizes
     // better than the alternatives. We wrap it in a Rust function for the better calling
     // convention for DST references and to make it clearer that this is not actually used from C.
-    #[allow(improper_ctypes_definitions)]
+    #[expect(improper_ctypes_definitions)]
     #[inline]
     const extern "C" fn inner(message: &'static str) -> ! {
         panic!("{}", message);
