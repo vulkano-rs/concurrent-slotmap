@@ -1387,6 +1387,30 @@ impl<V> Slot<V> {
         self.value.get().cast()
     }
 
+    #[inline]
+    pub fn value(&self) -> Option<&V> {
+        if is_occupied(self.generation.load(Acquire)) {
+            // SAFETY: We checked that the slot is occupied, which means that it must have been
+            // initialized in `SlotMap::insert[_mut]`. The `Acquire` ordering when loading the
+            // slot's generation synchronizes with the `Release` ordering in `SlotMap::insert`,
+            // making sure that the newly written value is visible here.
+            Some(unsafe { self.value_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn value_mut(&mut self) -> Option<&mut V> {
+        if is_occupied(*self.generation.get_mut()) {
+            // SAFETY: We checked that the slot is occupied, which means that it must have been
+            // initialized in `SlotMap::insert[_mut]`.
+            Some(unsafe { self.value_unchecked_mut() })
+        } else {
+            None
+        }
+    }
+
     /// # Safety
     ///
     /// The value must be initialized. You can use [`generation`] to determine the state of the
