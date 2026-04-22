@@ -307,8 +307,8 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     #[track_caller]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
         match self
@@ -329,8 +329,8 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     #[track_caller]
     pub fn insert_with_tag_with<'a>(
         &'a self,
@@ -361,8 +361,8 @@ impl<K: Key, V> SlotMap<K, V> {
 
     /// # Panics
     ///
-    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     /// - Panics if `tag` has more than the low 8 bits set.
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
     ///
     /// # Errors
     ///
@@ -600,8 +600,6 @@ impl<V> SlotMapInner<V> {
             }
         }
 
-        assert_eq!(tag & !TAG_MASK, 0);
-
         let (id, slot, _) = self.allocate_slot(tag, guard);
 
         let leak_guard = LeakGuard { map: self, id };
@@ -625,6 +623,7 @@ impl<V> SlotMapInner<V> {
         tag: u32,
         guard: &'a hyaline::Guard<'a>,
     ) -> (SlotId, &'a Slot<V>, bool) {
+        assert_eq!(tag & !TAG_MASK, 0);
         self.check_guard(guard);
 
         'outer: for shard in self.header().shards() {
