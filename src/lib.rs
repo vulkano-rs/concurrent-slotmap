@@ -18,6 +18,7 @@ use core::{
         Ordering::{Acquire, Relaxed, Release},
     },
 };
+use std::convert::Infallible;
 
 pub mod hyaline;
 mod vec;
@@ -310,12 +311,17 @@ impl<K: Key, V> SlotMap<K, V> {
     /// - Panics if `tag` has more than the low 8 bits set.
     #[track_caller]
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
-        K::from_id(self.inner.insert_with_tag_with(tag, guard, |_| value))
+        match self
+            .inner
+            .try_insert_with_tag_with::<Infallible>(tag, guard, |_| Ok(value))
+        {
+            Ok(id) => K::from_id(id),
+        }
     }
 
     /// # Panics
     ///
-    /// Panics if `guard.global()` is `Some` and does not equal `self.global()`.
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
     #[track_caller]
     pub fn insert_with<'a>(&'a self, guard: &'a hyaline::Guard<'a>, f: impl FnOnce(K) -> V) -> K {
         self.insert_with_tag_with(0, guard, f)
@@ -332,9 +338,45 @@ impl<K: Key, V> SlotMap<K, V> {
         guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(K) -> V,
     ) -> K {
-        let f = |id| f(K::from_id(id));
+        match self.try_insert_with_tag_with::<Infallible>(tag, guard, |k| Ok(f(k))) {
+            Ok(id) => id,
+        }
+    }
 
-        K::from_id(self.inner.insert_with_tag_with(tag, guard, f))
+    /// # Panics
+    ///
+    /// Panics if `guard.collector()` does not equal `self.collector()`.
+    ///
+    /// # Errors
+    ///
+    /// If `f` returns an error, returns that same error.
+    #[track_caller]
+    pub fn try_insert_with<'a, E>(
+        &'a self,
+        guard: &'a hyaline::Guard<'a>,
+        f: impl FnOnce(K) -> Result<V, E>,
+    ) -> Result<K, E> {
+        self.try_insert_with_tag_with(0, guard, f)
+    }
+
+    /// # Panics
+    ///
+    /// - Panics if `guard.collector()` does not equal `self.collector()`.
+    /// - Panics if `tag` has more than the low 8 bits set.
+    ///
+    /// # Errors
+    ///
+    /// If `f` returns an error, returns that same error.
+    #[track_caller]
+    pub fn try_insert_with_tag_with<'a, E>(
+        &'a self,
+        tag: u32,
+        guard: &'a hyaline::Guard<'a>,
+        f: impl FnOnce(K) -> Result<V, E>,
+    ) -> Result<K, E> {
+        self.inner
+            .try_insert_with_tag_with(tag, guard, |id| f(K::from_id(id)))
+            .map(K::from_id)
     }
 
     #[track_caller]
@@ -347,7 +389,12 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `tag` has more than the low 8 bits set.
     #[track_caller]
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
-        K::from_id(self.inner.insert_with_tag_with_mut(tag, |_| value))
+        match self
+            .inner
+            .try_insert_with_tag_with_mut::<Infallible>(tag, |_| Ok(value))
+        {
+            Ok(id) => K::from_id(id),
+        }
     }
 
     #[track_caller]
@@ -360,9 +407,35 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `tag` has more than the low 8 bits set.
     #[track_caller]
     pub fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(K) -> V) -> K {
-        let f = |id| f(K::from_id(id));
+        match self.try_insert_with_tag_with_mut::<Infallible>(tag, |id| Ok(f(id))) {
+            Ok(id) => id,
+        }
+    }
 
-        K::from_id(self.inner.insert_with_tag_with_mut(tag, f))
+    /// # Errors
+    ///
+    /// If `f` returns an error, returns that same error.
+    #[track_caller]
+    pub fn try_insert_with_mut<E>(&mut self, f: impl FnOnce(K) -> Result<V, E>) -> Result<K, E> {
+        self.try_insert_with_tag_with_mut(0, f)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `tag` has more than the low 8 bits set.
+    ///
+    /// # Errors
+    ///
+    /// If `f` returns an error, returns that same error.
+    #[track_caller]
+    pub fn try_insert_with_tag_with_mut<E>(
+        &mut self,
+        tag: u32,
+        f: impl FnOnce(K) -> Result<V, E>,
+    ) -> Result<K, E> {
+        self.inner
+            .try_insert_with_tag_with_mut(tag, |id| f(K::from_id(id)))
+            .map(K::from_id)
     }
 
     /// # Panics
@@ -506,25 +579,44 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
 
 impl<V> SlotMapInner<V> {
     #[track_caller]
-    fn insert_with_tag_with<'a>(
+    fn try_insert_with_tag_with<'a, E>(
         &'a self,
         tag: u32,
         guard: &'a hyaline::Guard<'a>,
-        f: impl FnOnce(SlotId) -> V,
-    ) -> SlotId {
+        f: impl FnOnce(SlotId) -> Result<V, E>,
+    ) -> Result<SlotId, E> {
+        struct LeakGuard<'a, V> {
+            map: &'a SlotMapInner<V>,
+            id: SlotId,
+        }
+
+        impl<V> Drop for LeakGuard<'_, V> {
+            #[cold]
+            fn drop(&mut self) {
+                // SAFETY: The only way this can be called is if inserting the value failed, at
+                // which point the slot's state tag is still `VACANT_TAG`. We also know that the
+                // index is in bounds because we have just allocated it.
+                unsafe { self.map.deallocate_slot(self.id) };
+            }
+        }
+
         assert_eq!(tag & !TAG_MASK, 0);
 
         let (id, slot, _) = self.allocate_slot(tag, guard);
 
+        let leak_guard = LeakGuard { map: self, id };
+        let value = f(id)?;
+        mem::forget(leak_guard);
+
         // SAFETY: `SlotMapInner::allocate_slot` always returns a unique slot that is not shared
         // with any other threads.
-        unsafe { slot.value.get().cast::<V>().write(f(id)) };
+        unsafe { slot.value.get().cast::<V>().write(value) };
 
         slot.generation.store(id.generation(), Release);
 
         self.header().shard().len.fetch_add(1, Relaxed);
 
-        id
+        Ok(id)
     }
 
     #[track_caller]
@@ -587,18 +679,69 @@ impl<V> SlotMapInner<V> {
         (id, slot, true)
     }
 
-    #[track_caller]
-    fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(SlotId) -> V) -> SlotId {
-        let (id, slot) = self.allocate_slot_mut(tag);
+    unsafe fn deallocate_slot(&self, id: SlotId) {
+        let shard = self.header().shard();
 
-        slot.value.get_mut().write(f(id));
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.inner.get_unchecked(id.index) };
+
+        let mut free_list_head = shard.free_list.load(Acquire);
+        let mut backoff = Backoff::new();
+
+        loop {
+            slot.next_free.store(free_list_head, Relaxed);
+
+            match shard
+                .free_list
+                .compare_exchange_weak(free_list_head, id.index, Release, Acquire)
+            {
+                Ok(_) => break,
+                Err(new_head) => {
+                    free_list_head = new_head;
+                    backoff.spin();
+                }
+            }
+        }
+    }
+
+    #[track_caller]
+    fn try_insert_with_tag_with_mut<E>(
+        &mut self,
+        tag: u32,
+        f: impl FnOnce(SlotId) -> Result<V, E>,
+    ) -> Result<SlotId, E> {
+        struct LeakGuard<'a, V> {
+            map: &'a mut SlotMapInner<V>,
+            id: SlotId,
+        }
+
+        impl<V> Drop for LeakGuard<'_, V> {
+            #[cold]
+            fn drop(&mut self) {
+                // SAFETY: The only way this can be called is if inserting the value failed, at
+                // which point the slot's state tag is still `VACANT_TAG`. We also know that the
+                // index is in bounds because we have just allocated it.
+                unsafe { self.map.deallocate_slot_mut(self.id) };
+            }
+        }
+
+        let (id, _) = self.allocate_slot_mut(tag);
+
+        let leak_guard = LeakGuard { map: self, id };
+        let value = f(id)?;
+        mem::forget(leak_guard);
+
+        // SAFETY: We know that the index is in bounds because we have just allocated it.
+        let slot = unsafe { self.inner.get_unchecked_mut(id.index) };
+
+        slot.value.get_mut().write(value);
 
         *slot.generation.get_mut() = id.generation();
 
         let len = self.header_mut().shard_mut().len.get_mut();
         *len = len.wrapping_add(1);
 
-        id
+        Ok(id)
     }
 
     #[track_caller]
@@ -644,6 +787,21 @@ impl<V> SlotMapInner<V> {
         (id, slot)
     }
 
+    unsafe fn deallocate_slot_mut(&mut self, id: SlotId) {
+        // SAFETY: We unbind the lifetime to convince the borrow checker that we don't borrow
+        // `self.inner` mutably more than once. We don't because the header and slots are occupying
+        // disjoint memory ranges.
+        let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.header_mut()) };
+
+        let shard = header.shard_mut();
+
+        // SAFETY: The caller must ensure that the index is in bounds.
+        let slot = unsafe { self.inner.get_unchecked_mut(id.index) };
+
+        *slot.next_free.get_mut() = *shard.free_list.get_mut();
+        *shard.free_list.get_mut() = id.index;
+    }
+
     #[track_caller]
     fn remove<'a>(&'a self, id: SlotId, guard: &'a hyaline::Guard<'a>) -> Option<&'a V> {
         self.check_guard(guard);
@@ -679,6 +837,8 @@ impl<V> SlotMapInner<V> {
         // disjoint memory ranges.
         let header = unsafe { mem::transmute::<&mut Header, &mut Header>(self.header_mut()) };
 
+        let shard = header.shard_mut();
+
         let slot = self.inner.get_mut(id.index)?;
         let generation = *slot.generation.get_mut();
 
@@ -686,10 +846,10 @@ impl<V> SlotMapInner<V> {
             let new_generation = (generation & GENERATION_MASK).wrapping_add(ONE_GENERATION);
             *slot.generation.get_mut() = new_generation;
 
-            *slot.next_free.get_mut() = *header.shard_mut().free_list.get_mut();
-            *header.shard_mut().free_list.get_mut() = id.index;
+            *slot.next_free.get_mut() = *shard.free_list.get_mut();
+            *shard.free_list.get_mut() = id.index;
 
-            let len = header.shard_mut().len.get_mut();
+            let len = shard.len.get_mut();
             *len = len.wrapping_sub(1);
 
             // SAFETY:
@@ -1681,7 +1841,10 @@ const fn panic_nounwind(message: &'static str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        thread,
+    };
 
     #[test]
     fn basic_usage1() {
@@ -2591,6 +2754,34 @@ mod tests {
         let x = map.insert_with_tag_mut(42, 1);
         assert_eq!(x.generation() & TAG_MASK, 1);
         assert_eq!(map.get_mut(x), Some(&mut 42));
+    }
+
+    #[test]
+    fn try_insert() {
+        let map = SlotMap::new(1);
+
+        assert!(map.try_insert_with::<()>(&map.pin(), |_| Err(())).is_err());
+
+        catch_unwind(|| {
+            let _ = map.try_insert_with::<()>(&map.pin(), |_| panic!());
+        })
+        .unwrap_err();
+
+        assert!(map.try_insert_with::<()>(&map.pin(), |_| Ok(42)).is_ok());
+    }
+
+    #[test]
+    fn try_insert_mut() {
+        let mut map = SlotMap::new(1);
+
+        assert!(map.try_insert_with_mut::<()>(|_| Err(())).is_err());
+
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = map.try_insert_with_mut::<()>(|_| panic!());
+        }))
+        .unwrap_err();
+
+        assert!(map.try_insert_with_mut::<()>(|_| Ok(42)).is_ok());
     }
 
     #[test]
