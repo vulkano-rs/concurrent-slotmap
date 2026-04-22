@@ -126,6 +126,7 @@ impl<V> SlotMap<SlotId, V> {
     /// - Panics if the `max_capacity` would exceed `isize::MAX` bytes.
     /// - Panics if [reserving] the allocation fails.
     ///
+    /// [`CollectorHandle::pin`]: hyaline::CollectorHandle::pin
     /// [reserving]: virtual_buffer#reserving
     #[must_use]
     #[track_caller]
