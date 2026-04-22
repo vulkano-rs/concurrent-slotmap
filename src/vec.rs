@@ -25,8 +25,7 @@ pub(crate) fn set_shard_count() {
             1
         } else {
             thread::available_parallelism()
-                .map(NonZeroUsize::get)
-                .unwrap_or(1)
+                .map_or(1, NonZeroUsize::get)
                 .next_power_of_two()
         };
 
