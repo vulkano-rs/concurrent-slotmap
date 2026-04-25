@@ -314,7 +314,7 @@ impl<K: Key, V> SlotMap<K, V> {
     pub fn insert_with_tag<'a>(&'a self, value: V, tag: u32, guard: &'a hyaline::Guard<'a>) -> K {
         match self
             .inner
-            .try_insert_with_tag_with::<Infallible>(tag, guard, |_| Ok(value))
+            .try_insert_with_tag_with::<Infallible>(tag, guard, move |_| Ok(value))
         {
             Ok(id) => K::from_id(id),
         }
@@ -339,7 +339,7 @@ impl<K: Key, V> SlotMap<K, V> {
         guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(K) -> V,
     ) -> K {
-        match self.try_insert_with_tag_with::<Infallible>(tag, guard, |k| Ok(f(k))) {
+        match self.try_insert_with_tag_with::<Infallible>(tag, guard, move |k| Ok(f(k))) {
             Ok(id) => id,
         }
     }
@@ -376,7 +376,7 @@ impl<K: Key, V> SlotMap<K, V> {
         f: impl FnOnce(K) -> Result<V, E>,
     ) -> Result<K, E> {
         self.inner
-            .try_insert_with_tag_with(tag, guard, |id| f(K::from_id(id)))
+            .try_insert_with_tag_with(tag, guard, move |id| f(K::from_id(id)))
             .map(K::from_id)
     }
 
@@ -392,7 +392,7 @@ impl<K: Key, V> SlotMap<K, V> {
     pub fn insert_with_tag_mut(&mut self, value: V, tag: u32) -> K {
         match self
             .inner
-            .try_insert_with_tag_with_mut::<Infallible>(tag, |_| Ok(value))
+            .try_insert_with_tag_with_mut::<Infallible>(tag, move |_| Ok(value))
         {
             Ok(id) => K::from_id(id),
         }
@@ -408,7 +408,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// Panics if `tag` has more than the low 8 bits set.
     #[track_caller]
     pub fn insert_with_tag_with_mut(&mut self, tag: u32, f: impl FnOnce(K) -> V) -> K {
-        match self.try_insert_with_tag_with_mut::<Infallible>(tag, |id| Ok(f(id))) {
+        match self.try_insert_with_tag_with_mut::<Infallible>(tag, move |id| Ok(f(id))) {
             Ok(id) => id,
         }
     }
@@ -435,7 +435,7 @@ impl<K: Key, V> SlotMap<K, V> {
         f: impl FnOnce(K) -> Result<V, E>,
     ) -> Result<K, E> {
         self.inner
-            .try_insert_with_tag_with_mut(tag, |id| f(K::from_id(id)))
+            .try_insert_with_tag_with_mut(tag, move |id| f(K::from_id(id)))
             .map(K::from_id)
     }
 
@@ -570,7 +570,7 @@ impl<K: Key, V> SlotMap<K, MaybeUninit<V>> {
         guard: &'a hyaline::Guard<'a>,
         f: impl FnOnce(K) -> MaybeUninit<V>,
     ) -> (K, &'a MaybeUninit<V>) {
-        let f = |id| f(K::from_id(id));
+        let f = move |id| f(K::from_id(id));
 
         let (id, value) = self.inner.revive_or_insert_with(guard, f);
 
