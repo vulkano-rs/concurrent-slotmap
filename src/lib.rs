@@ -27,7 +27,7 @@ mod vec;
 const NIL: u32 = u32::MAX;
 
 /// The number of low bits that can be used for user-tagged generations.
-const TAG_BITS: u32 = 8;
+const TAG_BITS: u32 = 10;
 
 /// The mask for user-tagged generations.
 const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
